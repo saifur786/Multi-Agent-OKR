@@ -1,0 +1,6 @@
+{
+  "name": "Planview Anvi Multi-Agent Orchestration & Knowledge Base",
+  "description": "Enterprise supervisor-worker multi-agent OKR lifecycle & 7-layer traceability engine powered by Planview Anvi asynchronous event bus.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
