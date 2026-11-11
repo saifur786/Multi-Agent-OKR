@@ -474,6 +474,16 @@ export function generateRequirementTraceabilityMatrixCSV(): string {
       layer: 'Governance & Compliance',
       test: 'generateRequirementTraceabilityMatrixCSV test',
       status: 'VERIFIED_PASSED'
+    },
+    {
+      id: 'REQ-HEATMAP-01',
+      category: 'Capacity Intelligence',
+      req: 'System shall use Recharts to render a heatmap of resource utilisation across 7-layer traceability nodes with bottlenecks in red',
+      spec: 'Recharts ScatterChart and ComposedChart visualizing capacity stress, over-allocation thresholds (>=100%), and interactive AI burst remediation',
+      agent: 'Alignment & Capacity Agent (Stage 3)',
+      layer: 'Layers 1 through 7 (Full Traceability Hierarchy)',
+      test: 'calculate7LayerNodeUtilisation test',
+      status: 'VERIFIED_PASSED'
     }
   ];
 
