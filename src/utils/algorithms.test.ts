@@ -8,7 +8,9 @@ import {
   calculateRegressionPrediction,
   computeVectorCosineSimilarity,
   solvePolynomialRegression,
-  evaluateAdvisoryCommittee
+  evaluateAdvisoryCommittee,
+  generateHistoricalAccuracyCohorts,
+  generateAgentAccuracyProfiles
 } from './algorithms';
 import { TraceabilityNode } from '../types/orchestration';
 
@@ -227,5 +229,36 @@ test('evaluateAdvisoryCommittee generates requested N advisory agents with multi
   assert.ok(committee.polynomialModel.rSquaredPolynomial > 0);
   assert.equal(committee.polynomialModel.trajectory.length, 12);
   assert.ok(committee.confidenceInterval[0] <= committee.confidenceInterval[1]);
+});
+
+test('generateHistoricalAccuracyCohorts returns ordered cohorts with increasing R2 and narrowing CI spread', () => {
+  const quarterCohorts = generateHistoricalAccuracyCohorts('quarters');
+  assert.equal(quarterCohorts.length, 8);
+  
+  // Verify monotonic or converging R-squared growth over time
+  const firstR2 = quarterCohorts[0].rSquaredPolynomial;
+  const lastR2 = quarterCohorts[quarterCohorts.length - 1].rSquaredPolynomial;
+  assert.ok(lastR2 > firstR2, `Last R2 (${lastR2}) should exceed initial (${firstR2})`);
+  
+  // Verify CI spread narrows as confidence interval calibrates
+  const firstSpread = quarterCohorts[0].ciSpread;
+  const lastSpread = quarterCohorts[quarterCohorts.length - 1].ciSpread;
+  assert.ok(lastSpread < firstSpread, `Last CI spread (${lastSpread}) should be tighter than first (${firstSpread})`);
+
+  // Verify sprint cohorts
+  const sprintCohorts = generateHistoricalAccuracyCohorts('sprints');
+  assert.equal(sprintCohorts.length, 12);
+  assert.ok(sprintCohorts[11].rSquaredPolynomial >= 0.95);
+});
+
+test('generateAgentAccuracyProfiles returns diverse advisory personas with calibration data', () => {
+  const profiles = generateAgentAccuracyProfiles();
+  assert.ok(profiles.length >= 5);
+  for (const p of profiles) {
+    assert.ok(p.historicalRSquared > 0.85);
+    assert.ok(p.ciCalibrationRate >= 90);
+    assert.ok(p.color.startsWith('#'));
+    assert.equal(p.historicalTrend.length, 8);
+  }
 });
 

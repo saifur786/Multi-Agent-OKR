@@ -32,7 +32,9 @@ export type EventTopic =
   | 'ROOT_CAUSE_SYNTHESIZED'
   | 'KNOWLEDGE_BASE_UPDATED'
   | 'INTERVENTION_APPLIED'
-  | 'CUSTOM_INDUSTRY_SYNTHESIZED';
+  | 'CUSTOM_INDUSTRY_SYNTHESIZED'
+  | 'EXECUTIVE_REPORT_EXPORTED'
+  | 'GOVERNANCE_DOC_EXPORTED';
 
 export interface BusEvent {
   id: string;
@@ -262,6 +264,33 @@ export interface AdvisoryCommitteeSummary {
     trajectory: TrajectoryPoint[];
   };
   agentOutcomes: AdvisoryAgentOutcome[];
+}
+
+export interface HistoricalAccuracyCohort {
+  period: string;
+  cycleIndex: number;
+  rSquaredPolynomial: number;
+  rSquaredLinear: number;
+  predictedAttainment: number;
+  actualAttainment: number;
+  ciLower: number;
+  ciUpper: number;
+  ciSpread: number;
+  brierScore: number;
+  meanAbsoluteError: number;
+  consensusDivergence: number;
+  sampleSizeKRs: number;
+  agentCount: number;
+}
+
+export interface AgentHistoricalAccuracyProfile {
+  agentName: string;
+  role: string;
+  historicalRSquared: number;
+  averageMAE: number;
+  ciCalibrationRate: number;
+  color: string;
+  historicalTrend: { period: string; rSquared: number; mae: number; spread: number }[];
 }
 
 export interface IndustryDataBundle {

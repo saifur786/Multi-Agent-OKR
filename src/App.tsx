@@ -14,6 +14,7 @@ import { KnowledgeBaseView } from './components/KnowledgeBaseView';
 import { SupervisorEventBus } from './components/SupervisorEventBus';
 import { AddCustomIndustryModal } from './components/AddCustomIndustryModal';
 import { AdvisoryCommitteeView } from './components/AdvisoryCommitteeView';
+import { AdvisoryPerformanceAccuracyView } from './components/AdvisoryPerformanceAccuracyView';
 
 export default function App() {
   // Dynamic Industries Dictionary (includes defaults + user-created custom industries)
@@ -266,10 +267,21 @@ export default function App() {
 
         {/* View 3: Advisory Committee Multi-Agent Outcomes */}
         {activeView === 'advisory' && (
-          <AdvisoryCommitteeView industry={industry} />
+          <AdvisoryCommitteeView
+            industry={industry}
+            onNavigateToAccuracy={() => setActiveView('performance')}
+          />
         )}
 
-        {/* View 4: 5-Pillar AI Knowledge Base */}
+        {/* View 4: Advisory Historical Accuracy & R² Analytics (Recharts) */}
+        {activeView === 'performance' && (
+          <AdvisoryPerformanceAccuracyView
+            industry={industry}
+            onNavigateToOutcomes={() => setActiveView('advisory')}
+          />
+        )}
+
+        {/* View 5: 5-Pillar AI Knowledge Base */}
         {activeView === 'knowledge' && (
           <KnowledgeBaseView
             industry={industry}

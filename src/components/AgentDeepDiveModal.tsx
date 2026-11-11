@@ -19,11 +19,21 @@ import {
   Database,
   Terminal,
   Clock,
-  Play
+  Play,
+  Download,
+  FileText,
+  Table,
+  FileSpreadsheet
 } from 'lucide-react';
 import { IndustryDataBundle, LifecycleStage, TraceabilityNode } from '../types/orchestration';
 import { evaluateSmartCriteria, calculateRegressionPrediction, computeVectorCosineSimilarity, remediateOrphanNode } from '../utils/algorithms';
 import { eventBus } from '../utils/eventBus';
+import {
+  generateExecutiveReportCSV,
+  generateBusinessRequirementDocument,
+  generateRequirementTraceabilityMatrixCSV,
+  triggerFileDownload
+} from '../utils/documentGenerators';
 
 interface AgentDeepDiveModalProps {
   stage: LifecycleStage;
@@ -66,8 +76,12 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
   const [simulatedWebhookFiring, setSimulatedWebhookFiring] = useState(false);
   const [webhookLogs, setWebhookLogs] = useState(industry.recentWebhooks);
 
-  // STAGE 5 (Executive JSON) state
+  // STAGE 5 (Executive JSON & Document Exports) state
   const [copiedJson, setCopiedJson] = useState(false);
+  const [exportedCsv, setExportedCsv] = useState(false);
+  const [downloadedBrd, setDownloadedBrd] = useState(false);
+  const [downloadedRtm, setDownloadedRtm] = useState(false);
+  const [activeDocPreview, setActiveDocPreview] = useState<'none' | 'brd' | 'rtm'>('none');
 
   // STAGE 6 (Retro & Vector Ingestion) state
   const [vectorIngested, setVectorIngested] = useState(industry.retrospective.ingestedIntoKnowledgeBase);
@@ -168,6 +182,63 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
     navigator.clipboard.writeText(JSON.stringify(industry.executivePayload, null, 2));
     setCopiedJson(true);
     setTimeout(() => setCopiedJson(false), 2000);
+  };
+
+  // STAGE 5 Handler: Export Node Health & Traceability to CSV
+  const handleExportCSV = () => {
+    const csv = generateExecutiveReportCSV(industry, nodesMap);
+    const filename = `${industry.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_executive_traceability_health.csv`;
+    triggerFileDownload(csv, filename, 'text/csv;charset=utf-8;');
+    setExportedCsv(true);
+    setTimeout(() => setExportedCsv(false), 2500);
+
+    eventBus.publish({
+      topic: 'EXECUTIVE_REPORT_EXPORTED',
+      sourceAgent: 'Executive Reporting Agent',
+      targetAgent: 'Supervisor Agent',
+      summary: `Exported comprehensive 7-layer node health and OKR traceability CSV for ${industry.name}`,
+      payload: { filename, totalNodes: Object.keys(nodesMap).length, quarter: industry.quarter },
+      latencyMs: 18,
+      severity: 'success'
+    });
+  };
+
+  // STAGE 5 Handler: Download Business Requirement Document (BRD)
+  const handleDownloadBRD = () => {
+    const brd = generateBusinessRequirementDocument(industry);
+    const filename = `Planview_Anvi_Business_Requirement_Document_${industry.name.replace(/[^a-zA-Z0-9]/g, '_')}.md`;
+    triggerFileDownload(brd, filename, 'text/markdown;charset=utf-8;');
+    setDownloadedBrd(true);
+    setTimeout(() => setDownloadedBrd(false), 2500);
+
+    eventBus.publish({
+      topic: 'GOVERNANCE_DOC_EXPORTED',
+      sourceAgent: 'Executive Reporting Agent',
+      targetAgent: 'Enterprise Architecture Board',
+      summary: `Generated and downloaded formal Business Requirement Document (BRD) for ${industry.name}`,
+      payload: { filename, docType: 'BRD', standard: 'BRD-PV-ANVI-2026-V2.4' },
+      latencyMs: 22,
+      severity: 'info'
+    });
+  };
+
+  // STAGE 5 Handler: Download Requirement Traceability Matrix (RTM)
+  const handleDownloadRTM = () => {
+    const rtm = generateRequirementTraceabilityMatrixCSV();
+    const filename = `Planview_Anvi_Requirement_Traceability_Matrix_RTM_${industry.name.replace(/[^a-zA-Z0-9]/g, '_')}.csv`;
+    triggerFileDownload(rtm, filename, 'text/csv;charset=utf-8;');
+    setDownloadedRtm(true);
+    setTimeout(() => setDownloadedRtm(false), 2500);
+
+    eventBus.publish({
+      topic: 'GOVERNANCE_DOC_EXPORTED',
+      sourceAgent: 'Executive Reporting Agent',
+      targetAgent: 'Quality & Governance Auditor',
+      summary: `Generated and downloaded formal Requirement Traceability Matrix (RTM) CSV for ${industry.name}`,
+      payload: { filename, docType: 'RTM', mappingsCount: 18 },
+      latencyMs: 20,
+      severity: 'info'
+    });
   };
 
   // STAGE 6 Handler: Ingest Vectors
@@ -575,37 +646,63 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
           )}
 
           {/* ===============================================================
-              STAGE 5: EXECUTIVE REPORTING AGENT (JSON PAYLOAD)
+              STAGE 5: EXECUTIVE REPORTING AGENT (JSON PAYLOAD & EXPORTS)
              =============================================================== */}
           {stage.id === 5 && (
             <div className="space-y-4">
               <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-2xs space-y-4">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                   <div>
                     <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                       <BarChart3 className="w-4 h-4 text-emerald-600" />
-                      Executive Scorecard &amp; Aggregated JSON Telemetry
+                      Executive Scorecard &amp; Aggregated Reporting
                     </h3>
                     <p className="text-xs text-slate-500">
-                      Aggregates KR health, portfolio contribution ROI, and squad impact formatted for React dashboards.
+                      Aggregates KR health, portfolio contribution ROI, squad impact, and 7-layer traceability metrics into auditable formats.
                     </p>
                   </div>
-                  <button
-                    onClick={handleCopyJson}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg shadow-2xs transition-all cursor-pointer"
-                  >
-                    {copiedJson ? (
-                      <>
-                        <Check className="w-3.5 h-3.5" />
-                        <span>Copied JSON</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3.5 h-3.5" />
-                        <span>Copy JSON Payload</span>
-                      </>
-                    )}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    {/* Export to CSV Button */}
+                    <button
+                      onClick={handleExportCSV}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg shadow-2xs transition-all cursor-pointer ${
+                        exportedCsv
+                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                          : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                      }`}
+                      title="Download 7-layer node health, OKR status, and traceability metrics as CSV"
+                    >
+                      {exportedCsv ? (
+                        <>
+                          <Check className="w-3.5 h-3.5" />
+                          <span>CSV Exported</span>
+                        </>
+                      ) : (
+                        <>
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Export to CSV</span>
+                        </>
+                      )}
+                    </button>
+
+                    {/* Copy JSON Payload Button */}
+                    <button
+                      onClick={handleCopyJson}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg shadow-2xs transition-all cursor-pointer"
+                    >
+                      {copiedJson ? (
+                        <>
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Copied JSON</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Copy JSON Payload</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 {/* Executive Summary Cards */}
@@ -636,12 +733,130 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
                   </div>
                 </div>
 
+                {/* Downloadable Enterprise Governance & Traceability Documents Suite */}
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className="text-xs font-bold text-slate-800 uppercase flex items-center gap-1.5">
+                        <FileText className="w-4 h-4 text-indigo-600" />
+                        Enterprise Governance &amp; Traceability Documentation Suite
+                      </h4>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        Download formal audit documents: Business Requirement Document (BRD) &amp; Requirement Traceability Matrix (RTM).
+                      </p>
+                    </div>
+                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-200">
+                      Audit Ready
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                    {/* BRD Card */}
+                    <div className="p-3.5 bg-white rounded-lg border border-slate-200 space-y-2.5 flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
+                            <BookOpen className="w-4 h-4 text-indigo-600" />
+                            Business Requirement Document (BRD)
+                          </span>
+                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-100 text-slate-600">
+                            BRD-PV-ANVI-2026
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-1">
+                          Enterprise architectural specification: 6-stage supervisor-worker agents, vector KB pipelines, quadratic regression models, and SMART scoring rubrics.
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-1 border-t border-slate-100">
+                        <button
+                          onClick={handleDownloadBRD}
+                          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-2xs transition-all cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>{downloadedBrd ? '✓ BRD Downloaded' : 'Download BRD (.md)'}</span>
+                        </button>
+                        <button
+                          onClick={() => setActiveDocPreview(activeDocPreview === 'brd' ? 'none' : 'brd')}
+                          className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition-all cursor-pointer"
+                        >
+                          {activeDocPreview === 'brd' ? 'Hide' : 'Preview'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* RTM Card */}
+                    <div className="p-3.5 bg-white rounded-lg border border-slate-200 space-y-2.5 flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
+                            <Table className="w-4 h-4 text-emerald-600" />
+                            Requirement Traceability Matrix (RTM)
+                          </span>
+                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-700">
+                            18 Mappings
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-1">
+                          Bidirectional matrix mapping requirements (REQ-STRAT, REQ-OKR, REQ-GRAPH, REQ-RISK) to 7-layer lineage nodes, verification test cases, and verification states.
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-1 border-t border-slate-100">
+                        <button
+                          onClick={handleDownloadRTM}
+                          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold shadow-2xs transition-all cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>{downloadedRtm ? '✓ RTM Downloaded' : 'Download RTM (.csv)'}</span>
+                        </button>
+                        <button
+                          onClick={() => setActiveDocPreview(activeDocPreview === 'rtm' ? 'none' : 'rtm')}
+                          className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition-all cursor-pointer"
+                        >
+                          {activeDocPreview === 'rtm' ? 'Hide' : 'Preview'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Inline Document Previews */}
+                  {activeDocPreview === 'brd' && (
+                    <div className="p-4 bg-slate-900 text-slate-200 rounded-xl font-mono text-xs max-h-72 overflow-y-auto space-y-2 border border-slate-800">
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 border-b border-slate-800 pb-1">
+                        <span className="font-bold text-indigo-400">BRD Preview (Markdown)</span>
+                        <button onClick={() => setActiveDocPreview('none')} className="text-slate-400 hover:text-white cursor-pointer">✕ Close</button>
+                      </div>
+                      <pre className="whitespace-pre-wrap text-[11px] text-slate-300">
+                        {generateBusinessRequirementDocument(industry).slice(0, 1800)}...
+                      </pre>
+                    </div>
+                  )}
+
+                  {activeDocPreview === 'rtm' && (
+                    <div className="p-4 bg-slate-900 text-slate-200 rounded-xl font-mono text-xs max-h-72 overflow-y-auto space-y-2 border border-slate-800">
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 border-b border-slate-800 pb-1">
+                        <span className="font-bold text-emerald-400">RTM Preview (CSV Raw View)</span>
+                        <button onClick={() => setActiveDocPreview('none')} className="text-slate-400 hover:text-white cursor-pointer">✕ Close</button>
+                      </div>
+                      <pre className="whitespace-pre-wrap text-[10px] text-slate-300">
+                        {generateRequirementTraceabilityMatrixCSV()}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+
                 {/* Formatted JSON Payload for React Dashboards */}
                 <div>
-                  <p className="text-xs font-bold text-slate-500 uppercase mb-1.5">
-                    Live React Dashboard Payload (schema: Planview Executive Telemetry v2)
-                  </p>
-                  <pre className="p-3.5 rounded-xl bg-slate-900 text-slate-200 font-mono text-xs overflow-x-auto max-h-60 border border-slate-800">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <p className="text-xs font-bold text-slate-500 uppercase">
+                      Live React Dashboard Payload (schema: Planview Executive Telemetry v2)
+                    </p>
+                    <span className="text-[11px] text-slate-400">
+                      {Object.keys(nodesMap).length} Active Nodes Monitored
+                    </span>
+                  </div>
+                  <pre className="p-3.5 rounded-xl bg-slate-900 text-slate-200 font-mono text-xs overflow-x-auto max-h-48 border border-slate-800">
                     {JSON.stringify(industry.executivePayload, null, 2)}
                   </pre>
                 </div>

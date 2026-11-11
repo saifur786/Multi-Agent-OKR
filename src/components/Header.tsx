@@ -14,12 +14,13 @@ import {
   Play,
   RotateCcw,
   Plus,
-  Users
+  Users,
+  LineChart
 } from 'lucide-react';
 import { IndustryDataBundle, IndustryKey } from '../types/orchestration';
 import { StatusBadge } from './StatusBadge';
 
-export type ActiveNavView = 'lifecycle' | 'traceability' | 'knowledge' | 'advisory';
+export type ActiveNavView = 'lifecycle' | 'traceability' | 'knowledge' | 'advisory' | 'performance';
 
 interface HeaderProps {
   industry: IndustryDataBundle;
@@ -202,6 +203,18 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <Users className="w-4 h-4 text-amber-500" />
               Advisory Committee Outcomes
+            </button>
+            <button
+              onClick={() => onSelectView('performance')}
+              aria-label="Switch to Advisory Performance & Accuracy Analytics"
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all cursor-pointer ${
+                activeView === 'performance'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <LineChart className="w-4 h-4 text-emerald-500" />
+              Accuracy Analytics (R² &amp; CI)
             </button>
             <button
               onClick={() => onSelectView('knowledge')}

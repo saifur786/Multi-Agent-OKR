@@ -13,12 +13,22 @@ import {
   ExternalLink,
   Zap,
   Layers,
-  ArrowRight
+  ArrowRight,
+  Download,
+  FileText,
+  Table,
+  Check
 } from 'lucide-react';
 import { IndustryDataBundle, LifecycleStage, TraceabilityNode } from '../types/orchestration';
 import { StatusBadge } from './StatusBadge';
 import { eventBus } from '../utils/eventBus';
 import { AgentDeepDiveModal } from './AgentDeepDiveModal';
+import {
+  generateExecutiveReportCSV,
+  generateBusinessRequirementDocument,
+  generateRequirementTraceabilityMatrixCSV,
+  triggerFileDownload
+} from '../utils/documentGenerators';
 
 interface LifecycleViewProps {
   industry: IndustryDataBundle;
@@ -74,6 +84,67 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
       setIsSimulating(false);
       setSimRunCount((prev) => prev + 1);
     }, 550);
+  };
+
+  const [exportedCsv, setExportedCsv] = useState(false);
+  const [downloadedBrd, setDownloadedBrd] = useState(false);
+  const [downloadedRtm, setDownloadedRtm] = useState(false);
+
+  // Export 7-layer node health and OKR metrics to CSV
+  const handleExportCSV = () => {
+    const csv = generateExecutiveReportCSV(industry, nodesMap);
+    const filename = `${industry.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_executive_traceability_health.csv`;
+    triggerFileDownload(csv, filename, 'text/csv;charset=utf-8;');
+    setExportedCsv(true);
+    setTimeout(() => setExportedCsv(false), 2500);
+
+    eventBus.publish({
+      topic: 'EXECUTIVE_REPORT_EXPORTED',
+      sourceAgent: 'Executive Reporting Agent',
+      targetAgent: 'Supervisor Agent',
+      summary: `Exported comprehensive 7-layer node health and OKR traceability CSV for ${industry.name}`,
+      payload: { filename, totalNodes: Object.keys(nodesMap).length, quarter: industry.quarter },
+      latencyMs: 18,
+      severity: 'success'
+    });
+  };
+
+  // Download Business Requirement Document (BRD)
+  const handleDownloadBRD = () => {
+    const brd = generateBusinessRequirementDocument(industry);
+    const filename = `Planview_Anvi_Business_Requirement_Document_${industry.name.replace(/[^a-zA-Z0-9]/g, '_')}.md`;
+    triggerFileDownload(brd, filename, 'text/markdown;charset=utf-8;');
+    setDownloadedBrd(true);
+    setTimeout(() => setDownloadedBrd(false), 2500);
+
+    eventBus.publish({
+      topic: 'GOVERNANCE_DOC_EXPORTED',
+      sourceAgent: 'Executive Reporting Agent',
+      targetAgent: 'Enterprise Architecture Board',
+      summary: `Generated and downloaded formal Business Requirement Document (BRD) for ${industry.name}`,
+      payload: { filename, docType: 'BRD', standard: 'BRD-PV-ANVI-2026-V2.4' },
+      latencyMs: 22,
+      severity: 'info'
+    });
+  };
+
+  // Download Requirement Traceability Matrix (RTM)
+  const handleDownloadRTM = () => {
+    const rtm = generateRequirementTraceabilityMatrixCSV();
+    const filename = `Planview_Anvi_Requirement_Traceability_Matrix_RTM_${industry.name.replace(/[^a-zA-Z0-9]/g, '_')}.csv`;
+    triggerFileDownload(rtm, filename, 'text/csv;charset=utf-8;');
+    setDownloadedRtm(true);
+    setTimeout(() => setDownloadedRtm(false), 2500);
+
+    eventBus.publish({
+      topic: 'GOVERNANCE_DOC_EXPORTED',
+      sourceAgent: 'Executive Reporting Agent',
+      targetAgent: 'Quality & Governance Auditor',
+      summary: `Generated and downloaded formal Requirement Traceability Matrix (RTM) CSV for ${industry.name}`,
+      payload: { filename, docType: 'RTM', mappingsCount: 18 },
+      latencyMs: 20,
+      severity: 'info'
+    });
   };
 
   return (
@@ -176,6 +247,71 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
                 </button>
               </div>
             </div>
+
+            {/* Stage 5 Special: Executive Reporting & Governance Exports */}
+            {activeStage.id === 5 && (
+              <div className="p-4 rounded-xl bg-gradient-to-r from-emerald-50/80 via-white to-indigo-50/80 border border-emerald-200/80 shadow-2xs space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                  <div>
+                    <span className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider flex items-center gap-1.5">
+                      <BarChart3 className="w-3.5 h-3.5 text-emerald-600" />
+                      Executive Governance &amp; Traceability Downloads
+                    </span>
+                    <p className="text-xs text-slate-700 font-medium mt-0.5">
+                      Export comprehensive 7-layer node health, OKR status, and download formal BRD &amp; RTM documents.
+                    </p>
+                  </div>
+                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 shrink-0">
+                    {Object.keys(nodesMap).length} Monitored Nodes
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-emerald-100">
+                  {/* Export to CSV Button */}
+                  <button
+                    onClick={handleExportCSV}
+                    aria-label="Export to CSV"
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-2xs transition-all cursor-pointer ${
+                      exportedCsv
+                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                        : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                    }`}
+                  >
+                    {exportedCsv ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" />
+                        <span>CSV Exported</span>
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Export to CSV</span>
+                      </>
+                    )}
+                  </button>
+
+                  {/* Download BRD Button */}
+                  <button
+                    onClick={handleDownloadBRD}
+                    aria-label="Download Business Requirement Document"
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 shadow-2xs transition-all cursor-pointer"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>{downloadedBrd ? '✓ BRD Downloaded' : 'Download BRD (.md)'}</span>
+                  </button>
+
+                  {/* Download RTM Button */}
+                  <button
+                    onClick={handleDownloadRTM}
+                    aria-label="Download Requirement Traceability Matrix"
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 shadow-2xs transition-all cursor-pointer"
+                  >
+                    <Table className="w-3.5 h-3.5 text-purple-600" />
+                    <span>{downloadedRtm ? '✓ RTM Downloaded' : 'Download RTM (.csv)'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* 5 Agentic AI Actions */}
             <div>

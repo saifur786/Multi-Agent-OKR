@@ -13,7 +13,9 @@ import {
   SmartCriteria,
   AdvisoryAgentOutcome,
   AdvisoryCommitteeSummary,
-  TrajectoryPoint
+  TrajectoryPoint,
+  HistoricalAccuracyCohort,
+  AgentHistoricalAccuracyProfile
 } from '../types/orchestration';
 
 /**
@@ -709,4 +711,140 @@ export function computeVectorCosineSimilarity(vecA: number[], vecB: number[]): n
 
   if (normA === 0 || normB === 0) return 0;
   return +(dotProduct / (Math.sqrt(normA) * Math.sqrt(normB))).toFixed(4);
+}
+
+/**
+ * Generates historical performance accuracy cohorts for Recharts visualisations,
+ * tracking R² goodness of fit and confidence interval growth/tightening over time.
+ */
+export function generateHistoricalAccuracyCohorts(
+  timeframe: 'quarters' | 'sprints' = 'quarters'
+): HistoricalAccuracyCohort[] {
+  if (timeframe === 'sprints') {
+    // 12 Sprint cycles in current annual cycle
+    return [
+      { period: 'Sprint 1', cycleIndex: 1, rSquaredPolynomial: 0.78, rSquaredLinear: 0.69, predictedAttainment: 64, actualAttainment: 58, ciLower: 46, ciUpper: 82, ciSpread: 36, brierScore: 0.19, meanAbsoluteError: 8.5, consensusDivergence: 4.8, sampleSizeKRs: 24, agentCount: 3 },
+      { period: 'Sprint 2', cycleIndex: 2, rSquaredPolynomial: 0.81, rSquaredLinear: 0.72, predictedAttainment: 66, actualAttainment: 63, ciLower: 50, ciUpper: 82, ciSpread: 32, brierScore: 0.17, meanAbsoluteError: 7.2, consensusDivergence: 4.4, sampleSizeKRs: 28, agentCount: 3 },
+      { period: 'Sprint 3', cycleIndex: 3, rSquaredPolynomial: 0.83, rSquaredLinear: 0.74, predictedAttainment: 69, actualAttainment: 67, ciLower: 55, ciUpper: 83, ciSpread: 28, brierScore: 0.15, meanAbsoluteError: 6.4, consensusDivergence: 4.1, sampleSizeKRs: 34, agentCount: 4 },
+      { period: 'Sprint 4', cycleIndex: 4, rSquaredPolynomial: 0.86, rSquaredLinear: 0.77, predictedAttainment: 72, actualAttainment: 71, ciLower: 60, ciUpper: 84, ciSpread: 24, brierScore: 0.13, meanAbsoluteError: 5.5, consensusDivergence: 3.7, sampleSizeKRs: 42, agentCount: 5 },
+      { period: 'Sprint 5', cycleIndex: 5, rSquaredPolynomial: 0.88, rSquaredLinear: 0.80, predictedAttainment: 74, actualAttainment: 75, ciLower: 64, ciUpper: 84, ciSpread: 20, brierScore: 0.11, meanAbsoluteError: 4.7, consensusDivergence: 3.4, sampleSizeKRs: 48, agentCount: 5 },
+      { period: 'Sprint 6', cycleIndex: 6, rSquaredPolynomial: 0.90, rSquaredLinear: 0.82, predictedAttainment: 77, actualAttainment: 76, ciLower: 68, ciUpper: 86, ciSpread: 18, brierScore: 0.09, meanAbsoluteError: 3.9, consensusDivergence: 3.0, sampleSizeKRs: 56, agentCount: 6 },
+      { period: 'Sprint 7', cycleIndex: 7, rSquaredPolynomial: 0.92, rSquaredLinear: 0.84, predictedAttainment: 80, actualAttainment: 81, ciLower: 72, ciUpper: 88, ciSpread: 16, brierScore: 0.08, meanAbsoluteError: 3.3, consensusDivergence: 2.7, sampleSizeKRs: 64, agentCount: 6 },
+      { period: 'Sprint 8', cycleIndex: 8, rSquaredPolynomial: 0.94, rSquaredLinear: 0.86, predictedAttainment: 83, actualAttainment: 84, ciLower: 76, ciUpper: 90, ciSpread: 14, brierScore: 0.06, meanAbsoluteError: 2.8, consensusDivergence: 2.5, sampleSizeKRs: 72, agentCount: 7 },
+      { period: 'Sprint 9', cycleIndex: 9, rSquaredPolynomial: 0.96, rSquaredLinear: 0.88, predictedAttainment: 86, actualAttainment: 87, ciLower: 80, ciUpper: 92, ciSpread: 12, brierScore: 0.05, meanAbsoluteError: 2.3, consensusDivergence: 2.3, sampleSizeKRs: 84, agentCount: 8 },
+      { period: 'Sprint 10', cycleIndex: 10, rSquaredPolynomial: 0.97, rSquaredLinear: 0.89, predictedAttainment: 89, actualAttainment: 90, ciLower: 84, ciUpper: 94, ciSpread: 10, brierScore: 0.04, meanAbsoluteError: 1.9, consensusDivergence: 2.1, sampleSizeKRs: 96, agentCount: 8 },
+      { period: 'Sprint 11', cycleIndex: 11, rSquaredPolynomial: 0.98, rSquaredLinear: 0.90, predictedAttainment: 92, actualAttainment: 93, ciLower: 88, ciUpper: 96, ciSpread: 8, brierScore: 0.03, meanAbsoluteError: 1.6, consensusDivergence: 2.0, sampleSizeKRs: 112, agentCount: 8 },
+      { period: 'Sprint 12', cycleIndex: 12, rSquaredPolynomial: 0.99, rSquaredLinear: 0.91, predictedAttainment: 95, actualAttainment: 96, ciLower: 92, ciUpper: 98, ciSpread: 6, brierScore: 0.02, meanAbsoluteError: 1.3, consensusDivergence: 1.8, sampleSizeKRs: 128, agentCount: 8 }
+    ];
+  }
+
+  // 8 Quarters (Q1 2025 to Q4 2026)
+  return [
+    { period: 'Q1 2025', cycleIndex: 1, rSquaredPolynomial: 0.74, rSquaredLinear: 0.64, predictedAttainment: 68, actualAttainment: 62, ciLower: 48, ciUpper: 88, ciSpread: 40, brierScore: 0.22, meanAbsoluteError: 11.2, consensusDivergence: 5.4, sampleSizeKRs: 38, agentCount: 3 },
+    { period: 'Q2 2025', cycleIndex: 2, rSquaredPolynomial: 0.79, rSquaredLinear: 0.69, predictedAttainment: 72, actualAttainment: 69, ciLower: 55, ciUpper: 89, ciSpread: 34, brierScore: 0.18, meanAbsoluteError: 8.4, consensusDivergence: 4.7, sampleSizeKRs: 52, agentCount: 4 },
+    { period: 'Q3 2025', cycleIndex: 3, rSquaredPolynomial: 0.84, rSquaredLinear: 0.74, predictedAttainment: 75, actualAttainment: 73, ciLower: 62, ciUpper: 88, ciSpread: 26, brierScore: 0.14, meanAbsoluteError: 6.2, consensusDivergence: 4.0, sampleSizeKRs: 68, agentCount: 5 },
+    { period: 'Q4 2025', cycleIndex: 4, rSquaredPolynomial: 0.88, rSquaredLinear: 0.78, predictedAttainment: 78, actualAttainment: 79, ciLower: 68, ciUpper: 88, ciSpread: 20, brierScore: 0.11, meanAbsoluteError: 4.8, consensusDivergence: 3.3, sampleSizeKRs: 84, agentCount: 5 },
+    { period: 'Q1 2026', cycleIndex: 5, rSquaredPolynomial: 0.92, rSquaredLinear: 0.82, predictedAttainment: 81, actualAttainment: 82, ciLower: 73, ciUpper: 89, ciSpread: 16, brierScore: 0.08, meanAbsoluteError: 3.7, consensusDivergence: 2.8, sampleSizeKRs: 104, agentCount: 6 },
+    { period: 'Q2 2026', cycleIndex: 6, rSquaredPolynomial: 0.95, rSquaredLinear: 0.85, predictedAttainment: 85, actualAttainment: 86, ciLower: 79, ciUpper: 91, ciSpread: 12, brierScore: 0.06, meanAbsoluteError: 2.6, consensusDivergence: 2.4, sampleSizeKRs: 122, agentCount: 7 },
+    { period: 'Q3 2026', cycleIndex: 7, rSquaredPolynomial: 0.98, rSquaredLinear: 0.88, predictedAttainment: 89, actualAttainment: 90, ciLower: 84, ciUpper: 94, ciSpread: 10, brierScore: 0.04, meanAbsoluteError: 1.9, consensusDivergence: 2.1, sampleSizeKRs: 145, agentCount: 8 },
+    { period: 'Q4 2026', cycleIndex: 8, rSquaredPolynomial: 0.99, rSquaredLinear: 0.90, predictedAttainment: 94, actualAttainment: 95, ciLower: 90, ciUpper: 98, ciSpread: 8, brierScore: 0.02, meanAbsoluteError: 1.4, consensusDivergence: 1.9, sampleSizeKRs: 168, agentCount: 8 }
+  ];
+}
+
+/**
+ * Returns historical performance profiles across distinct advisory agent personas.
+ */
+export function generateAgentAccuracyProfiles(): AgentHistoricalAccuracyProfile[] {
+  return [
+    {
+      agentName: 'Precision & SMART Auditor',
+      role: 'Metric Verifiability & Anti-Vagueness',
+      historicalRSquared: 0.98,
+      averageMAE: 2.1,
+      ciCalibrationRate: 98.4,
+      color: '#4f46e5',
+      historicalTrend: [
+        { period: 'Q1 25', rSquared: 0.76, mae: 9.8, spread: 38 },
+        { period: 'Q2 25', rSquared: 0.82, mae: 7.2, spread: 32 },
+        { period: 'Q3 25', rSquared: 0.87, mae: 5.4, spread: 24 },
+        { period: 'Q4 25', rSquared: 0.91, mae: 4.1, spread: 18 },
+        { period: 'Q1 26', rSquared: 0.94, mae: 3.1, spread: 14 },
+        { period: 'Q2 26', rSquared: 0.96, mae: 2.5, spread: 11 },
+        { period: 'Q3 26', rSquared: 0.97, mae: 2.2, spread: 9 },
+        { period: 'Q4 26', rSquared: 0.98, mae: 2.1, spread: 7 }
+      ]
+    },
+    {
+      agentName: 'Empirical Velocity & Attainment Actuary',
+      role: 'Polynomial Regression & Run-Rate Risk',
+      historicalRSquared: 0.99,
+      averageMAE: 1.7,
+      ciCalibrationRate: 99.1,
+      color: '#059669',
+      historicalTrend: [
+        { period: 'Q1 25', rSquared: 0.78, mae: 8.9, spread: 35 },
+        { period: 'Q2 25', rSquared: 0.84, mae: 6.5, spread: 29 },
+        { period: 'Q3 25', rSquared: 0.89, mae: 4.8, spread: 21 },
+        { period: 'Q4 25', rSquared: 0.93, mae: 3.6, spread: 16 },
+        { period: 'Q1 26', rSquared: 0.96, mae: 2.7, spread: 12 },
+        { period: 'Q2 26', rSquared: 0.97, mae: 2.1, spread: 9 },
+        { period: 'Q3 26', rSquared: 0.98, mae: 1.8, spread: 7 },
+        { period: 'Q4 26', rSquared: 0.99, mae: 1.7, spread: 5 }
+      ]
+    },
+    {
+      agentName: 'Market Novelty & Disruption Advisor',
+      role: 'Strategic Breakthrough & Innovation Index',
+      historicalRSquared: 0.93,
+      averageMAE: 3.8,
+      ciCalibrationRate: 94.2,
+      color: '#d97706',
+      historicalTrend: [
+        { period: 'Q1 25', rSquared: 0.69, mae: 12.4, spread: 44 },
+        { period: 'Q2 25', rSquared: 0.74, mae: 9.8, spread: 37 },
+        { period: 'Q3 25', rSquared: 0.80, mae: 7.6, spread: 30 },
+        { period: 'Q4 25', rSquared: 0.85, mae: 5.9, spread: 23 },
+        { period: 'Q1 26', rSquared: 0.88, mae: 4.8, spread: 19 },
+        { period: 'Q2 26', rSquared: 0.90, mae: 4.2, spread: 15 },
+        { period: 'Q3 26', rSquared: 0.92, mae: 3.9, spread: 12 },
+        { period: 'Q4 26', rSquared: 0.93, mae: 3.8, spread: 10 }
+      ]
+    },
+    {
+      agentName: 'Governance, Risk & Dependency Sentinel',
+      role: 'Cross-Squad Contention & Regulatory Buffers',
+      historicalRSquared: 0.96,
+      averageMAE: 2.8,
+      ciCalibrationRate: 97.0,
+      color: '#dc2626',
+      historicalTrend: [
+        { period: 'Q1 25', rSquared: 0.73, mae: 10.6, spread: 40 },
+        { period: 'Q2 25', rSquared: 0.78, mae: 8.1, spread: 33 },
+        { period: 'Q3 25', rSquared: 0.84, mae: 6.0, spread: 25 },
+        { period: 'Q4 25', rSquared: 0.89, mae: 4.6, spread: 19 },
+        { period: 'Q1 26', rSquared: 0.92, mae: 3.6, spread: 15 },
+        { period: 'Q2 26', rSquared: 0.94, mae: 3.1, spread: 12 },
+        { period: 'Q3 26', rSquared: 0.95, mae: 2.9, spread: 9 },
+        { period: 'Q4 26', rSquared: 0.96, mae: 2.8, spread: 7 }
+      ]
+    },
+    {
+      agentName: 'C-Suite Strategic Value Assessor',
+      role: 'Top-Line Revenue & Unit Cost Elasticity',
+      historicalRSquared: 0.97,
+      averageMAE: 2.4,
+      ciCalibrationRate: 97.8,
+      color: '#7c3aed',
+      historicalTrend: [
+        { period: 'Q1 25', rSquared: 0.75, mae: 10.1, spread: 39 },
+        { period: 'Q2 25', rSquared: 0.80, mae: 7.7, spread: 31 },
+        { period: 'Q3 25', rSquared: 0.86, mae: 5.6, spread: 23 },
+        { period: 'Q4 25', rSquared: 0.90, mae: 4.2, spread: 17 },
+        { period: 'Q1 26', rSquared: 0.93, mae: 3.3, spread: 13 },
+        { period: 'Q2 26', rSquared: 0.95, mae: 2.7, spread: 10 },
+        { period: 'Q3 26', rSquared: 0.96, mae: 2.5, spread: 8 },
+        { period: 'Q4 26', rSquared: 0.97, mae: 2.4, spread: 6 }
+      ]
+    }
+  ];
 }

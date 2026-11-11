@@ -25,9 +25,13 @@ import { eventBus } from '../utils/eventBus';
 
 interface AdvisoryCommitteeViewProps {
   industry: IndustryDataBundle;
+  onNavigateToAccuracy?: () => void;
 }
 
-export const AdvisoryCommitteeView: React.FC<AdvisoryCommitteeViewProps> = ({ industry }) => {
+export const AdvisoryCommitteeView: React.FC<AdvisoryCommitteeViewProps> = ({
+  industry,
+  onNavigateToAccuracy
+}) => {
   // Configurable Agent Count N (minimum 3, up to user input e.g. 16)
   const [agentCount, setAgentCount] = useState<number>(5);
 
@@ -335,6 +339,16 @@ export const AdvisoryCommitteeView: React.FC<AdvisoryCommitteeViewProps> = ({ in
           >
             Polynomial Regression Visualizer
           </button>
+          {onNavigateToAccuracy && (
+            <button
+              onClick={onNavigateToAccuracy}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition-colors cursor-pointer"
+              title="Open Recharts historical performance view"
+            >
+              <TrendingUp className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Historical Accuracy (Recharts)</span>
+            </button>
+          )}
         </div>
 
         <span className="text-xs text-slate-500 font-medium hidden sm:inline">
