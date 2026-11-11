@@ -6,7 +6,9 @@ import {
   remediateOrphanNode,
   evaluateSmartCriteria,
   calculateRegressionPrediction,
-  computeVectorCosineSimilarity
+  computeVectorCosineSimilarity,
+  solvePolynomialRegression,
+  evaluateAdvisoryCommittee
 } from './algorithms';
 import { TraceabilityNode } from '../types/orchestration';
 
@@ -186,3 +188,44 @@ test('computeVectorCosineSimilarity computes similarity correctly', () => {
   assert.equal(simIdentical, 1);
   assert.equal(simOrthogonal, 0);
 });
+
+test('solvePolynomialRegression fits quadratic curve and calculates R-squared', () => {
+  const points = [
+    { x: 2, y: 40 },
+    { x: 4, y: 52 },
+    { x: 6, y: 66 },
+    { x: 8, y: 78 }
+  ];
+
+  const poly = solvePolynomialRegression(points);
+  assert.ok(poly.rSquared >= 0.8, `Expected high R-squared, got ${poly.rSquared}`);
+  assert.ok(typeof poly.a === 'number');
+  assert.ok(typeof poly.b === 'number');
+  assert.ok(typeof poly.c === 'number');
+  assert.ok(['Accelerating', 'Decelerating', 'Linear-Dominant'].includes(poly.curveType));
+});
+
+test('evaluateAdvisoryCommittee generates requested N advisory agents with multiple dimensions', () => {
+  const kr = 'Reduce payment API latency from 320ms to under 100ms in Q4';
+  const history = [45, 52, 60, 72];
+  const committee = evaluateAdvisoryCommittee(kr, history, 5);
+
+  assert.equal(committee.totalAgents, 5, 'Should generate exactly 5 advisory agents');
+  assert.equal(committee.agentOutcomes.length, 5);
+  
+  // Verify multiple dimensions on each agent
+  for (const agent of committee.agentOutcomes) {
+    assert.ok(agent.qualityScore >= 0 && agent.qualityScore <= 100);
+    assert.ok(agent.noveltyScore >= 0 && agent.noveltyScore <= 100);
+    assert.ok(agent.smartScore >= 0 && agent.smartScore <= 100);
+    assert.ok(agent.regressionAttainment >= 0 && agent.regressionAttainment <= 100);
+    assert.ok(agent.confidenceInterval[0] <= agent.confidenceInterval[1]);
+    assert.ok(agent.rationale.length > 10);
+  }
+
+  // Verify polynomial model & trajectory
+  assert.ok(committee.polynomialModel.rSquaredPolynomial > 0);
+  assert.equal(committee.polynomialModel.trajectory.length, 12);
+  assert.ok(committee.confidenceInterval[0] <= committee.confidenceInterval[1]);
+});
+

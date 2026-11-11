@@ -2,7 +2,7 @@
  * Planview Anvi Multi-Agent System & Knowledge Base Pipeline Types
  */
 
-export type IndustryKey = 'Banking' | 'IT Consulting' | 'Retail' | 'Power Suppliers';
+export type IndustryKey = string;
 
 export type AgentRole =
   | 'supervisor'
@@ -19,6 +19,7 @@ export type EventTopic =
   | 'STRATEGIC_THEMES_PROPOSED'
   | 'OKR_SMART_EVALUATED'
   | 'KR_REGRESSION_PREDICTED'
+  | 'ADVISORY_COMMITTEE_EVALUATED'
   | 'GRAPH_TRAVERSAL_EXECUTED'
   | 'ORPHAN_EPIC_DETECTED'
   | 'SQUAD_OVERALLOCATION_FLAGGED'
@@ -30,7 +31,8 @@ export type EventTopic =
   | 'PROJECT_RUNNER_INGESTED'
   | 'ROOT_CAUSE_SYNTHESIZED'
   | 'KNOWLEDGE_BASE_UPDATED'
-  | 'INTERVENTION_APPLIED';
+  | 'INTERVENTION_APPLIED'
+  | 'CUSTOM_INDUSTRY_SYNTHESIZED';
 
 export interface BusEvent {
   id: string;
@@ -72,7 +74,6 @@ export interface LifecycleStage {
   status: 'On Track' | 'At Risk' | 'Behind';
   aiActions: AgentActionPillars;
   simMetrics: SimulationMetrics;
-  // Specific module artifacts
   moduleDetail: {
     badge: string;
     description: string;
@@ -205,8 +206,66 @@ export interface RetrospectiveRootCause {
   ingestedIntoKnowledgeBase: boolean;
 }
 
+/**
+ * Advisory Agent Multi-Dimensional Outcome Interface
+ */
+export interface AdvisoryAgentOutcome {
+  id: string;
+  name: string;
+  role: string;
+  specialty: string;
+  qualityScore: number; // 0-100%
+  noveltyScore: number; // 0-100%
+  smartScore: number;   // 0-100%
+  regressionAttainment: number; // predicted %
+  rSquared: number;
+  confidenceInterval: [number, number];
+  verdict: 'Exceeds Bar' | 'Approved with Conditions' | 'Needs Restructuring';
+  rationale: string;
+  recommendedEnhancement: string;
+  weights: {
+    quality: number;
+    novelty: number;
+    smart: number;
+    attainment: number;
+  };
+}
+
+export interface TrajectoryPoint {
+  week: number;
+  label: string;
+  actual?: number;
+  predictedLinear: number;
+  predictedPolynomial: number;
+  ciLower: number;
+  ciUpper: number;
+}
+
+export interface AdvisoryCommitteeSummary {
+  totalAgents: number;
+  consensusScore: number;
+  averageQuality: number;
+  averageNovelty: number;
+  averageSmart: number;
+  consensusAttainmentProbability: number;
+  overallRSquared: number;
+  confidenceInterval: [number, number];
+  divergenceIndex: number;
+  polynomialModel: {
+    equation: string;
+    linearEquation: string;
+    coefficients: { a: number; b: number; c: number };
+    rSquaredLinear: number;
+    rSquaredPolynomial: number;
+    curveType: 'Accelerating' | 'Decelerating' | 'Linear-Dominant';
+    inflectionWeek: number | null;
+    trajectory: TrajectoryPoint[];
+  };
+  agentOutcomes: AdvisoryAgentOutcome[];
+}
+
 export interface IndustryDataBundle {
-  id: IndustryKey;
+  id: string;
   name: string;
   sector: string;
   quarter: string;
@@ -214,10 +273,10 @@ export interface IndustryDataBundle {
   attainment: number;
   totalBudget: string;
   activeAgents: number;
+  isCustom?: boolean;
   stages: LifecycleStage[];
   traceability: Record<number, TraceabilityNode[]>;
   knowledgeBase: KnowledgeBasePillar[];
-  // Module-specific data
   smartRubric: SmartCriteria;
   regressionModel: RegressionModelResult;
   graphDiagnostics: GraphTraversalReport;
