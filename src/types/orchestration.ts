@@ -113,6 +113,7 @@ export interface HumanPriority {
   overriddenBy: string;
   overrideTimestamp: string;
 }
+
 export interface TraceabilityNode {
   id: string;
   title: string;
@@ -136,57 +137,6 @@ export interface TraceabilityNode {
   programLifecycleStatus?: 'Active' | 'Terminated' | 'Initiated' | 'Proposed';
   targetDate?: string;
   kpiFormula?: string;
-}
-
-export interface StrategicProblem {
-  id: string;
-  title: string;
-  description: string;
-  cause: string;
-  causalChainToDollarImpact: string;
-  remediationTiming: string;
-  impactedStakeholders: string[];
-  leadingIndicators: string[];
-  laggingIndicators: string[];
-  targetMetrics: { label: string; value: string }[];
-}
-
-export interface OkrPriority {
-  id: string;
-  title: string;
-  owner: string;
-  aiPriorityScore: number;
-  manualPriorityScore: number;
-  status: 'On Track' | 'At Risk' | 'Behind';
-  strategicProblemId: string;
-  notes: string;
-}
-
-export interface ProgramPlan {
-  id: string;
-  name: string;
-  strategicStatement: string;
-  definition: string;
-  status: 'Active' | 'Paused' | 'Terminated';
-  roadmap: { phase: string; outcome: string; due: string }[];
-  resources: { owner: string; team: string; fte: number; allocationPct: number }[];
-  launchPlan: {
-    start: string;
-    goLive: string;
-    owner: string;
-    risk: string;
-  };
-}
-
-export interface IndustryEventTrigger {
-  id: string;
-  scope: 'Global' | 'Industry';
-  title: string;
-  severity: 'Low' | 'Medium' | 'High' | 'Critical';
-  description: string;
-  impact: string;
-  affectedSegments: string[];
-  triggeredAt: string;
 }
 
 export interface KnowledgeBasePillar {
@@ -483,10 +433,6 @@ export interface IndustryDataBundle {
   recentWebhooks: WebhookSimulation[];
   executivePayload: ExecutiveReportPayload;
   retrospective: RetrospectiveRootCause;
-  strategicProblems?: StrategicProblem[];
-  okrPriorities?: OkrPriority[];
-  programPlans?: ProgramPlan[];
-  significantEvents?: IndustryEventTrigger[];
   orgDirectory?: OrgDirectoryMember[];
   policies?: OkrEnterprisePolicy[];
   programs?: ManagedProgram[];

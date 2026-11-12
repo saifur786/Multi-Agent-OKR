@@ -1,4 +1,12 @@
 import { IndustryDataBundle, IndustryKey } from '../types/orchestration';
+import { TELCO_DATA } from './telcoData';
+import {
+  BANKING_ORG_DIRECTORY,
+  BANKING_POLICIES,
+  BANKING_PROGRAMS,
+  BANKING_DISASTERS,
+  GLOBAL_DISASTER_TEMPLATES
+} from './enterpriseGovernanceData';
 
 export const INDUSTRY_DATA: Record<IndustryKey, IndustryDataBundle> = {
   Telco: {
@@ -519,6 +527,10 @@ export const INDUSTRY_DATA: Record<IndustryKey, IndustryDataBundle> = {
     attainment: 74,
     totalBudget: '$42.5M',
     activeAgents: 6,
+    orgDirectory: BANKING_ORG_DIRECTORY,
+    policies: BANKING_POLICIES,
+    programs: BANKING_PROGRAMS,
+    activeDisasters: [...BANKING_DISASTERS, ...GLOBAL_DISASTER_TEMPLATES],
     stages: [
       {
         id: 1,
@@ -2067,5 +2079,6 @@ export const INDUSTRY_DATA: Record<IndustryKey, IndustryDataBundle> = {
       actionableLesson: 'Standardize modular wireless LTE/5G telemetry gateways to enable logical software commissioning weeks before physical fiber pull.',
       ingestedIntoKnowledgeBase: true
     }
-  }
+  },
+  Telco: TELCO_DATA
 };

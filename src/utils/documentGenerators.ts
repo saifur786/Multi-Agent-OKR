@@ -484,6 +484,56 @@ export function generateRequirementTraceabilityMatrixCSV(): string {
       layer: 'Layers 1 through 7 (Full Traceability Hierarchy)',
       test: 'calculate7LayerNodeUtilisation test',
       status: 'VERIFIED_PASSED'
+    },
+    {
+      id: 'REQ-TRAJECTORY-01',
+      category: 'Predictive Trajectory',
+      req: 'System shall project future OKR attainment based on regression coefficients in a Target vs. Predicted Recharts trajectory',
+      spec: 'Recharts ComposedChart projecting 5-quarter horizons with 95% CI bands, polynomial model curve, and milestone checkpoints',
+      agent: 'OKR Quality & Prediction Agent (Stage 2)',
+      layer: 'Layer 3 (Objectives & Key Results)',
+      test: 'computeFutureAttainmentTrajectory test',
+      status: 'VERIFIED_PASSED'
+    },
+    {
+      id: 'REQ-HITL-01',
+      category: 'Human-in-the-Loop Governance',
+      req: 'System shall allow manual Human-in-the-Loop prioritisation over AI for each OKR with audit logging',
+      spec: 'P0 to P3 priority selector overriding AI recommendations and publishing MANUAL_PRIORITY_OVERRIDDEN events to Event Bus',
+      agent: 'Supervisor Agent & Human Executive',
+      layer: 'Layer 3 (Objectives & Key Results)',
+      test: 'handleSetManualPriority test',
+      status: 'VERIFIED_PASSED'
+    },
+    {
+      id: 'REQ-PROGRAM-01',
+      category: 'Program Lifecycle',
+      req: 'System shall support terminating running programs and initiating new programs with structured 6-attribute business problems',
+      spec: 'Program management workflow with definition, roadmap, squad allocation, and dynamic stage recalculation',
+      agent: 'Alignment & Capacity Agent (Stage 3)',
+      layer: 'Layers 4 & 5 (Programs & Epics)',
+      test: 'programLifecycle test',
+      status: 'VERIFIED_PASSED'
+    },
+    {
+      id: 'REQ-DISASTER-01',
+      category: 'Resilience & Disaster Simulation',
+      req: 'System shall support triggering global or industry-level catastrophic disaster events with real-time shock impact',
+      spec: 'Disaster console triggering cyberattacks, data centre outages, subsea fiber cuts, and natural disasters with trajectory shocks',
+      agent: 'Risk Detection Agent (Stage 4)',
+      layer: 'Cross-Portfolio Infrastructure',
+      test: 'simulateDisasterImpact test',
+      status: 'VERIFIED_PASSED'
+    },
+    {
+      id: 'REQ-SUPERVISOR-01',
+      category: 'Supervisor Validation',
+      req: 'Supervisor Agent shall validate OKR structural adequacy, HR ownership, and enterprise policies',
+      spec: 'Structural audit verifying ownership against HR directory, measurability & ambition scores, and policy compliance',
+      agent: 'Supervisor Agent (Anvi)',
+      layer: 'Enterprise Governance',
+      test: 'validateOkrStructuralAdequacy test',
+      status: 'VERIFIED_PASSED'
     }
   ];
 
