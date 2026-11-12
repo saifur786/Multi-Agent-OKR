@@ -21,7 +21,7 @@ import {
 import { IndustryDataBundle, IndustryKey } from '../types/orchestration';
 import { StatusBadge } from './StatusBadge';
 
-export type ActiveNavView = 'lifecycle' | 'traceability' | 'knowledge' | 'advisory' | 'performance' | 'heatmap';
+export type ActiveNavView = 'lifecycle' | 'traceability' | 'knowledge' | 'advisory' | 'performance' | 'heatmap' | 'strategy';
 
 interface HeaderProps {
   industry: IndustryDataBundle;
@@ -229,6 +229,18 @@ export const Header: React.FC<HeaderProps> = ({
               <Flame className="w-4 h-4 text-red-500" />
               <span>Utilisation Heatmap</span>
               <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+            </button>
+            <button
+              onClick={() => onSelectView('strategy')}
+              aria-label="Switch to Strategic Portfolio Planner"
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all cursor-pointer ${
+                activeView === 'strategy'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <Target className="w-4 h-4 text-amber-500" />
+              Strategic Portfolio Planner
             </button>
             <button
               onClick={() => onSelectView('knowledge')}

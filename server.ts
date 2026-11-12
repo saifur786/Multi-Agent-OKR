@@ -11,7 +11,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const INITIAL_PORT = Number(process.env.PORT) || 3000;
+
+function startServerOnPort(port: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port, () => {
+      console.log(`Planview Anvi Multi-Agent System server running on http://localhost:${port}`);
+      resolve(port);
+    });
+
+    server.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'EADDRINUSE') {
+        const nextPort = port + 1;
+        console.warn(`Port ${port} is already in use. Retrying on ${nextPort}...`);
+        server.close(() => {
+          startServerOnPort(nextPort).then(resolve).catch(reject);
+        });
+        return;
+      }
+
+      reject(error);
+    });
+  });
+}
 
 app.use(express.json());
 
@@ -387,9 +409,13 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, () => {
-    console.log(`Planview Anvi Multi-Agent System server running on http://localhost:${PORT}`);
-  });
+  try {
+    const activePort = await startServerOnPort(INITIAL_PORT);
+    console.log(`App is listening on http://localhost:${activePort}`);
+  } catch (error) {
+    console.error('Unable to start the application server:', error);
+    process.exit(1);
+  }
 }
 
 startServer();

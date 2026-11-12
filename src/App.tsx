@@ -16,6 +16,7 @@ import { AddCustomIndustryModal } from './components/AddCustomIndustryModal';
 import { AdvisoryCommitteeView } from './components/AdvisoryCommitteeView';
 import { AdvisoryPerformanceAccuracyView } from './components/AdvisoryPerformanceAccuracyView';
 import { ResourceUtilisationHeatmapView } from './components/ResourceUtilisationHeatmapView';
+import { StrategicPortfolioPlannerView } from './components/StrategicPortfolioPlannerView';
 
 export default function App() {
   // Dynamic Industries Dictionary (includes defaults + user-created custom industries)
@@ -296,6 +297,10 @@ export default function App() {
         )}
 
         {/* View 6: 5-Pillar AI Knowledge Base */}
+        {activeView === 'strategy' && (
+          <StrategicPortfolioPlannerView industry={industry} />
+        )}
+
         {activeView === 'knowledge' && (
           <KnowledgeBaseView
             industry={industry}
