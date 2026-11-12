@@ -17,6 +17,15 @@ import { AdvisoryCommitteeView } from './components/AdvisoryCommitteeView';
 import { AdvisoryPerformanceAccuracyView } from './components/AdvisoryPerformanceAccuracyView';
 import { ResourceUtilisationHeatmapView } from './components/ResourceUtilisationHeatmapView';
 import { StrategicPortfolioPlannerView } from './components/StrategicPortfolioPlannerView';
+import { OkrTrajectoryView } from './components/OkrTrajectoryView';
+import { OkrProgramStudioView } from './components/OkrProgramStudioView';
+import { EnterpriseGovernanceModal } from './components/EnterpriseGovernanceModal';
+import {
+  OrgDirectoryMember,
+  OkrEnterprisePolicy,
+  ManagedProgram,
+  SignificantDisasterEvent
+} from './types/orchestration';
 
 export default function App() {
   // Dynamic Industries Dictionary (includes defaults + user-created custom industries)
@@ -26,12 +35,13 @@ export default function App() {
 
   const industriesList = useMemo(() => Object.keys(industriesDict), [industriesDict]);
 
-  const [selectedIndustry, setSelectedIndustry] = useState<string>('Banking');
+  const [selectedIndustry, setSelectedIndustry] = useState<string>('Telco');
   const [activeView, setActiveView] = useState<ActiveNavView>('lifecycle');
   const [activeStageId, setActiveStageId] = useState<number>(1);
   const [isEventBusOpen, setIsEventBusOpen] = useState<boolean>(false);
   const [isOrchestratingAll, setIsOrchestratingAll] = useState<boolean>(false);
   const [isAddCustomIndustryOpen, setIsAddCustomIndustryOpen] = useState<boolean>(false);
+  const [isGovernanceOpen, setIsGovernanceOpen] = useState<boolean>(false);
 
   const [fedPillars, setFedPillars] = useState<Record<string, boolean>>({
     kb1: true,
@@ -46,6 +56,20 @@ export default function App() {
   );
 
   const industry = industriesDict[selectedIndustry] || industriesDict['Banking'];
+
+  // Enterprise Governance State
+  const [managedPrograms, setManagedPrograms] = useState<ManagedProgram[]>(
+    () => industry.programs || []
+  );
+  const [activeDisasters, setActiveDisasters] = useState<SignificantDisasterEvent[]>(
+    () => industry.activeDisasters || []
+  );
+  const [orgDirectory, setOrgDirectory] = useState<OrgDirectoryMember[]>(
+    () => industry.orgDirectory || []
+  );
+  const [policies, setPolicies] = useState<OkrEnterprisePolicy[]>(
+    () => industry.policies || []
+  );
 
   // Flatten nodes for the selected industry into state for live manipulation
   const [nodesMap, setNodesMap] = useState<Record<string, TraceabilityNode>>(() => {
@@ -83,6 +107,10 @@ export default function App() {
       });
     });
     setNodesMap(map);
+    setManagedPrograms(newInd.programs || []);
+    setActiveDisasters(newInd.activeDisasters || []);
+    setOrgDirectory(newInd.orgDirectory || []);
+    setPolicies(newInd.policies || []);
 
     const firstL2 = newInd.traceability[2]?.[0]?.id || newInd.traceability[1][0].id;
     setSelectedNodeId(firstL2);
@@ -223,6 +251,8 @@ export default function App() {
         isEventBusOpen={isEventBusOpen}
         onToggleEventBus={() => setIsEventBusOpen((prev) => !prev)}
         onOpenAddCustomIndustry={() => setIsAddCustomIndustryOpen(true)}
+        onOpenGovernance={() => setIsGovernanceOpen(true)}
+        activeDisasterCount={activeDisasters.filter((d) => d.active).length}
       />
 
       {/* Main Body */}
@@ -300,7 +330,19 @@ export default function App() {
         {activeView === 'strategy' && (
           <StrategicPortfolioPlannerView industry={industry} />
         )}
-
+        
+        {/* View 7: Enterprise Governance, Policies & Org Data */}
+        {activeView === 'governance' && (
+          <EnterpriseGovernanceModal
+            industry={industry}
+            orgDirectory={orgDirectory}
+            onUpdateOrgDirectory={setOrgDirectory}
+            policies={policies}
+            onUpdatePolicies={setPolicies}
+            onClose={() => setIsGovernanceOpen(false)}
+          />
+        )}
+        {/* View 8: 5-Pillar AI Knowledge Base */}
         {activeView === 'knowledge' && (
           <KnowledgeBaseView
             industry={industry}
@@ -309,7 +351,45 @@ export default function App() {
             activeFedCount={activeFedCount}
           />
         )}
+        {/* View 6: OKR Future Attainment Trajectory (Target vs Predicted Recharts) */}
+        {activeView === 'trajectory' && (
+          <OkrTrajectoryView
+            industry={industry}
+            nodesMap={nodesMap}
+            activeDisasters={activeDisasters}
+            managedPrograms={managedPrograms}
+            onNavigateToStudio={() => setActiveView('studio')}
+          />
+        )}
+
+        {/* View 7: OKR & Program Management Studio (HITL & Disaster Events) */}
+        {activeView === 'studio' && (
+          <OkrProgramStudioView
+            industry={industry}
+            nodesMap={nodesMap}
+            onUpdateNodesMap={setNodesMap}
+            managedPrograms={managedPrograms}
+            onUpdateManagedPrograms={setManagedPrograms}
+            activeDisasters={activeDisasters}
+            onUpdateActiveDisasters={setActiveDisasters}
+            orgDirectory={orgDirectory}
+            policies={policies}
+            onNavigateToTrajectory={() => setActiveView('trajectory')}
+          />
+        )}
       </main>
+
+      {/* Enterprise Governance, Policies & Org Data Modal */}
+      {isGovernanceOpen && (
+        <EnterpriseGovernanceModal
+          industry={industry}
+          orgDirectory={orgDirectory}
+          onUpdateOrgDirectory={setOrgDirectory}
+          policies={policies}
+          onUpdatePolicies={setPolicies}
+          onClose={() => setIsGovernanceOpen(false)}
+        />
+      )}
 
       {/* Add Custom Industry Modal */}
       {isAddCustomIndustryOpen && (

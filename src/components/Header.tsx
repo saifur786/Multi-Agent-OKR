@@ -16,12 +16,25 @@ import {
   Plus,
   Users,
   LineChart,
-  Flame
+  Flame,
+  TrendingUp,
+  Sliders,
+  ShieldCheck,
+  AlertOctagon
 } from 'lucide-react';
 import { IndustryDataBundle, IndustryKey } from '../types/orchestration';
 import { StatusBadge } from './StatusBadge';
 
-export type ActiveNavView = 'lifecycle' | 'traceability' | 'knowledge' | 'advisory' | 'performance' | 'heatmap' | 'strategy';
+export type ActiveNavView = 
+  'lifecycle' 
+  | 'traceability' 
+  | 'knowledge' 
+  | 'advisory' 
+  | 'performance' 
+  | 'heatmap' 
+  | 'strategy'
+  | 'trajectory'
+  | 'studio';
 
 interface HeaderProps {
   industry: IndustryDataBundle;
@@ -36,13 +49,16 @@ interface HeaderProps {
   isEventBusOpen: boolean;
   onToggleEventBus: () => void;
   onOpenAddCustomIndustry: () => void;
+  onOpenGovernance?: () => void;
+  activeDisasterCount?: number;
 }
 
 const DEFAULT_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
   Banking: Building2,
   'IT Consulting': Briefcase,
   Retail: ShoppingBag,
-  'Power Suppliers': Zap
+  'Power Suppliers': Zap,
+  Telco: Radio
 };
 
 export const Header: React.FC<HeaderProps> = ({
@@ -57,7 +73,9 @@ export const Header: React.FC<HeaderProps> = ({
   eventCount,
   isEventBusOpen,
   onToggleEventBus,
-  onOpenAddCustomIndustry
+  onOpenAddCustomIndustry,
+  onOpenGovernance,
+  activeDisasterCount = 0
 }) => {
   return (
     <header className="sticky top-0 z-30 bg-white border-b border-slate-200 shadow-xs">
@@ -125,6 +143,28 @@ export const Header: React.FC<HeaderProps> = ({
                 <Plus className="w-3.5 h-3.5" />
                 <span>Custom Industry</span>
               </button>
+
+              {onOpenGovernance && (
+                <button
+                  onClick={onOpenGovernance}
+                  aria-label="Configure Enterprise Governance, Policies & Org Data"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-100 border border-slate-200 transition-all cursor-pointer"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5 text-indigo-600" />
+                  <span>Policies &amp; Org</span>
+                </button>
+              )}
+
+              {activeDisasterCount > 0 && (
+                <button
+                  onClick={() => onSelectView('studio')}
+                  aria-label="View Active Crisis & Disasters"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-bold text-red-700 bg-red-100 hover:bg-red-200 border border-red-300 transition-all cursor-pointer animate-pulse"
+                >
+                  <AlertOctagon className="w-3.5 h-3.5 text-red-600" />
+                  <span>Crisis Active ({activeDisasterCount})</span>
+                </button>
+              )}              
             </div>
 
             {/* Event Bus Drawer Toggle Button */}
@@ -217,6 +257,30 @@ export const Header: React.FC<HeaderProps> = ({
               <LineChart className="w-4 h-4 text-emerald-500" />
               Accuracy Analytics (R² &amp; CI)
             </button>
+            <button
+              onClick={() => onSelectView('trajectory')}
+              aria-label="Switch to Target vs. Predicted Trajectory View"
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all cursor-pointer ${
+                activeView === 'trajectory'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <TrendingUp className="w-4 h-4 text-sky-500" />
+              <span>Target vs. Predicted Trajectory</span>
+            </button>
+            <button
+              onClick={() => onSelectView('studio')}
+              aria-label="Switch to OKR & Program Management Studio"
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-all cursor-pointer ${
+                activeView === 'studio'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <Sliders className="w-4 h-4 text-violet-500" />
+              <span>OKR &amp; Program Studio</span>
+            </button>            
             <button
               onClick={() => onSelectView('heatmap')}
               aria-label="Switch to 7-Layer Resource Utilisation Heatmap"

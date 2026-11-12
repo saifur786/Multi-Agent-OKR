@@ -3,7 +3,9 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
+import { MongoClient, type Db } from 'mongodb';
 import { GoogleGenAI, Type } from '@google/genai';
+import { INDUSTRY_DATA } from './src/data/industryData';
 
 dotenv.config();
 
@@ -12,6 +14,43 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const INITIAL_PORT = Number(process.env.PORT) || 3000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/';
+const DATABASE_NAME = process.env.MONGODB_DB_NAME || 'multi_agent_okr';
+
+let mongoClient: MongoClient | null = null;
+let mongoDb: Db | null = null;
+
+async function connectMongo() {
+  if (mongoDb) return mongoDb;
+
+  try {
+    mongoClient = new MongoClient(MONGODB_URI);
+    await mongoClient.connect();
+    mongoDb = mongoClient.db(DATABASE_NAME);
+    await mongoDb.collection('industries').createIndex({ id: 1 }, { unique: true });
+    await mongoDb.collection('industries').createIndex({ name: 1 });
+    console.log(`Connected to MongoDB at ${MONGODB_URI}`);
+    return mongoDb;
+  } catch (error) {
+    console.warn('MongoDB connection unavailable; continuing in memory-only mode.', error);
+    return null;
+  }
+}
+
+async function seedIndustriesIfEmpty() {
+  if (!mongoDb) return;
+
+  const count = await mongoDb.collection('industries').countDocuments();
+  if (count > 0) return;
+
+  const documents = Object.values(INDUSTRY_DATA).map((industry) => ({
+    ...industry,
+    _lastUpdated: new Date().toISOString()
+  }));
+
+  await mongoDb.collection('industries').insertMany(documents);
+  console.log(`Seeded ${documents.length} industry records into MongoDB.`);
+}
 
 function startServerOnPort(port: number): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -36,6 +75,43 @@ function startServerOnPort(port: number): Promise<number> {
 }
 
 app.use(express.json());
+
+app.get('/api/health', async (_req, res) => {
+  const db = await connectMongo();
+  res.json({ ok: true, mongo: !!db, database: DATABASE_NAME, uri: MONGODB_URI });
+});
+
+app.get('/api/industries', async (_req, res) => {
+  const db = await connectMongo();
+  if (!db) {
+    return res.json({ industries: Object.values(INDUSTRY_DATA) });
+  }
+
+  const industries = await db.collection('industries').find({}).sort({ name: 1 }).toArray();
+  return res.json({ industries });
+});
+
+app.post('/api/industries', async (req, res) => {
+  const db = await connectMongo();
+  const payload = req.body;
+
+  if (!payload?.id || !payload?.name) {
+    return res.status(400).json({ error: 'Industry id and name are required.' });
+  }
+
+  if (!db) {
+    const nextIndex = { ...INDUSTRY_DATA, [payload.name]: payload };
+    return res.status(201).json({ industry: payload, source: 'memory' });
+  }
+
+  const result = await db.collection('industries').updateOne(
+    { id: payload.id },
+    { $set: { ...payload, _lastUpdated: new Date().toISOString() } },
+    { upsert: true }
+  );
+
+  res.status(201).json({ industry: payload, source: 'mongodb', upserted: result.upsertedCount > 0 });
+});
 
 // Initialize GoogleGenAI server-side client
 let ai: GoogleGenAI | null = null;
@@ -410,6 +486,8 @@ async function startServer() {
   }
 
   try {
+    await connectMongo();
+    await seedIndustriesIfEmpty();
     const activePort = await startServerOnPort(INITIAL_PORT);
     console.log(`App is listening on http://localhost:${activePort}`);
   } catch (error) {

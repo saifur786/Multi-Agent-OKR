@@ -34,7 +34,14 @@ export type EventTopic =
   | 'INTERVENTION_APPLIED'
   | 'CUSTOM_INDUSTRY_SYNTHESIZED'
   | 'EXECUTIVE_REPORT_EXPORTED'
-  | 'GOVERNANCE_DOC_EXPORTED';
+  | 'GOVERNANCE_DOC_EXPORTED'
+  | 'MANUAL_PRIORITY_OVERRIDDEN'
+  | 'OKR_CREATED_OR_EDITED'
+  | 'PROGRAM_TERMINATED'
+  | 'PROGRAM_INITIATED'
+  | 'SIGNIFICANT_EVENT_TRIGGERED'
+  | 'SIGNIFICANT_EVENT_RESOLVED'
+  | 'GOVERNANCE_POLICY_VALIDATED';
 
 export interface BusEvent {
   id: string;
@@ -82,6 +89,30 @@ export interface LifecycleStage {
   };
 }
 
+export interface BusinessMetricIndicator {
+  indicator: string;
+  baselineValue: string;
+  targetValue: string;
+  metricType: 'Leading' | 'Lagging';
+}
+
+export interface StructuredBusinessProblem {
+  problemDescription: string;
+  impactedStakeholders: string[];
+  causalChainToDollarImpact: string;
+  rootCause: string;
+  targetRemediationTiming: string;
+  metrics: BusinessMetricIndicator[];
+}
+
+export type PriorityLevel = 'P0 - Critical' | 'P1 - High' | 'P2 - Medium' | 'P3 - Deferred' | 'AI_RECOMMENDED';
+
+export interface HumanPriority {
+  priority: PriorityLevel;
+  overrideReason: string;
+  overriddenBy: string;
+  overrideTimestamp: string;
+}
 export interface TraceabilityNode {
   id: string;
   title: string;
@@ -98,6 +129,13 @@ export interface TraceabilityNode {
     loadPct: number;
   };
   isOrphan?: boolean;
+  manualPriority?: HumanPriority;
+  businessProblem?: StructuredBusinessProblem;
+  measurabilityScore?: number;
+  ambitionScore?: number;
+  programLifecycleStatus?: 'Active' | 'Terminated' | 'Initiated' | 'Proposed';
+  targetDate?: string;
+  kpiFormula?: string;
 }
 
 export interface StrategicProblem {
@@ -344,6 +382,87 @@ export interface AgentHistoricalAccuracyProfile {
   historicalTrend: { period: string; rSquared: number; mae: number; spread: number }[];
 }
 
+export interface OrgDirectoryMember {
+  id: string;
+  name: string;
+  role: string;
+  department: string;
+  title: string;
+  email: string;
+  fteCapacity: number;
+}
+
+export interface OkrEnterprisePolicy {
+  id: string;
+  ruleName: string;
+  category: 'Cadence' | 'SMART Threshold' | 'Ownership' | 'Ambition' | 'Checkpoints';
+  description: string;
+  minMeasurableScore: number;
+  minAmbitionScore: number;
+  maxKrsPerObjective: number;
+  mandatoryMetadataFields: string[];
+  governanceFrequency: 'Weekly' | 'Bi-Weekly' | 'Monthly' | 'Quarterly';
+  status: 'Enforced' | 'Warning' | 'Exempt';
+}
+
+export interface ManagedProgram {
+  id: string;
+  title: string;
+  status: 'Active' | 'Terminated' | 'Initiated' | 'Proposed';
+  linkedOkrId?: string;
+  strategicStatement: {
+    issues: string;
+    intent: string;
+    growthVision: string;
+  };
+  businessProblem: StructuredBusinessProblem;
+  roadmap: {
+    milestone: string;
+    targetQuarter: string;
+    deliverables: string[];
+    status: 'Completed' | 'In Progress' | 'Upcoming';
+  }[];
+  resourceAssignments: {
+    squadId: string;
+    squadName: string;
+    assignedFte: number;
+    budgetAllocation: string;
+  }[];
+  terminationReason?: string;
+  terminationDate?: string;
+  reallocatedHeadcount?: number;
+  reallocatedBudget?: string;
+}
+
+export interface SignificantDisasterEvent {
+  id: string;
+  title: string;
+  type: 'cyberattack' | 'datacenter_outage' | 'network_saturation' | 'natural_disaster' | 'regulatory_shock';
+  industry: string | 'Global';
+  severity: 'Critical' | 'Severe' | 'Moderate';
+  active: boolean;
+  description: string;
+  impacts: {
+    attainmentDropPct: number;
+    impactedLayerIds: number[];
+    affectedSquads: string[];
+    costImpact: string;
+    mitigationAction: string;
+  };
+}
+
+export interface FutureTrajectoryPoint {
+  period: string;
+  quarterIndex: number;
+  targetTrajectory: number;
+  aiPredictedTrajectory: number;
+  ciLower: number;
+  ciUpper: number;
+  humanPrioritisedTrajectory: number;
+  disasterShockTrajectory?: number;
+  milestoneEvent?: string;
+}
+
 export interface IndustryDataBundle {
   id: string;
   name: string;
@@ -368,4 +487,8 @@ export interface IndustryDataBundle {
   okrPriorities?: OkrPriority[];
   programPlans?: ProgramPlan[];
   significantEvents?: IndustryEventTrigger[];
+  orgDirectory?: OrgDirectoryMember[];
+  policies?: OkrEnterprisePolicy[];
+  programs?: ManagedProgram[];
+  activeDisasters?: SignificantDisasterEvent[];
 }
