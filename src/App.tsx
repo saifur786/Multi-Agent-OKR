@@ -3,23 +3,67 @@
  * Supervisor-Worker Multi-Agent Orchestration Engine over Asynchronous Event Bus
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'react';
 import { INDUSTRY_DATA } from './data/industryData';
 import { IndustryKey, TraceabilityNode, BusEvent, IndustryDataBundle } from './types/orchestration';
 import { eventBus } from './utils/eventBus';
 import { Header, ActiveNavView } from './components/Header';
 import { LifecycleView } from './components/LifecycleView';
-import { TraceabilityView } from './components/TraceabilityView';
-import { KnowledgeBaseView } from './components/KnowledgeBaseView';
-import { SupervisorEventBus } from './components/SupervisorEventBus';
-import { AddCustomIndustryModal } from './components/AddCustomIndustryModal';
-import { AdvisoryCommitteeView } from './components/AdvisoryCommitteeView';
-import { AdvisoryPerformanceAccuracyView } from './components/AdvisoryPerformanceAccuracyView';
-import { ResourceUtilisationHeatmapView } from './components/ResourceUtilisationHeatmapView';
-import { StrategicPortfolioPlannerView } from './components/StrategicPortfolioPlannerView';
-import { OkrTrajectoryView } from './components/OkrTrajectoryView';
-import { OkrProgramStudioView } from './components/OkrProgramStudioView';
-import { EnterpriseGovernanceModal } from './components/EnterpriseGovernanceModal';
+
+function lazyWithRetry<T extends React.ComponentType<any>>(
+  loader: () => Promise<{ default: T }>,
+  retries = 3
+): React.LazyExoticComponent<T> {
+  return React.lazy(async () => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await loader();
+      } catch (err) {
+        lastError = err;
+        if (attempt < retries) {
+          const delayMs = 400 * Math.pow(2, attempt);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+    throw lastError;
+  });
+}
+
+const TraceabilityView = lazyWithRetry(() =>
+  import('./components/TraceabilityView').then((m) => ({ default: m.TraceabilityView }))
+);
+const KnowledgeBaseView = lazyWithRetry(() =>
+  import('./components/KnowledgeBaseView').then((m) => ({ default: m.KnowledgeBaseView }))
+);
+const SupervisorEventBus = lazyWithRetry(() =>
+  import('./components/SupervisorEventBus').then((m) => ({ default: m.SupervisorEventBus }))
+);
+const AddCustomIndustryModal = lazyWithRetry(() =>
+  import('./components/AddCustomIndustryModal').then((m) => ({ default: m.AddCustomIndustryModal }))
+);
+const AdvisoryCommitteeView = lazyWithRetry(() =>
+  import('./components/AdvisoryCommitteeView').then((m) => ({ default: m.AdvisoryCommitteeView }))
+);
+const AdvisoryPerformanceAccuracyView = lazyWithRetry(() =>
+  import('./components/AdvisoryPerformanceAccuracyView').then((m) => ({ default: m.AdvisoryPerformanceAccuracyView }))
+);
+const ResourceUtilisationHeatmapView = lazyWithRetry(() =>
+  import('./components/ResourceUtilisationHeatmapView').then((m) => ({ default: m.ResourceUtilisationHeatmapView }))
+);
+const StrategicPortfolioPlannerView = lazyWithRetry(() =>
+  import('./components/StrategicPortfolioPlannerView').then((m) => ({ default: m.StrategicPortfolioPlannerView }))
+);
+const OkrTrajectoryView = lazyWithRetry(() =>
+  import('./components/OkrTrajectoryView').then((m) => ({ default: m.OkrTrajectoryView }))
+);
+const OkrProgramStudioView = lazyWithRetry(() =>
+  import('./components/OkrProgramStudioView').then((m) => ({ default: m.OkrProgramStudioView }))
+);
+const EnterpriseGovernanceModal = lazyWithRetry(() =>
+  import('./components/EnterpriseGovernanceModal').then((m) => ({ default: m.EnterpriseGovernanceModal }))
+);
 import {
   OrgDirectoryMember,
   OkrEnterprisePolicy,
@@ -95,10 +139,18 @@ export default function App() {
   });
 
   const [events, setEvents] = useState<BusEvent[]>(() =>
-    eventBus.seedInitialEvents(INDUSTRY_DATA['Banking'].name)
+    eventBus.seedInitialEvents((INDUSTRY_DATA['Telco'] || INDUSTRY_DATA['Banking']).name)
   );
 
-  const industry = normalizeIndustryBundle(industriesDict[selectedIndustry] || industriesDict['Banking']);
+  const industry = useMemo(
+    () => normalizeIndustryBundle(industriesDict[selectedIndustry] || industriesDict['Banking']),
+    [industriesDict, selectedIndustry]
+  );
+
+  const isHydratingRef = useRef<boolean>(true);
+  const selectedIndustryRef = useRef<string>(selectedIndustry);
+  selectedIndustryRef.current = selectedIndustry;
+  const lastPersistedSnapshotRef = useRef<string>('');
 
   const persistIndustry = useCallback(async (payload: IndustryDataBundle) => {
     try {
@@ -108,16 +160,10 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(normalized)
       });
-    } catch (error) {
-      console.warn('Industry persistence skipped; MongoDB is currently unavailable.', error);
+    } catch {
+      // Persistence skipped silently if offline
     }
   }, []);
-
-  useEffect(() => {
-    if (industry && industry.name) {
-      void persistIndustry(industry);
-    }
-  }, [industry, persistIndustry]);
 
   // Enterprise Governance State
   const [managedPrograms, setManagedPrograms] = useState<ManagedProgram[]>(
@@ -167,6 +213,7 @@ export default function App() {
     const loadIndustries = async () => {
       try {
         const response = await fetch('/api/industries');
+        if (!response.ok) return;
         const data = await response.json();
         const loaded = data?.industries ?? [];
         if (!isMounted || !Array.isArray(loaded) || loaded.length === 0) return;
@@ -174,25 +221,43 @@ export default function App() {
         const merged: Record<string, IndustryDataBundle> = { ...INDUSTRY_DATA };
         loaded.forEach((entry: any) => {
           const normalized = normalizeIndustryBundle(entry);
-          const base = normalizeIndustryBundle(merged[normalized.name] || normalized);
-          merged[normalized.name] = mergeIndustryWithFallback(base, normalized);
+          const normId = String(normalized.id || '').toLowerCase();
+          const normName = String(normalized.name || '').toLowerCase();
+          const matchedKey = Object.keys(merged).find((k) => {
+            const existing = merged[k];
+            return (
+              k.toLowerCase() === normId ||
+              String(existing?.id || '').toLowerCase() === normId ||
+              String(existing?.name || '').toLowerCase() === normName
+            );
+          });
+          const baseKey = matchedKey || normalized.name;
+          const base = normalizeIndustryBundle(merged[baseKey] || normalized);
+          merged[baseKey] = mergeIndustryWithFallback(base, normalized);
         });
 
-        const nextIndustryKey = merged[selectedIndustry]
-          ? selectedIndustry
+        const currentKey = selectedIndustryRef.current;
+        const nextIndustryKey = merged[currentKey]
+          ? currentKey
           : merged['Telco']
             ? 'Telco'
             : Object.keys(merged)[0];
         if (!nextIndustryKey) return;
 
+        isHydratingRef.current = true;
         const normalizedIndustry = normalizeIndustryBundle(merged[nextIndustryKey]);
+        lastPersistedSnapshotRef.current = JSON.stringify(normalizedIndustry);
         setIndustriesDict(merged);
-        if (nextIndustryKey !== selectedIndustry) {
+        if (nextIndustryKey !== currentKey) {
           setSelectedIndustry(nextIndustryKey);
         }
         hydrateIndustryState(normalizedIndustry, false);
-      } catch (error) {
-        console.warn('Could not load industry catalog from MongoDB; using seeded defaults.', error);
+      } catch {
+        // Seeded defaults already active
+      } finally {
+        setTimeout(() => {
+          isHydratingRef.current = false;
+        }, 50);
       }
     };
 
@@ -200,7 +265,7 @@ export default function App() {
     return () => {
       isMounted = false;
     };
-  }, [selectedIndustry, hydrateIndustryState]);
+  }, [hydrateIndustryState]);
 
   const currentIndustryBundle = useMemo<IndustryDataBundle>(() => {
     const traceability = Object.fromEntries(
@@ -222,9 +287,18 @@ export default function App() {
   }, [industry, nodesMap, managedPrograms, activeDisasters, orgDirectory, policies]);
 
   useEffect(() => {
-    if (selectedIndustry && currentIndustryBundle?.name) {
-      void persistIndustry(currentIndustryBundle);
+    if (isHydratingRef.current || !selectedIndustry || !currentIndustryBundle?.name) {
+      return;
     }
+    const serialized = JSON.stringify(currentIndustryBundle);
+    if (serialized === lastPersistedSnapshotRef.current) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      lastPersistedSnapshotRef.current = serialized;
+      void persistIndustry(currentIndustryBundle);
+    }, 350);
+    return () => clearTimeout(timer);
   }, [selectedIndustry, currentIndustryBundle, persistIndustry]);
 
   // Subscribe to Event Bus
@@ -235,13 +309,22 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // When switching industry, refresh nodesMap, events, and selected node
+  // When switching industry, save current bundle snapshot, refresh nodesMap, events, and selected node
   const handleSelectIndustry = useCallback((ind: string) => {
-    const normalizedIndustry = normalizeIndustryBundle(industriesDict[ind] || industriesDict['Banking']);
+    isHydratingRef.current = true;
+    const nextDict = {
+      ...industriesDict,
+      [selectedIndustry]: currentIndustryBundle
+    };
+    const normalizedIndustry = normalizeIndustryBundle(nextDict[ind] || nextDict['Banking']);
+    setIndustriesDict(nextDict);
     setSelectedIndustry(ind);
     setActiveStageId(1);
     hydrateIndustryState(normalizedIndustry, true);
-  }, [industriesDict, hydrateIndustryState]);
+    setTimeout(() => {
+      isHydratingRef.current = false;
+    }, 50);
+  }, [industriesDict, selectedIndustry, currentIndustryBundle, hydrateIndustryState]);
 
   // Add custom industry generated by Strategy & Ideation Agent
   const handleAddCustomIndustry = (newIndustry: IndustryDataBundle) => {
@@ -372,6 +455,13 @@ export default function App() {
 
       {/* Main Body */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full space-y-6">
+        <Suspense
+          fallback={
+            <div className="rounded-2xl border border-slate-200 bg-white p-6 text-xs font-medium text-slate-500 shadow-xs">
+              Loading module...
+            </div>
+          }
+        >
         {/* Toggleable Supervisor Event Bus Panel */}
         {isEventBusOpen && (
           <SupervisorEventBus
@@ -441,23 +531,11 @@ export default function App() {
           />
         )}
 
-        {/* View 6: 5-Pillar AI Knowledge Base */}
+        {/* View 6: Strategic Portfolio Planner */}
         {activeView === 'strategy' && (
           <StrategicPortfolioPlannerView industry={industry} />
         )}
-        
-        {/* View 7: Enterprise Governance, Policies & Org Data */}
-        {activeView === 'governance' && (
-          <EnterpriseGovernanceModal
-            industry={industry}
-            orgDirectory={orgDirectory}
-            onUpdateOrgDirectory={setOrgDirectory}
-            policies={policies}
-            onUpdatePolicies={setPolicies}
-            onClose={() => setIsGovernanceOpen(false)}
-          />
-        )}
-        {/* View 8: 5-Pillar AI Knowledge Base */}
+        {/* View 7: 5-Pillar AI Knowledge Base */}
         {activeView === 'knowledge' && (
           <KnowledgeBaseView
             industry={industry}
@@ -492,27 +570,30 @@ export default function App() {
             onNavigateToTrajectory={() => setActiveView('trajectory')}
           />
         )}
+        </Suspense>
       </main>
 
-      {/* Enterprise Governance, Policies & Org Data Modal */}
-      {isGovernanceOpen && (
-        <EnterpriseGovernanceModal
-          industry={industry}
-          orgDirectory={orgDirectory}
-          onUpdateOrgDirectory={setOrgDirectory}
-          policies={policies}
-          onUpdatePolicies={setPolicies}
-          onClose={() => setIsGovernanceOpen(false)}
-        />
-      )}
+      <Suspense fallback={null}>
+        {/* Enterprise Governance, Policies & Org Data Modal */}
+        {isGovernanceOpen && (
+          <EnterpriseGovernanceModal
+            industry={industry}
+            orgDirectory={orgDirectory}
+            onUpdateOrgDirectory={setOrgDirectory}
+            policies={policies}
+            onUpdatePolicies={setPolicies}
+            onClose={() => setIsGovernanceOpen(false)}
+          />
+        )}
 
-      {/* Add Custom Industry Modal */}
-      {isAddCustomIndustryOpen && (
-        <AddCustomIndustryModal
-          onClose={() => setIsAddCustomIndustryOpen(false)}
-          onAddIndustry={handleAddCustomIndustry}
-        />
-      )}
+        {/* Add Custom Industry Modal */}
+        {isAddCustomIndustryOpen && (
+          <AddCustomIndustryModal
+            onClose={() => setIsAddCustomIndustryOpen(false)}
+            onAddIndustry={handleAddCustomIndustry}
+          />
+        )}
+      </Suspense>
 
       {/* Footer */}
       <footer className="border-t border-slate-200 bg-white py-4 mt-8">

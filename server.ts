@@ -6,6 +6,11 @@ import { createServer as createViteServer } from 'vite';
 import { MongoClient, type Db } from 'mongodb';
 import { GoogleGenAI, Type } from '@google/genai';
 import { INDUSTRY_DATA } from './src/data/industryData';
+import {
+  buildStructuredBusinessProblemFromDraft,
+  mergeConversationalDrafts,
+  parseConversationalOkrInput
+} from './src/utils/conversationalOkrParser';
 
 dotenv.config();
 
@@ -14,27 +19,55 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const INITIAL_PORT = Number(process.env.PORT) || 3000;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/';
+const MONGODB_URI = (process.env.MONGODB_URI || '').trim();
 const DATABASE_NAME = process.env.MONGODB_DB_NAME || 'multi_agent_okr';
 
 let mongoClient: MongoClient | null = null;
 let mongoDb: Db | null = null;
+let mongoUnavailable = false;
 
-async function connectMongo() {
+const memoryIndustries = new Map<string, any>(
+  Object.values(INDUSTRY_DATA).map((industry) => [
+    industry.id,
+    { ...industry, _lastUpdated: new Date().toISOString() }
+  ])
+);
+const memoryInteractions: Array<{
+  id: string;
+  agent: string;
+  context: string;
+  message: string;
+  response: string;
+  createdAt: string;
+  metadata: Record<string, any>;
+}> = [];
+
+async function connectMongo(): Promise<Db | null> {
   if (mongoDb) return mongoDb;
+  if (!MONGODB_URI || mongoUnavailable) return null;
 
+  let candidateClient: MongoClient | null = null;
   try {
-    mongoClient = new MongoClient(MONGODB_URI);
-    await mongoClient.connect();
+    candidateClient = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 2000,
+      connectTimeoutMS: 2000
+    });
+    await candidateClient.connect();
+    mongoClient = candidateClient;
     mongoDb = mongoClient.db(DATABASE_NAME);
     await mongoDb.collection('industries').createIndex({ id: 1 }, { unique: true });
     await mongoDb.collection('industries').createIndex({ name: 1 });
     await mongoDb.collection('agent_interactions').createIndex({ createdAt: -1 });
     await mongoDb.collection('agent_interactions').createIndex({ agent: 1, context: 1 });
-    console.log(`Connected to MongoDB at ${MONGODB_URI}`);
+    console.log(`Connected to MongoDB (${DATABASE_NAME}).`);
     return mongoDb;
   } catch (error) {
-    console.warn('MongoDB connection unavailable; continuing in memory-only mode.', error);
+    mongoUnavailable = true;
+    if (candidateClient) {
+      await candidateClient.close().catch(() => {});
+    }
+    const reason = error instanceof Error ? error.message : 'connection failed';
+    console.info(`MongoDB unavailable (${reason}); running with stateful in-memory store.`);
     return null;
   }
 }
@@ -76,21 +109,29 @@ function startServerOnPort(port: number): Promise<number> {
   });
 }
 
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
 app.get('/api/health', async (_req, res) => {
   const db = await connectMongo();
-  res.json({ ok: true, mongo: !!db, database: DATABASE_NAME, uri: MONGODB_URI });
+  res.json({
+    ok: true,
+    mongo: !!db,
+    mode: db ? 'mongodb' : 'memory',
+    database: DATABASE_NAME
+  });
 });
 
 app.get('/api/industries', async (_req, res) => {
   const db = await connectMongo();
   if (!db) {
-    return res.json({ industries: Object.values(INDUSTRY_DATA) });
+    const industries = Array.from(memoryIndustries.values()).sort((a, b) =>
+      String(a.name || '').localeCompare(String(b.name || ''))
+    );
+    return res.json({ industries, source: 'memory' });
   }
 
   const industries = await db.collection('industries').find({}).sort({ name: 1 }).toArray();
-  return res.json({ industries });
+  return res.json({ industries, source: 'mongodb' });
 });
 
 app.post('/api/industries', async (req, res) => {
@@ -101,17 +142,21 @@ app.post('/api/industries', async (req, res) => {
     return res.status(400).json({ error: 'Industry id and name are required.' });
   }
 
+  const timestamped = { ...payload, _lastUpdated: new Date().toISOString() };
+
   if (!db) {
-    return res.status(201).json({ industry: payload, source: 'memory' });
+    const existed = memoryIndustries.has(payload.id);
+    memoryIndustries.set(payload.id, timestamped);
+    return res.status(201).json({ industry: timestamped, source: 'memory', upserted: !existed });
   }
 
   const result = await db.collection('industries').updateOne(
     { id: payload.id },
-    { $set: { ...payload, _lastUpdated: new Date().toISOString() } },
+    { $set: timestamped },
     { upsert: true }
   );
 
-  res.status(201).json({ industry: payload, source: 'mongodb', upserted: result.upsertedCount > 0 });
+  return res.status(201).json({ industry: timestamped, source: 'mongodb', upserted: result.upsertedCount > 0 });
 });
 
 app.get('/api/agent-interactions', async (req, res) => {
@@ -119,7 +164,33 @@ app.get('/api/agent-interactions', async (req, res) => {
   const { agent, context, from, to, q } = req.query;
 
   if (!db) {
-    return res.json({ interactions: [] });
+    let filtered = memoryInteractions.slice();
+    if (agent) {
+      filtered = filtered.filter((item) => item.agent === String(agent));
+    }
+    if (context) {
+      const ctxNeedle = String(context).toLowerCase();
+      filtered = filtered.filter((item) => item.context.toLowerCase().includes(ctxNeedle));
+    }
+    if (q) {
+      const queryNeedle = String(q).toLowerCase();
+      filtered = filtered.filter(
+        (item) =>
+          item.message.toLowerCase().includes(queryNeedle) ||
+          item.response.toLowerCase().includes(queryNeedle) ||
+          item.context.toLowerCase().includes(queryNeedle)
+      );
+    }
+    if (from) {
+      const fromIso = new Date(String(from)).toISOString();
+      filtered = filtered.filter((item) => item.createdAt >= fromIso);
+    }
+    if (to) {
+      const toIso = new Date(String(to)).toISOString();
+      filtered = filtered.filter((item) => item.createdAt <= toIso);
+    }
+    filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return res.json({ interactions: filtered, source: 'memory' });
   }
 
   const filter: Record<string, any> = {};
@@ -143,16 +214,12 @@ app.get('/api/agent-interactions', async (req, res) => {
     .sort({ createdAt: -1 })
     .toArray();
 
-  res.json({ interactions });
+  return res.json({ interactions, source: 'mongodb' });
 });
 
 app.post('/api/agent-interactions', async (req, res) => {
   const db = await connectMongo();
   const payload = req.body ?? {};
-
-  if (!db) {
-    return res.status(202).json({ saved: false, message: 'MongoDB unavailable; interaction recorded in memory only.' });
-  }
 
   const record = {
     id: payload.id || `interaction-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -164,12 +231,17 @@ app.post('/api/agent-interactions', async (req, res) => {
     metadata: payload.metadata || {}
   };
 
-  await db.collection('agent_interactions').insertOne(record);
-  res.status(201).json({ saved: true, interaction: record });
-});
+  if (!db) {
+    memoryInteractions.unshift(record);
+    if (memoryInteractions.length > 200) {
+      memoryInteractions.length = 200;
+    }
+    return res.status(201).json({ saved: true, source: 'memory', interaction: record });
+  }
 
-type ConversationIntent = 'create_okr' | 'update_business_problem' | 'run_orchestration' | 'clarify' | 'unknown';
-type ConversationSeverity = 'info' | 'success' | 'warning' | 'danger';
+  await db.collection('agent_interactions').insertOne(record);
+  return res.status(201).json({ saved: true, source: 'mongodb', interaction: record });
+});
 
 const conversationalEventTopics = [
   'ORCHESTRATION_STARTED',
@@ -179,84 +251,6 @@ const conversationalEventTopics = [
   'INTERVENTION_APPLIED',
   'ADVISORY_COMMITTEE_EVALUATED'
 ] as const;
-
-function parseConversationFallback(message: string, context: any) {
-  const text = String(message || '').trim();
-  const lower = text.toLowerCase();
-  const owners: string[] = Array.isArray(context?.owners) ? context.owners : [];
-  const parentOptions: Array<{ id: string; title?: string }> = Array.isArray(context?.parentOptions) ? context.parentOptions : [];
-  const firstOwner = owners[0] || 'Executive Lead';
-  const firstParent = parentOptions[0]?.id || '';
-
-  const hasCreateSignal = /(create|add|new)\s+(okr|key result)/i.test(text);
-  const hasBusinessProblemSignal = /(business problem|root cause|stakeholder|causal chain)/i.test(text);
-  const hasOrchestrationSignal = /(orchestrate|run agents|trigger agents|advisory|supervisor)/i.test(text);
-
-  let intent: ConversationIntent = 'unknown';
-  if (hasCreateSignal) intent = 'create_okr';
-  else if (hasBusinessProblemSignal) intent = 'update_business_problem';
-  else if (hasOrchestrationSignal) intent = 'run_orchestration';
-  else intent = 'clarify';
-
-  const titleMatch = text.match(/(?:okr|key result)\s+(?:to|for)\s+(.+?)(?:\.|,|$)/i);
-  const timingMatch = text.match(/(Q[1-4]\s*\d{4}(?:\s*Sprint\s*\d+)?)/i);
-  const budgetMatch = text.match(/(\$[\d.,]+[mMkK]?)/);
-
-  const remediation = timingMatch?.[1] ? [timingMatch[1]] : ['Q2 2027 Sprint 4'];
-  const draft = intent === 'create_okr' || intent === 'update_business_problem'
-    ? {
-        title: titleMatch?.[1]?.trim() || `Resolve ${context?.sector || 'enterprise'} performance bottleneck`,
-        parentId: firstParent,
-        owner: firstOwner,
-        priority: 'P1 - High',
-        budget: budgetMatch?.[1] || '$4.5M',
-        problemDescription: text,
-        impactedStakeholders: ['Executive Board', 'Customer Operations'],
-        causalChainToDollarImpact: 'Operational bottleneck → service delay → revenue leakage',
-        rootCause: 'Capacity and workflow constraints',
-        remediationTimings: remediation,
-        metrics: [
-          { indicator: 'Cycle Time', baselineValue: '9 days', targetValue: '3 days', metricType: 'Leading' },
-          { indicator: 'Revenue Risk', baselineValue: '$6.0M', targetValue: '$0', metricType: 'Lagging' }
-        ]
-      }
-    : null;
-
-  return {
-    assistantMessage: intent === 'clarify'
-      ? 'I can help create an OKR or business problem draft. Tell me target outcome, owner, timeline, and measurable metric.'
-      : 'I interpreted your intent and prepared a structured draft. Review and apply it to the OKR form.',
-    intent,
-    confidence: intent === 'clarify' ? 0.55 : 0.72,
-    questions: [
-      'Who is the accountable owner from the HR directory?',
-      'What is the target remediation timeline?',
-      'Which leading and lagging metrics should be tracked?'
-    ],
-    actionPlan: intent === 'run_orchestration'
-      ? ['Trigger supervisor validation', 'Run advisory committee evaluation', 'Publish intervention event']
-      : ['Populate structured business problem', 'Validate owner and policy thresholds', 'Prepare for publish'],
-    okrDraft: draft,
-    orchestrationEvents: intent === 'run_orchestration'
-      ? [
-          {
-            topic: 'ORCHESTRATION_STARTED',
-            sourceAgent: 'Conversational Agent',
-            targetAgent: 'Supervisor Agent',
-            summary: 'Conversational workflow requested orchestration start',
-            severity: 'info'
-          },
-          {
-            topic: 'ADVISORY_COMMITTEE_EVALUATED',
-            sourceAgent: 'Conversational Agent',
-            targetAgent: 'Advisory Committee',
-            summary: 'Requested advisory review for draft OKR alignment',
-            severity: 'success'
-          }
-        ]
-      : []
-  };
-}
 
 // Initialize GoogleGenAI server-side client
 let ai: GoogleGenAI | null = null;
@@ -276,26 +270,45 @@ app.post('/api/okr-conversational-agent', async (req, res) => {
     const body = req.body ?? {};
     const message = String(body.message || '').trim();
     const history = Array.isArray(body.history) ? body.history : [];
-    const context = body.context || {};
+    const context = {
+      ...(body.context || {}),
+      autoCompleteRemaining: Boolean(body.autoCompleteRemaining ?? body.context?.autoCompleteRemaining)
+    };
+    const currentDraft = body.currentDraft || null;
 
     if (!message) {
       return res.status(400).json({ error: 'message is required' });
     }
 
-    const fallback = parseConversationFallback(message, context);
+    const fallback = parseConversationalOkrInput(message, context, history, currentDraft);
 
     if (ai && process.env.GEMINI_API_KEY) {
       try {
-        const prompt = `You are Planview Anvi Conversational OKR Agent.
-Interpret user message intent and return structured JSON only.
+        const missingListText =
+          fallback.missingAttributes.length > 0
+            ? fallback.missingAttributes.map((m) => `${m.category} -> ${m.label}: ${m.question}`).join('\n  - ')
+            : 'None (All OKR & 6 Business Problem attributes captured!)';
+
+        const prompt = `You are Planview Anvi Intelligent Conversational OKR Agent.
+Interpret user message intent (including structured key-value lines AND plain conversational answers to your prior question) across the multi-turn conversation and return structured JSON only.
+
+Rules:
+- Whenever the user supplies an owner, timeline, metric(s), target outcome, budget, or any business problem attribute (even as a short follow-up answer), classify intent as "create_okr" or "update_business_problem" and update okrDraft.
+- Preserve exact owner names, timeline strings, and metrics (indicator, baselineValue, targetValue, metricType Leading/Lagging) given by the user.
+- Check the Gap Analysis below: if attributes are still missing (and autoCompleteRemaining is false), ask focused, helpful follow-up questions in "questions" and "assistantMessage" to gather those exact missing fields (especially verifying if owner exists in Available Owners).
+- When all attributes are captured (or autoCompleteRemaining is true), clearly state that the complete OKR & 6-dimension Business Problem is ready for "Apply Draft to Form" and "Publish OKR & Execute Remaining Stages".
 
 Context:
 - Industry: ${context.industryName || 'Unknown'}
 - Sector: ${context.sector || 'Enterprise'}
 - Quarter: ${context.quarter || 'Q1 2027'}
-- Available Owners: ${(context.owners || []).join(', ') || 'Executive Lead'}
+- Auto-complete remaining fields requested: ${Boolean(context.autoCompleteRemaining)}
+- Available HR Directory Owners: ${(context.owners || []).join(', ') || 'Executive Lead'}
 - Parent Options: ${(context.parentOptions || []).map((p: any) => `${p.id}:${p.title || ''}`).join(' | ')}
 - Existing OKRs: ${(context.existingOkrTitles || []).join(' | ')}
+- Current Draft JSON: ${JSON.stringify(currentDraft || fallback.okrDraft || null)}
+- Gap Analysis (${fallback.readinessPct}% ready):
+  - ${missingListText}
 
 Conversation History:
 ${history.map((item: any, i: number) => `${i + 1}. ${item.role}: ${item.text}`).join('\n')}
@@ -304,16 +317,16 @@ Latest User Message:
 ${message}
 
 Return:
-- assistantMessage (short helpful response)
+- assistantMessage (summarize captured fields and ask concise questions for missing fields, OR confirm 100% readiness to Apply Draft to Form)
 - intent in [create_okr, update_business_problem, run_orchestration, clarify, unknown]
 - confidence (0..1)
-- questions (up to 3)
+- questions (up to 3 targeted questions for missing OKR or Business Problem fields)
 - actionPlan (up to 4)
-- okrDraft with title, parentId, owner, priority, budget, problemDescription, impactedStakeholders[], causalChainToDollarImpact, rootCause, remediationTimings[], metrics[]
+- okrDraft with title, parentId, owner, priority, budget, targetDate, problemDescription, impactedStakeholders[], causalChainToDollarImpact, rootCause, rootCauses[], targetRemediationTiming, remediationTimings[], metrics[]
 - orchestrationEvents[] where topic is one of ${conversationalEventTopics.join(', ')}`;
 
         const response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
+          model: 'gemini-4-hydrogen',
           contents: prompt,
           config: {
             responseMimeType: 'application/json',
@@ -333,10 +346,13 @@ Return:
                     owner: { type: Type.STRING },
                     priority: { type: Type.STRING },
                     budget: { type: Type.STRING },
+                    targetDate: { type: Type.STRING },
                     problemDescription: { type: Type.STRING },
                     impactedStakeholders: { type: Type.ARRAY, items: { type: Type.STRING } },
                     causalChainToDollarImpact: { type: Type.STRING },
                     rootCause: { type: Type.STRING },
+                    rootCauses: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    targetRemediationTiming: { type: Type.STRING },
                     remediationTimings: { type: Type.ARRAY, items: { type: Type.STRING } },
                     metrics: {
                       type: Type.ARRAY,
@@ -373,24 +389,65 @@ Return:
         const text = response.text;
         if (text) {
           const parsed = JSON.parse(text);
+          const effectiveIntent =
+            (parsed.intent === 'clarify' || parsed.intent === 'unknown') &&
+            (fallback.intent === 'create_okr' || fallback.intent === 'update_business_problem')
+              ? fallback.intent
+              : parsed.intent || fallback.intent;
+
+          const effectiveDraft = (parsed.okrDraft || fallback.okrDraft)
+            ? mergeConversationalDrafts(
+                parsed.okrDraft || null,
+                fallback.okrDraft
+                  ? {
+                      ...fallback.okrDraft,
+                      title: parsed.okrDraft?.title && !/^(title|outcome|placeholder)/i.test(parsed.okrDraft.title)
+                        ? parsed.okrDraft.title
+                        : fallback.okrDraft.title,
+                      problemDescription: parsed.okrDraft?.problemDescription || fallback.okrDraft.problemDescription,
+                      causalChainToDollarImpact:
+                        parsed.okrDraft?.causalChainToDollarImpact || fallback.okrDraft.causalChainToDollarImpact,
+                      rootCause: parsed.okrDraft?.rootCause || fallback.okrDraft.rootCause,
+                      lastAskedField: fallback.nextExpectedField
+                    }
+                  : null
+              )
+            : null;
+
+          const effectiveBusinessProblem = effectiveDraft
+            ? buildStructuredBusinessProblemFromDraft(effectiveDraft, context.sector || 'Enterprise', message)
+            : fallback.businessProblem;
+
           return res.json({
             success: true,
-            assistantMessage: parsed.assistantMessage || fallback.assistantMessage,
-            intent: parsed.intent || fallback.intent,
-            confidence: typeof parsed.confidence === 'number' ? parsed.confidence : fallback.confidence,
-            questions: Array.isArray(parsed.questions) ? parsed.questions : fallback.questions,
-            actionPlan: Array.isArray(parsed.actionPlan) ? parsed.actionPlan : fallback.actionPlan,
-            okrDraft: parsed.okrDraft || fallback.okrDraft,
-            orchestrationEvents: Array.isArray(parsed.orchestrationEvents) ? parsed.orchestrationEvents : fallback.orchestrationEvents,
-            source: 'gemini-3.8-flash'
+            assistantMessage:
+              effectiveIntent !== 'clarify' && parsed.intent === 'clarify'
+                ? fallback.assistantMessage
+                : parsed.assistantMessage || fallback.assistantMessage,
+            intent: effectiveIntent,
+            confidence: typeof parsed.confidence === 'number' ? Math.max(parsed.confidence, fallback.confidence) : fallback.confidence,
+            questions: fallback.questions.length > 0 ? fallback.questions : (Array.isArray(parsed.questions) ? parsed.questions : []),
+            actionPlan: Array.isArray(parsed.actionPlan) && parsed.actionPlan.length > 0 ? parsed.actionPlan : fallback.actionPlan,
+            okrDraft: effectiveDraft,
+            businessProblem: effectiveBusinessProblem,
+            orchestrationEvents: Array.isArray(parsed.orchestrationEvents) && parsed.orchestrationEvents.length > 0
+              ? parsed.orchestrationEvents
+              : fallback.orchestrationEvents,
+            missingAttributes: fallback.missingAttributes,
+            capturedAttributes: fallback.capturedAttributes,
+            readinessPct: fallback.readinessPct,
+            isDraftComplete: fallback.isDraftComplete,
+            nextExpectedField: fallback.nextExpectedField,
+            source: 'gemini-4-hydrogen'
           });
         }
       } catch (geminiError) {
-        console.warn('Conversational OKR agent Gemini call failed, using fallback:', geminiError);
+        const msg = geminiError instanceof Error ? geminiError.message : 'Gemini call failed';
+        console.warn(`Conversational OKR agent Gemini call skipped (${msg}); using deterministic parser fallback.`);
       }
     }
 
-    return res.json({ success: true, ...fallback, source: 'heuristic-fallback' });
+    return res.json({ success: true, ...fallback, source: 'deterministic-parser' });
   } catch (error: any) {
     console.error('Conversational OKR agent error:', error);
     return res.status(500).json({ error: error.message || 'Internal server error' });
@@ -429,7 +486,7 @@ Generate a structured JSON response containing:
 8. "knowledgeBase": array of 5 knowledge pillars (Historical Performance, Market Data, Customer Feedback, Project Runner, Resources) with metrics and bullet points.`;
 
         const response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
+          model: 'gemini-4-hydrogen',
           contents: prompt,
           config: {
             systemInstruction: 'You are an enterprise strategic portfolio architect for Planview. Respond exclusively with valid JSON conforming to the requested schema.',
@@ -440,10 +497,11 @@ Generate a structured JSON response containing:
         const text = response.text;
         if (text) {
           const parsed = JSON.parse(text);
-          return res.json({ success: true, strategy: parsed, source: 'gemini-3.8-flash' });
+          return res.json({ success: true, strategy: parsed, source: 'gemini-4-hydrogen' });
         }
       } catch (geminiError) {
-        console.warn('Gemini API call warning, falling back to algorithmic synthesis:', geminiError);
+        const msg = geminiError instanceof Error ? geminiError.message : 'Gemini call failed';
+        console.warn(`Gemini API strategy call skipped (${msg}); using algorithmic synthesis.`);
       }
     }
 

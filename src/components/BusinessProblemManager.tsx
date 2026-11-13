@@ -371,7 +371,7 @@ export const BusinessProblemManager: React.FC<BusinessProblemManagerProps> = ({
             <p className="text-[11px] uppercase tracking-[0.16em] text-indigo-600 font-bold">Business Problem Manager</p>
             <h3 className="text-lg font-bold text-slate-900">Define and structure the Business-Problem attributes</h3>
           </div>
-          <button type="button" onClick={onClose} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 hover:text-slate-700">
+          <button type="button" aria-label="Close Business Problem Manager" onClick={onClose} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 hover:text-slate-700">
             <X className="w-5 h-5" />
           </button>
         </div>

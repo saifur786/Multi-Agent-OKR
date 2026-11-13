@@ -452,3 +452,49 @@ export interface IndustryDataBundle {
   activeDisasters?: SignificantDisasterEvent[];
   agentInteractions?: AgentInteractionRecord[];
 }
+
+export interface StrategicProblem {
+  id: string;
+  title: string;
+  description: string;
+  cause: string;
+  causalChainToDollarImpact: string;
+  remediationTiming: string;
+  impactedStakeholders: string[];
+  leadingIndicators: string[];
+  laggingIndicators: string[];
+  targetMetrics: { label: string; value: string }[];
+}
+
+export interface OkrPriority {
+  id: string;
+  title: string;
+  owner: string;
+  aiPriorityScore: number;
+  manualPriorityScore: number;
+  status: 'On Track' | 'At Risk' | 'Behind';
+  strategicProblemId: string;
+  notes: string;
+}
+
+export interface ProgramPlan {
+  id: string;
+  name: string;
+  strategicStatement: string;
+  definition: string;
+  status: 'Active' | 'Terminated' | 'Initiated' | 'Proposed';
+  roadmap: { phase: string; outcome: string; due: string }[];
+  resources: { owner: string; team: string; fte: number; allocationPct: number }[];
+  launchPlan: { start: string; goLive: string; owner: string; risk: string };
+}
+
+export interface IndustryEventTrigger {
+  id: string;
+  scope: 'Global' | 'Industry';
+  title: string;
+  severity: 'Critical' | 'High' | 'Medium' | 'Low';
+  description: string;
+  impact: string;
+  affectedSegments: string[];
+  triggeredAt: string;
+}

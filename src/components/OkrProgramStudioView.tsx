@@ -44,11 +44,22 @@ import {
 } from '../types/orchestration';
 import { eventBus } from '../utils/eventBus';
 import { validateOkrStructuralAdequacy } from '../utils/trajectoryCalculations';
+import { evaluateAdvisoryCommittee, evaluateSmartCriteria } from '../utils/algorithms';
 import {
   getAvailableBusinessProblemsForIndustry,
   parseRawProblemText,
   BusinessProblemTemplate
 } from '../utils/businessProblemLibrary';
+import {
+  buildStructuredBusinessProblemFromDraft,
+  ConversationIntent,
+  ConversationalOkrDraft,
+  ConversationalParseResult,
+  mergeConversationalDrafts,
+  MissingAttributeDetail,
+  MissingAttributeKey,
+  parseConversationalOkrInput
+} from '../utils/conversationalOkrParser';
 import { BusinessProblemManager } from './BusinessProblemManager';
 
 interface OkrProgramStudioViewProps {
@@ -64,44 +75,7 @@ interface OkrProgramStudioViewProps {
   onNavigateToTrajectory?: () => void;
 }
 
-type ConversationIntent = 'create_okr' | 'update_business_problem' | 'run_orchestration' | 'clarify' | 'unknown';
-
-interface ConversationalMetricDraft {
-  indicator: string;
-  baselineValue: string;
-  targetValue: string;
-  metricType: 'Leading' | 'Lagging';
-}
-
-interface ConversationalOkrDraft {
-  title?: string;
-  parentId?: string;
-  owner?: string;
-  priority?: PriorityLevel;
-  budget?: string;
-  problemDescription?: string;
-  impactedStakeholders?: string[];
-  causalChainToDollarImpact?: string;
-  rootCause?: string;
-  remediationTimings?: string[];
-  metrics?: ConversationalMetricDraft[];
-}
-
-interface ConversationalResponse {
-  assistantMessage: string;
-  intent: ConversationIntent;
-  confidence: number;
-  questions: string[];
-  actionPlan: string[];
-  okrDraft?: ConversationalOkrDraft | null;
-  orchestrationEvents?: Array<{
-    topic: EventTopic;
-    sourceAgent: string;
-    targetAgent: string;
-    summary: string;
-    severity: 'info' | 'success' | 'warning' | 'danger';
-  }>;
-}
+type ConversationalResponse = ConversationalParseResult;
 
 interface ConversationTurn {
   id: string;
@@ -111,6 +85,7 @@ interface ConversationTurn {
   confidence?: number;
   actionPlan?: string[];
   questions?: string[];
+  nextExpectedField?: MissingAttributeKey | null;
 }
 
 export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
@@ -143,12 +118,27 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const [isConversationalBackendOffline, setIsConversationalBackendOffline] = useState(false);
   const [preferredConversationalOrigin, setPreferredConversationalOrigin] = useState<string | null>(null);
   const [isDraftPendingReview, setIsDraftPendingReview] = useState(false);
+  const [newOkrValidationError, setNewOkrValidationError] = useState<string | null>(null);
   const [conversationDraft, setConversationDraft] = useState<ConversationalOkrDraft | null>(null);
+  const [conversationBusinessProblem, setConversationBusinessProblem] = useState<StructuredBusinessProblem | null>(null);
+  const [conversationGapReport, setConversationGapReport] = useState<{
+    missingAttributes: MissingAttributeDetail[];
+    capturedAttributes: string[];
+    readinessPct: number;
+    isDraftComplete: boolean;
+    nextExpectedField: MissingAttributeKey | null;
+  }>({
+    missingAttributes: [],
+    capturedAttributes: [],
+    readinessPct: 0,
+    isDraftComplete: false,
+    nextExpectedField: null
+  });
   const [conversationTurns, setConversationTurns] = useState<ConversationTurn[]>([
     {
       id: 'assistant-welcome',
       role: 'assistant',
-      text: 'Hi, I am the OKR Conversational Agent. Describe the business outcome you want, and I will draft an OKR with structured business-problem attributes.'
+      text: 'Hi, I am the OKR Conversational Agent. Describe the outcome you want — I will detect missing OKR & 6-dimension Business Problem attributes, ask targeted questions, and construct a Supervisor-ready draft for Apply Draft to Form.'
     }
   ]);
   const dependencyGraphRef = useRef<SVGSVGElement | null>(null);
@@ -225,8 +215,8 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       .selectAll('circle')
       .data(graphNodes)
       .join('circle')
-      .attr('r', (d) => (d.id === activeOkr?.id ? 14 : 11))
-      .attr('fill', (d) => {
+      .attr('r', (d: { id: string; label: string; status: string }) => (d.id === activeOkr?.id ? 14 : 11))
+      .attr('fill', (d: { id: string; label: string; status: string }) => {
         const node = nodesMap[d.id];
         if (d.id === activeOkr?.id) return '#4f46e5';
         if (node?.status === 'At Risk') return '#f59e0b';
@@ -236,7 +226,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       .attr('stroke', '#ffffff')
       .attr('stroke-width', 2)
       .style('cursor', 'pointer')
-      .on('click', (_, d) => {
+      .on('click', (_: unknown, d: { id: string; label: string; status: string }) => {
         setSelectedOkrId(d.id);
       });
 
@@ -249,7 +239,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       .attr('dy', -18)
       .attr('font-size', 9)
       .attr('fill', '#1e293b')
-      .text((d) => d.label.slice(0, 18));
+      .text((d: { id: string; label: string; status: string }) => d.label.slice(0, 18));
 
     const simulation = d3
       .forceSimulation(graphNodes as any)
@@ -299,6 +289,37 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const [editRootCause, setEditRootCause] = useState('');
   const [editRemediationTiming, setEditRemediationTiming] = useState('');
   const [editMetrics, setEditMetrics] = useState<BusinessMetricIndicator[]>([]);
+
+  // Effective 6-attribute problem for active OKR (including seeded defaults when undefined)
+  const effectiveActiveBusinessProblem = useMemo<StructuredBusinessProblem | null>(() => {
+    if (!activeOkr) return null;
+    const bp = activeOkr.businessProblem;
+    const rootCauseVal = bp?.rootCause || 'Constrained specialized engineering headcount and legacy architectural debt.';
+    const timingVal = bp?.targetRemediationTiming || activeOkr.targetDate || 'Q2 2027 Sprint 4';
+    return {
+      problemDescription:
+        bp?.problemDescription || `Operational bottleneck in ${industry.name} delaying execution against benchmark growth targets.`,
+      impactedStakeholders:
+        bp?.impactedStakeholders && bp.impactedStakeholders.length > 0
+          ? bp.impactedStakeholders
+          : ['Executive Leadership', 'Core Customers', 'Field Squads'],
+      causalChainToDollarImpact:
+        bp?.causalChainToDollarImpact || 'Execution friction -> 14% delivery slippage -> $6.2M annualised revenue degradation.',
+      rootCause: rootCauseVal,
+      rootCauses:
+        bp?.rootCauses && bp.rootCauses.length > 0 ? bp.rootCauses : [rootCauseVal],
+      targetRemediationTiming: timingVal,
+      remediationTimings:
+        bp?.remediationTimings && bp.remediationTimings.length > 0 ? bp.remediationTimings : [timingVal],
+      metrics:
+        bp?.metrics && bp.metrics.length > 0
+          ? bp.metrics
+          : [
+              { indicator: 'Key Operational Metric', baselineValue: '90%', targetValue: '< 65%', metricType: 'Leading' },
+              { indicator: 'Financial Dollar Impact', baselineValue: '$12.0M loss rate', targetValue: '$0', metricType: 'Lagging' }
+            ]
+    };
+  }, [activeOkr, industry.name]);
 
   // Initialize or synchronize inline editor values when active OKR changes or editor opens
   const handleStartEditingProblem = () => {
@@ -419,17 +440,21 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setTimeout(() => setFeedbackMessage(null), 4000);
   };
 
-  const enforceSupervisorPolicy = (candidate: TraceabilityNode) => {
+  const enforceSupervisorPolicy = (candidate: TraceabilityNode, showModalInline = false) => {
     const audit = validateOkrStructuralAdequacy(candidate, policies, orgDirectory);
     if (audit.enforcementBlocked) {
       const issueSummary = audit.complianceIssues.length > 0
         ? audit.complianceIssues.join('; ')
         : 'Missing required enterprise control fields';
 
+      const msg = `Supervisor Agent blocked the save for "${candidate.title}". Policy gaps: ${issueSummary}`;
       setFeedbackMessage({
-        text: `Supervisor Agent blocked the save for "${candidate.title}". Policy gaps: ${issueSummary}`,
+        text: msg,
         type: 'error'
       });
+      if (showModalInline) {
+        setNewOkrValidationError(msg);
+      }
       setTimeout(() => setFeedbackMessage(null), 6000);
 
       eventBus.publish({
@@ -453,6 +478,9 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       return false;
     }
 
+    if (showModalInline) {
+      setNewOkrValidationError(null);
+    }
     return true;
   };
 
@@ -612,6 +640,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setIsAddingNewOkr(true);
     setNewOkrMode('template');
     setIsDraftPendingReview(false);
+    setNewOkrValidationError(null);
     setNewOkrTimingDraft('');
     if (availableProblems.length > 0 && availableProblems[0]) {
       handleSelectIndustryProblem(availableProblems[0].id);
@@ -692,8 +721,10 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   };
 
   const applyConversationalDraftToForm = useCallback((draft: ConversationalOkrDraft) => {
+    setNewOkrMode('manual');
     if (draft.title) setNewOkrTitle(draft.title);
-    if (draft.parentId) setNewOkrParentId(draft.parentId);
+    const resolvedParentId = draft.parentId || potentialParents[0]?.id || '';
+    if (resolvedParentId) setNewOkrParentId(resolvedParentId);
     if (draft.owner) setNewOkrOwner(draft.owner);
     if (draft.priority) setNewOkrPriority(draft.priority);
     if (draft.budget) setNewOkrBudget(draft.budget);
@@ -702,14 +733,23 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       setNewOkrStakeholders(draft.impactedStakeholders.join(', '));
     }
     if (draft.causalChainToDollarImpact) setNewOkrCausalChain(draft.causalChainToDollarImpact);
-    if (draft.rootCause) setNewOkrRootCause(draft.rootCause);
+    const resolvedRootCause = draft.rootCause || draft.rootCauses?.[0];
+    if (resolvedRootCause) setNewOkrRootCause(resolvedRootCause);
 
-    if (Array.isArray(draft.remediationTimings) && draft.remediationTimings.length > 0) {
-      const timings = draft.remediationTimings.map((value) => String(value).trim()).filter(Boolean);
+    const rawTimings =
+      Array.isArray(draft.remediationTimings) && draft.remediationTimings.length > 0
+        ? draft.remediationTimings
+        : draft.targetRemediationTiming
+          ? [draft.targetRemediationTiming]
+          : draft.targetDate
+            ? [draft.targetDate]
+            : [];
+    if (rawTimings.length > 0) {
+      const timings = rawTimings.map((value) => String(value).trim()).filter(Boolean);
       if (timings.length > 0) {
         setNewOkrRemediationTimings(timings);
         setNewOkrRemediationTiming(timings[0]);
-        setNewOkrTargetDate(timings[0]);
+        setNewOkrTargetDate(draft.targetDate || timings[0]);
       }
     }
 
@@ -719,7 +759,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
           indicator: String(metric.indicator || '').trim(),
           baselineValue: String(metric.baselineValue || '').trim(),
           targetValue: String(metric.targetValue || '').trim(),
-          metricType: metric.metricType === 'Lagging' ? 'Lagging' : 'Leading'
+          metricType: (metric.metricType === 'Lagging' ? 'Lagging' : 'Leading') as 'Leading' | 'Lagging'
         }))
         .filter((metric) => metric.indicator);
       if (cleaned.length > 0) {
@@ -727,14 +767,25 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       }
     }
 
+    setIsConversationalAgentOpen(false);
     setIsAddingNewOkr(true);
     setIsDraftPendingReview(true);
+    setNewOkrValidationError(null);
     setFeedbackMessage({
-      text: 'Conversational draft applied. Review the populated Add OKR form before publishing.',
+      text: 'Conversational draft applied. Review the populated Add OKR form and click Publish OKR & Execute Remaining Stages.',
       type: 'success'
     });
     setTimeout(() => setFeedbackMessage(null), 3500);
-  }, []);
+  }, [potentialParents]);
+
+  const applyConversationalBusinessProblemToActiveOkr = useCallback(() => {
+    if (!activeOkr || (!conversationBusinessProblem && !conversationDraft)) return;
+    const problem =
+      conversationBusinessProblem ||
+      buildStructuredBusinessProblemFromDraft(conversationDraft || {}, industry.sector, '');
+    handleBusinessProblemSave(problem);
+    setIsConversationalAgentOpen(false);
+  }, [activeOkr, conversationBusinessProblem, conversationDraft, industry.sector]);
 
   const runConversationalOrchestration = useCallback((response: ConversationalResponse) => {
     if (!Array.isArray(response.orchestrationEvents) || response.orchestrationEvents.length === 0) return;
@@ -802,66 +853,53 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     }
   }, [getConversationalCandidateOrigins, isReconnectingConversationalBackend]);
 
-  const buildLocalConversationalFallback = useCallback((message: string): ConversationalResponse => {
-    const lower = message.toLowerCase();
-    const intent: ConversationIntent =
-      /(create|add|new)\s+(okr|key result)/i.test(message)
-        ? 'create_okr'
-        : /(orchestrate|run agents|trigger agents|advisory|supervisor)/i.test(message)
-          ? 'run_orchestration'
-          : /(business problem|root cause|causal chain|stakeholder)/i.test(message)
-            ? 'update_business_problem'
-            : 'clarify';
+  const buildLocalConversationalFallback = useCallback(
+    (
+      message: string,
+      history: Array<{ role: string; text: string; nextExpectedField?: MissingAttributeKey | null }> = [],
+      currentDraft: ConversationalOkrDraft | null = null,
+      autoCompleteRemaining = false
+    ): ConversationalResponse => {
+      return parseConversationalOkrInput(
+        message,
+        {
+          industryName: industry.name,
+          sector: industry.sector,
+          quarter: industry.quarter,
+          owners: orgDirectory.map((member) => member.name).filter(Boolean),
+          parentOptions: potentialParents.map((parent) => ({ id: parent.id, title: parent.title })),
+          existingOkrTitles: okrNodes.map((node) => node.title),
+          priorityOptions: ['P0 - Critical', 'P1 - High', 'P2 - Medium', 'AI_RECOMMENDED'],
+          autoCompleteRemaining
+        },
+        history,
+        currentDraft
+      );
+    },
+    [industry.name, industry.sector, industry.quarter, orgDirectory, potentialParents, okrNodes]
+  );
 
-    const extractedTiming = message.match(/(Q[1-4]\s*\d{4}(?:\s*Sprint\s*\d+)?)/i)?.[1] || 'Q2 2027 Sprint 4';
-    const extractedBudget = message.match(/(\$[\d.,]+[mMkK]?)/)?.[1] || '$4.5M';
+  const resetConversationalSession = useCallback(() => {
+    setConversationDraft(null);
+    setConversationBusinessProblem(null);
+    setConversationGapReport({
+      missingAttributes: [],
+      capturedAttributes: [],
+      readinessPct: 0,
+      isDraftComplete: false,
+      nextExpectedField: null
+    });
+    setConversationTurns([
+      {
+        id: `assistant-reset-${Date.now()}`,
+        role: 'assistant',
+        text: 'Started a fresh OKR drafting session. Describe your desired outcome or share details (owner, timeline, root cause, causal chain, metrics), and I will identify any missing attributes.'
+      }
+    ]);
+  }, []);
 
-    return {
-      assistantMessage: 'Backend conversational service is unreachable, so I created a local draft from your text. You can still apply and edit it.',
-      intent,
-      confidence: 0.64,
-      questions: [
-        'Who should be the accountable owner?',
-        'Do you want additional remediation timing milestones?',
-        'Which leading and lagging metrics matter most?'
-      ],
-      actionPlan: [
-        'Generate draft from free-text intent',
-        'Apply draft into Add OKR form',
-        'Validate and publish after review'
-      ],
-      okrDraft: {
-        title: intent === 'create_okr' ? `Resolve ${industry.sector} execution bottleneck` : 'Refine business problem structure',
-        parentId: potentialParents[0]?.id || '',
-        owner: orgDirectory[0]?.name || 'Executive Lead',
-        priority: lower.includes('critical') ? 'P0 - Critical' : 'P1 - High',
-        budget: extractedBudget,
-        problemDescription: message,
-        impactedStakeholders: ['Executive Board', 'Operations Team'],
-        causalChainToDollarImpact: 'Operational friction → delayed outcomes → measurable financial impact',
-        rootCause: 'Capacity and process constraints',
-        remediationTimings: [extractedTiming],
-        metrics: [
-          { indicator: 'Cycle Time', baselineValue: '9 days', targetValue: '3 days', metricType: 'Leading' },
-          { indicator: 'Revenue Risk', baselineValue: '$6.0M', targetValue: '$0', metricType: 'Lagging' }
-        ]
-      },
-      orchestrationEvents: intent === 'run_orchestration'
-        ? [
-            {
-              topic: 'ORCHESTRATION_STARTED',
-              sourceAgent: 'Local Conversational Fallback',
-              targetAgent: 'Supervisor Agent',
-              summary: 'Triggered local orchestration plan from conversational fallback',
-              severity: 'info'
-            }
-          ]
-        : []
-    };
-  }, [industry.sector, orgDirectory, potentialParents]);
-
-  const handleConversationalSend = async () => {
-    const trimmed = conversationInput.trim();
+  const handleConversationalSend = async (overrideMessage?: string, autoCompleteRemaining = false) => {
+    const trimmed = (overrideMessage ?? conversationInput).trim();
     if (!trimmed || isConversationLoading) return;
 
     const userTurn: ConversationTurn = {
@@ -869,15 +907,61 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       role: 'user',
       text: trimmed
     };
-    const priorTurns = conversationTurns.slice(-8).map((turn) => ({ role: turn.role, text: turn.text }));
+    const priorTurns = conversationTurns.slice(-10).map((turn) => ({
+      role: turn.role,
+      text: turn.text,
+      nextExpectedField: turn.nextExpectedField
+    }));
+    const activeDraftSnapshot = conversationDraft;
     setConversationTurns((prev) => [...prev, userTurn]);
-    setConversationInput('');
+    if (!overrideMessage) {
+      setConversationInput('');
+    }
     setIsConversationLoading(true);
+
+    const applyParsedResponse = (payload: ConversationalResponse) => {
+      const mergedDraft = payload.okrDraft
+        ? mergeConversationalDrafts(activeDraftSnapshot, payload.okrDraft)
+        : null;
+      const resolvedProblem =
+        payload.businessProblem ||
+        (mergedDraft ? buildStructuredBusinessProblemFromDraft(mergedDraft, industry.sector, trimmed) : null);
+
+      const missingAttributes = Array.isArray(payload.missingAttributes) ? payload.missingAttributes : [];
+      const capturedAttributes = Array.isArray(payload.capturedAttributes) ? payload.capturedAttributes : [];
+      const readinessPct = typeof payload.readinessPct === 'number' ? payload.readinessPct : (mergedDraft ? 100 : 0);
+      const isDraftComplete = typeof payload.isDraftComplete === 'boolean' ? payload.isDraftComplete : missingAttributes.length === 0;
+      const nextExpectedField = payload.nextExpectedField ?? missingAttributes[0]?.key ?? null;
+
+      const assistantTurn: ConversationTurn = {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        text: payload.assistantMessage || 'Parsed your input into an OKR & Business Problem draft.',
+        intent: payload.intent,
+        confidence: payload.confidence,
+        actionPlan: payload.actionPlan,
+        questions: payload.questions,
+        nextExpectedField
+      };
+      setConversationTurns((prev) => [...prev, assistantTurn]);
+      setConversationDraft(mergedDraft ? { ...mergedDraft, lastAskedField: nextExpectedField } : null);
+      setConversationBusinessProblem(resolvedProblem);
+      setConversationGapReport({
+        missingAttributes,
+        capturedAttributes,
+        readinessPct,
+        isDraftComplete,
+        nextExpectedField
+      });
+      runConversationalOrchestration(payload);
+    };
 
     try {
       const requestPayload = {
         message: trimmed,
         history: priorTurns,
+        currentDraft: activeDraftSnapshot,
+        autoCompleteRemaining,
         context: {
           industryName: industry.name,
           sector: industry.sector,
@@ -885,7 +969,8 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
           owners: orgDirectory.map((member) => member.name).filter(Boolean).slice(0, 20),
           parentOptions: potentialParents.slice(0, 20).map((parent) => ({ id: parent.id, title: parent.title })),
           existingOkrTitles: okrNodes.slice(0, 20).map((node) => node.title),
-          priorityOptions: ['P0 - Critical', 'P1 - High', 'P2 - Medium', 'AI_RECOMMENDED']
+          priorityOptions: ['P0 - Critical', 'P1 - High', 'P2 - Medium', 'AI_RECOMMENDED'],
+          autoCompleteRemaining
         }
       };
 
@@ -926,21 +1011,15 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
 
       if (!response && networkFailure) {
         setIsConversationalBackendOffline(true);
-        const fallbackPayload = buildLocalConversationalFallback(trimmed);
-        const assistantTurn: ConversationTurn = {
-          id: `assistant-local-${Date.now()}`,
-          role: 'assistant',
-          text: fallbackPayload.assistantMessage,
-          intent: fallbackPayload.intent,
-          confidence: fallbackPayload.confidence,
-          actionPlan: fallbackPayload.actionPlan,
-          questions: fallbackPayload.questions
-        };
-        setConversationTurns((prev) => [...prev, assistantTurn]);
-        setConversationDraft(fallbackPayload.okrDraft || null);
-        runConversationalOrchestration(fallbackPayload);
+        const fallbackPayload = buildLocalConversationalFallback(
+          trimmed,
+          priorTurns,
+          activeDraftSnapshot,
+          autoCompleteRemaining
+        );
+        applyParsedResponse(fallbackPayload);
         setFeedbackMessage({
-          text: 'Conversational backend is offline. Local intent fallback generated a draft.',
+          text: 'Conversational backend is offline. Local parser generated your OKR & Business Problem draft.',
           type: 'warning'
         });
         setTimeout(() => setFeedbackMessage(null), 3500);
@@ -957,37 +1036,18 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         setPreferredConversationalOrigin(responseOrigin);
       }
       setIsConversationalBackendOffline(false);
-      const assistantTurn: ConversationTurn = {
-        id: `assistant-${Date.now()}`,
-        role: 'assistant',
-        text: payload.assistantMessage || 'I can help draft your OKR. Please add more detail.',
-        intent: payload.intent,
-        confidence: payload.confidence,
-        actionPlan: payload.actionPlan,
-        questions: payload.questions
-      };
-      setConversationTurns((prev) => [...prev, assistantTurn]);
-      setConversationDraft(payload.okrDraft || null);
-      runConversationalOrchestration(payload);
+      applyParsedResponse(payload);
     } catch (error) {
       setIsConversationalBackendOffline(true);
-      const fallbackPayload = buildLocalConversationalFallback(trimmed);
-      setConversationTurns((prev) => [
-        ...prev,
-        {
-          id: `assistant-error-${Date.now()}`,
-          role: 'assistant',
-          text: fallbackPayload.assistantMessage,
-          intent: fallbackPayload.intent,
-          confidence: fallbackPayload.confidence,
-          actionPlan: fallbackPayload.actionPlan,
-          questions: fallbackPayload.questions
-        }
-      ]);
-      setConversationDraft(fallbackPayload.okrDraft || null);
-      runConversationalOrchestration(fallbackPayload);
+      const fallbackPayload = buildLocalConversationalFallback(
+        trimmed,
+        priorTurns,
+        activeDraftSnapshot,
+        autoCompleteRemaining
+      );
+      applyParsedResponse(fallbackPayload);
       setFeedbackMessage({
-        text: 'Backend request failed. Local conversational fallback is active.',
+        text: 'Backend request failed. Local conversational parser generated your draft.',
         type: 'warning'
       });
       setTimeout(() => setFeedbackMessage(null), 3500);
@@ -1112,6 +1172,9 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
 
     const parentId = newOkrParentId || potentialParents[0]?.id || Object.keys(nodesMap)[0] || 'root';
 
+    const smartEval = evaluateSmartCriteria(newOkrTitle);
+    const advisoryEval = evaluateAdvisoryCommittee(newOkrTitle, [42, 49, 57, 64, 72], 5);
+
     const newNode: TraceabilityNode = {
       id: newId,
       title: newOkrTitle,
@@ -1130,15 +1193,15 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       },
       businessProblem: structuredProblem,
       ai: {
-        analyse: `Newly structured OKR for ${industry.sector} validated against enterprise SMART criteria and HR directory.`,
-        predict: 'Projected 84% attainment probability under current capacity profile.',
-        recommend: 'Pair dedicated agile release train to unblock dependencies.',
+        analyse: `SMART composite ${smartEval.compositeScore}/100 validated against enterprise policies and HR directory.`,
+        predict: `Projected ${Math.min(96, Math.max(68, Math.round(advisoryEval.consensusScore)))}% attainment probability across ${normalizedRemediationTimings.join(', ')}.`,
+        recommend: `Advisory consensus (${advisoryEval.consensusScore.toFixed(0)}%) recommends dedicated squad alignment to unblock "${structuredProblem.rootCause}".`,
         automate: 'Continuous webhook sync established with Planview AgilePlace.',
-        optimise: 'Resource allocation verified across org directory.'
+        optimise: 'Resource allocation and causal impact verified across org directory.'
       }
     };
 
-    if (!enforceSupervisorPolicy(newNode)) {
+    if (!enforceSupervisorPolicy(newNode, true)) {
       return;
     }
 
@@ -1159,8 +1222,8 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     eventBus.publish({
       topic: 'OKR_CREATED_OR_EDITED',
       sourceAgent: 'Human Executive (HITL)',
-      targetAgent: 'Advisory Committee & Supervisor',
-      summary: `New OKR Added: "${newOkrTitle}" (${newOkrPriority}) with 6 structured problem attributes`,
+      targetAgent: 'Supervisor & Advisory Committee',
+      summary: `New OKR Published: "${newOkrTitle}" (${newOkrPriority}) with 6 structured Business Problem attributes`,
       payload: {
         id: newId,
         title: newOkrTitle,
@@ -1172,14 +1235,43 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       severity: 'success'
     });
 
+    eventBus.publish({
+      topic: 'KR_REGRESSION_PREDICTED',
+      sourceAgent: 'OKR Quality & Prediction Agent',
+      targetAgent: 'Trajectory Engine',
+      summary: `Stage 2 Executed for "${newOkrTitle}": SMART score ${smartEval.compositeScore}/100`,
+      payload: {
+        okrId: newId,
+        smartCompositeScore: smartEval.compositeScore,
+        targetTiming: primaryTiming
+      },
+      latencyMs: 18,
+      severity: 'info'
+    });
+
+    eventBus.publish({
+      topic: 'ADVISORY_COMMITTEE_EVALUATED',
+      sourceAgent: 'Advisory Committee (5 Agents)',
+      targetAgent: 'Supervisor Agent',
+      summary: `Remaining Stages Executed for "${newOkrTitle}": Consensus ${advisoryEval.consensusScore.toFixed(0)}% • Bottleneck & $ impact verified`,
+      payload: {
+        okrId: newId,
+        consensusScore: advisoryEval.consensusScore,
+        causalChain: structuredProblem.causalChainToDollarImpact
+      },
+      latencyMs: 29,
+      severity: 'success'
+    });
+
     setIsAddingNewOkr(false);
     setIsDraftPendingReview(false);
+    setNewOkrValidationError(null);
     setSelectedOkrId(newId);
     setFeedbackMessage({
-      text: `Successfully created and published new OKR "${newOkrTitle}"! All 6 business problem dimensions structured & validated.`,
+      text: `Published "${newOkrTitle}" & executed remaining stages (SMART: ${smartEval.compositeScore}/100, Advisory Consensus: ${advisoryEval.consensusScore.toFixed(0)}%)!`,
       type: 'success'
     });
-    setTimeout(() => setFeedbackMessage(null), 4000);
+    setTimeout(() => setFeedbackMessage(null), 5000);
   };
 
   // Handle Terminate Program
@@ -1491,12 +1583,12 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                 {/* OKR Header with Toggle Button */}
                 <div className="flex items-start justify-between gap-3 pb-3 border-b border-slate-100">
                   <div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-bold text-indigo-600 uppercase">{activeOkr.id}</span>
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span className="text-xs font-bold text-indigo-600 uppercase whitespace-nowrap">{activeOkr.id}</span>
                       <span className="text-xs text-slate-400">•</span>
-                      <span className="text-xs text-slate-600">Owner: <strong>{activeOkr.owner}</strong></span>
+                      <span className="text-xs text-slate-600 whitespace-nowrap">Owner: <strong>{activeOkr.owner}</strong></span>
                       <span className="text-xs text-slate-400">•</span>
-                      <span className="text-xs text-slate-600">Timing: <strong>{activeOkr.targetDate || 'Q2 2027'}</strong></span>
+                      <span className="text-xs text-slate-600 whitespace-nowrap">Timing: <strong>{activeOkr.targetDate || 'Q2 2027'}</strong></span>
                     </div>
                     <h3 className="text-base font-bold text-slate-900 mt-0.5">{activeOkr.title}</h3>
                   </div>
@@ -2102,9 +2194,9 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
 
       {/* MODAL: CONVERSATIONAL OKR AGENT */}
       {isConversationalAgentOpen && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
-          <div className="bg-white rounded-2xl max-w-4xl w-full p-5 shadow-2xl border border-slate-200 my-8 space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+        <div className="fixed inset-0 bg-slate-900/65 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl max-w-4xl w-full max-h-[90vh] flex flex-col p-5 shadow-2xl border border-slate-200 overflow-hidden gap-3">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100 shrink-0">
               <div className="flex items-center gap-2">
                 <span className="p-1.5 rounded-lg bg-violet-100 text-violet-700">
                   <Bot className="w-4 h-4" />
@@ -2116,7 +2208,15 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                   </p>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={resetConversationalSession}
+                  className="px-2 py-0.5 rounded-full border border-slate-300 bg-white text-[10px] font-semibold text-slate-600 hover:bg-slate-100 cursor-pointer"
+                  title="Start a fresh OKR conversation"
+                >
+                  New Session
+                </button>
                 <button
                   type="button"
                   onClick={reconnectConversationalBackend}
@@ -2134,12 +2234,18 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                       ? 'Backend offline'
                       : 'Backend online'}
                 </button>
-                <button onClick={() => setIsConversationalAgentOpen(false)} className="text-slate-400 hover:text-slate-600 cursor-pointer">
+                <button
+                  type="button"
+                  aria-label="Close Conversational Agent"
+                  onClick={() => setIsConversationalAgentOpen(false)}
+                  className="text-slate-400 hover:text-slate-600 cursor-pointer"
+                >
                   <X className="w-5 h-5" />
                 </button>
               </div>
             </div>
 
+            <div className="flex-1 min-h-0 overflow-y-auto space-y-3 pr-1">
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
               <p className="text-[11px] font-semibold text-slate-700">Try prompts:</p>
               <div className="flex flex-wrap gap-2">
@@ -2160,7 +2266,68 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
               </div>
             </div>
 
-            <div className="rounded-xl border border-slate-200 bg-white p-3 h-[340px] overflow-y-auto space-y-3">
+            {(conversationTurns.length > 1 || conversationDraft) && (
+              <div className={`rounded-xl border p-2.5 space-y-2 ${
+                conversationGapReport.isDraftComplete
+                  ? 'border-emerald-200 bg-emerald-50/70'
+                  : 'border-amber-200 bg-amber-50/70'
+              }`}>
+                <div className="flex items-center justify-between gap-2 text-[11px]">
+                  <span className={`font-bold ${conversationGapReport.isDraftComplete ? 'text-emerald-800' : 'text-amber-900'}`}>
+                    {conversationGapReport.isDraftComplete
+                      ? 'OKR & 6-Dimension Business Problem Ready (100%)'
+                      : `Attribute Completeness: ${conversationGapReport.readinessPct}% (${conversationGapReport.missingAttributes.length} missing)`}
+                  </span>
+                  {!conversationGapReport.isDraftComplete && conversationDraft && (
+                    <button
+                      type="button"
+                      disabled={isConversationLoading}
+                      onClick={() => void handleConversationalSend('Construct complete draft with recommended defaults for remaining attributes', true)}
+                      className="px-2.5 py-1 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-[10px] font-semibold cursor-pointer disabled:opacity-60"
+                    >
+                      Construct Complete Draft
+                    </button>
+                  )}
+                </div>
+
+                {conversationGapReport.missingAttributes.length > 0 && (
+                  <div className="space-y-1.5">
+                    <div className="flex flex-wrap gap-1.5">
+                      {conversationGapReport.missingAttributes.map((missing) => (
+                        <button
+                          key={missing.key}
+                          type="button"
+                          onClick={() => setConversationInput(missing.example)}
+                          title={`Click to pre-fill ${missing.label} answer`}
+                          className="px-2 py-0.5 rounded-md border border-amber-300 bg-white hover:bg-amber-100 text-[10px] font-semibold text-amber-900 cursor-pointer"
+                        >
+                          + {missing.label}
+                        </button>
+                      ))}
+                    </div>
+                    {conversationGapReport.missingAttributes.some((m) => m.key === 'owner' || m.key === 'ownerVerification') &&
+                      orgDirectory.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                          <span className="text-[10px] font-semibold text-slate-600">HR Owners:</span>
+                          {orgDirectory.slice(0, 4).map((member) => (
+                            <button
+                              key={member.id}
+                              type="button"
+                              disabled={isConversationLoading}
+                              onClick={() => void handleConversationalSend(`owner: ${member.name}`)}
+                              className="px-2 py-0.5 rounded-md border border-indigo-200 bg-white hover:bg-indigo-50 text-[10px] font-semibold text-indigo-700 cursor-pointer"
+                            >
+                              Assign {member.name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="rounded-xl border border-slate-200 bg-white p-3 h-[280px] overflow-y-auto space-y-3">
               {conversationTurns.map((turn) => (
                 <div key={turn.id} className={`flex ${turn.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <div className={`max-w-[85%] rounded-xl px-3 py-2 text-xs ${
@@ -2189,7 +2356,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                         )}
                         {Array.isArray(turn.questions) && turn.questions.length > 0 && (
                           <div>
-                            <p className="font-bold mb-0.5">Need Clarification</p>
+                            <p className="font-bold mb-0.5">Questions to Complete Draft</p>
                             <ul className="list-disc pl-4 space-y-0.5">
                               {turn.questions.slice(0, 3).map((item) => <li key={item}>{item}</li>)}
                             </ul>
@@ -2201,39 +2368,130 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                 </div>
               ))}
               {isConversationLoading && (
-                <div className="text-xs text-slate-500">Agent is thinking...</div>
+                <div className="text-xs text-slate-500">Agent is analyzing OKR &amp; Business Problem gaps...</div>
               )}
             </div>
 
             {conversationDraft && (
-              <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                <div>
-                  <p className="text-xs font-bold text-emerald-800">Draft OKR detected</p>
-                  <p className="text-[11px] text-emerald-900">Apply extracted draft to Add OKR form for final validation and publish.</p>
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-2.5">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-bold text-emerald-800">
+                      {conversationGapReport.isDraftComplete
+                        ? 'Constructed Complete OKR & 6-Dimension Business Problem'
+                        : 'Progressive Draft OKR & Business Problem'}
+                    </p>
+                    <p className="text-[11px] text-emerald-900">
+                      {conversationGapReport.isDraftComplete
+                        ? 'All attributes captured. Click "Apply Draft to Form" for final review and Publish OKR & Execute Remaining Stages.'
+                        : 'Continue answering questions above or click "Apply Draft to Form" to review and complete remaining fields.'}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {activeOkr && conversationBusinessProblem && (
+                      <button
+                        type="button"
+                        onClick={applyConversationalBusinessProblemToActiveOkr}
+                        className="px-3 py-1.5 rounded-lg border border-emerald-600 bg-white hover:bg-emerald-100 text-emerald-800 text-xs font-semibold cursor-pointer"
+                      >
+                        Apply to Active OKR Problem
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => applyConversationalDraftToForm(conversationDraft)}
+                      className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold cursor-pointer"
+                    >
+                      Apply Draft to Form
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => applyConversationalDraftToForm(conversationDraft)}
-                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
-                >
-                  Apply Draft to Form
-                </button>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 rounded-lg border border-emerald-200 bg-white p-2.5 text-[11px] text-slate-700">
+                  <div>
+                    <span className="font-bold text-slate-900">Outcome / Title:</span>{' '}
+                    <span>{conversationDraft.title || 'Pending'}</span>
+                  </div>
+                  <div>
+                    <span className="font-bold text-slate-900">Owner:</span>{' '}
+                    <span>{conversationDraft.owner || 'Unassigned'}</span>
+                  </div>
+                  <div>
+                    <span className="font-bold text-slate-900">Timeline:</span>{' '}
+                    <span>
+                      {(conversationDraft.remediationTimings && conversationDraft.remediationTimings.join(', ')) ||
+                        conversationDraft.targetRemediationTiming ||
+                        conversationDraft.targetDate ||
+                        'Q2 2027 Sprint 4'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="font-bold text-slate-900">Priority / Budget:</span>{' '}
+                    <span>{conversationDraft.priority || 'P1 - High'} • {conversationDraft.budget || '$4.5M'}</span>
+                  </div>
+                  {Array.isArray(conversationDraft.metrics) && conversationDraft.metrics.length > 0 && (
+                    <div className="sm:col-span-2">
+                      <span className="font-bold text-slate-900 block mb-1">Parsed Metrics:</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {conversationDraft.metrics.map((metric, idx) => (
+                          <span
+                            key={`${metric.indicator}-${idx}`}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-slate-200 bg-slate-50 text-[10px] font-semibold text-slate-800"
+                          >
+                            <span className={metric.metricType === 'Lagging' ? 'text-amber-700' : 'text-indigo-700'}>
+                              {metric.metricType}
+                            </span>
+                            <span>• {metric.indicator}: {metric.baselineValue} → {metric.targetValue}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {conversationBusinessProblem && (
+                    <div className="sm:col-span-2 border-t border-slate-100 pt-1.5 space-y-0.5 text-[10px] text-slate-600">
+                      <p>
+                        <span className="font-bold text-slate-800">Business Problem:</span>{' '}
+                        {conversationBusinessProblem.problemDescription}
+                      </p>
+                      <p>
+                        <span className="font-bold text-slate-800">Root Cause:</span>{' '}
+                        {conversationBusinessProblem.rootCause}
+                      </p>
+                      <p>
+                        <span className="font-bold text-slate-800">Causal Chain:</span>{' '}
+                        {conversationBusinessProblem.causalChainToDollarImpact}
+                      </p>
+                      <p>
+                        <span className="font-bold text-slate-800">Stakeholders:</span>{' '}
+                        {conversationBusinessProblem.impactedStakeholders.join(', ')}
+                      </p>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
-            <div className="flex items-end gap-2">
+            </div>
+
+            <div className="flex items-end gap-2 shrink-0 pt-2 border-t border-slate-100">
               <textarea
                 rows={2}
                 value={conversationInput}
                 onChange={(e) => setConversationInput(e.target.value)}
-                placeholder="Tell the agent what outcome you want, constraints, owner, and target timeline..."
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleConversationalSend();
+                  }
+                }}
+                placeholder="Describe your goal or answer the agent's question (e.g. 'Legacy manual provisioning bottlenecks' or 'owner: Dr. Elena Vance')..."
                 className="flex-1 px-3 py-2 border border-slate-300 rounded-xl text-xs text-slate-800"
               />
               <button
                 type="button"
-                onClick={handleConversationalSend}
+                onClick={() => void handleConversationalSend()}
                 disabled={isConversationLoading || !conversationInput.trim()}
-                className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-semibold flex items-center gap-1"
+                className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
               >
                 <Send className="w-3.5 h-3.5" />
                 Send
@@ -2247,8 +2505,8 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       {/* MODAL: ADD NEW OKR (ENHANCED WITH 6 ATTRIBUTES & INDUSTRY DB) */}
       {/* ------------------------------------------------------------- */}
       {isAddingNewOkr && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
-          <div className="bg-white rounded-2xl max-w-6xl w-full p-6 shadow-2xl space-y-4 border border-slate-200 my-8">
+        <div className="fixed inset-0 bg-slate-900/65 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl max-w-6xl w-full max-h-[92vh] overflow-y-auto p-6 shadow-2xl space-y-4 border border-slate-200">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <div className="flex items-center gap-2">
                 <span className="p-1.5 rounded-lg bg-indigo-100 text-indigo-700">
@@ -2375,12 +2633,22 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                           onChange={(e) => setNewOkrOwner(e.target.value)}
                           className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
                         >
+                          {newOkrOwner && !orgDirectory.some((m) => m.name === newOkrOwner) && (
+                            <option value={newOkrOwner}>
+                              {newOkrOwner} (Custom Owner — Not in HR Directory)
+                            </option>
+                          )}
                           {orgDirectory.map((m) => (
                             <option key={m.id} value={m.name}>
                               {m.name} ({m.title})
                             </option>
                           ))}
                         </select>
+                        {newOkrOwner && !orgDirectory.some((m) => m.name === newOkrOwner) && (
+                          <p className="text-[10px] text-amber-700 mt-1">
+                            Parsed owner &ldquo;{newOkrOwner}&rdquo; is preserved; switch to an HR directory member if strict owner verification blocks publishing.
+                          </p>
+                        )}
                       </div>
                     </div>
 
@@ -2736,10 +3004,31 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                 </aside>
               </div>
 
+              {newOkrValidationError && (
+                <div className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3.5 py-2.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-xs text-red-800">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                    <span>{newOkrValidationError}</span>
+                  </div>
+                  {newOkrValidationError.toLowerCase().includes('hr directory') && orgDirectory[0] && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNewOkrOwner(orgDirectory[0].name);
+                        setNewOkrValidationError(null);
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-white border border-red-300 hover:bg-red-100 text-[11px] font-semibold text-red-800 shrink-0 cursor-pointer"
+                    >
+                      Assign {orgDirectory[0].name}
+                    </button>
+                  )}
+                </div>
+              )}
+
               <div className="pt-3 mt-4 border-t border-slate-100 flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => { setIsAddingNewOkr(false); setIsDraftPendingReview(false); }}
+                  onClick={() => { setIsAddingNewOkr(false); setIsDraftPendingReview(false); setNewOkrValidationError(null); }}
                   className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-50 cursor-pointer font-medium"
                 >
                   Cancel
@@ -2758,7 +3047,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
 
       {/* MODAL: INITIATE NEW PROGRAM */}
       {isInitiatingProgram && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+        <div className="fixed inset-0 bg-slate-900/65 flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-2xl max-w-xl w-full p-6 shadow-2xl space-y-4 border border-slate-200">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <h3 className="text-base font-bold text-slate-900">Initiate New Strategic Program</h3>
@@ -2856,14 +3145,14 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       <BusinessProblemManager
         isOpen={isBusinessProblemManagerOpen}
         onClose={() => setIsBusinessProblemManagerOpen(false)}
-        problem={activeOkr?.businessProblem || null}
+        problem={effectiveActiveBusinessProblem}
         orgDirectory={orgDirectory}
         onSave={handleBusinessProblemSave}
       />
 
       {/* MODAL: TERMINATE PROGRAM CONFIRMATION */}
       {terminatingProgramId && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+        <div className="fixed inset-0 bg-slate-900/65 flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4 border border-slate-200">
             <div className="flex items-center gap-2 text-red-600">
               <AlertTriangle className="w-5 h-5 shrink-0" />

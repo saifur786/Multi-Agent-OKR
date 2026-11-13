@@ -613,7 +613,7 @@ export const StrategicPortfolioPlannerView: React.FC<StrategicPortfolioPlannerVi
               <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
               <XAxis dataKey="month" tick={{ fontSize: 12, fill: '#475569' }} />
               <YAxis domain={[30, 100]} tick={{ fontSize: 12, fill: '#475569' }} />
-              <Tooltip formatter={(value: number) => [`${value}%`, 'Achievement']} />
+              <Tooltip formatter={(value) => [`${value ?? ''}%`, 'Achievement']} />
               <Legend />
               <ReferenceLine y={80} stroke="#cbd5e1" strokeDasharray="5 5" label={{ value: 'target', position: 'insideTopRight' }} />
               <Line type="monotone" dataKey="target" stroke="#4f46e5" strokeWidth={3} dot={{ r: 4 }} name="Target" />

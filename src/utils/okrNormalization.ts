@@ -27,7 +27,7 @@ export const normalizeStructuredBusinessProblem = (
           indicator: String(metric?.indicator ?? '').trim(),
           baselineValue: String(metric?.baselineValue ?? '').trim(),
           targetValue: String(metric?.targetValue ?? '').trim(),
-          metricType: metric?.metricType === 'Lagging' ? 'Lagging' : 'Leading'
+          metricType: (metric?.metricType === 'Lagging' ? 'Lagging' : 'Leading') as 'Leading' | 'Lagging'
         }))
         .filter((metric) => metric.indicator)
     : [];

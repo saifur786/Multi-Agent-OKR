@@ -173,6 +173,16 @@ export function validateOkrStructuralAdequacy(
           (Array.isArray(businessProblem.remediationTimings) && businessProblem.remediationTimings.some((value) => String(value).trim().length >= 2)));
       case 'metrics':
         return metricList.length > 0 && hasNumericTarget;
+      case 'overrideReason':
+        if (!okr.manualPriority || okr.manualPriority.priority === 'AI_RECOMMENDED') {
+          return true;
+        }
+        return Boolean(okr.manualPriority.overrideReason && okr.manualPriority.overrideReason.trim());
+      case 'overriddenBy':
+        if (!okr.manualPriority || okr.manualPriority.priority === 'AI_RECOMMENDED') {
+          return true;
+        }
+        return Boolean(okr.manualPriority.overriddenBy && okr.manualPriority.overriddenBy.trim());
       default:
         return false;
     }
