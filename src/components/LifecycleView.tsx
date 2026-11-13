@@ -59,7 +59,17 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
   const [simRunCount, setSimRunCount] = useState(0);
   const [deepDiveStage, setDeepDiveStage] = useState<LifecycleStage | null>(null);
 
-  const activeStage = industry.stages.find((s) => s.id === activeStageId) || industry.stages[0];
+  const stages = Array.isArray(industry.stages) ? industry.stages : [];
+  const activeStage = stages.find((s) => s.id === activeStageId) || stages[0] || null;
+
+  if (!activeStage) {
+    return (
+      <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-2xs">
+        <p className="text-sm font-semibold text-slate-800">Lifecycle data is unavailable for this industry.</p>
+        <p className="text-xs text-slate-500 mt-1">Please reselect an industry or regenerate normalized traceability data.</p>
+      </div>
+    );
+  }
 
   const handleRunSimulation = () => {
     setIsSimulating(true);
@@ -164,7 +174,7 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
-          {industry.stages.map((stage) => {
+          {stages.map((stage) => {
             const isSelected = stage.id === activeStageId;
             return (
               <button

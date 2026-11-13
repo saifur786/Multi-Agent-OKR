@@ -49,4 +49,40 @@ test('validateOkrStructuralAdequacy evaluates ownership and enterprise policies'
   assert.ok(report.ambitionScore >= 70);
   assert.ok(report.structuralCheckpointsPassed >= 4);
   assert.equal(report.isAdequate, true);
+  assert.equal(report.enforcementBlocked, false);
+});
+
+test('validateOkrStructuralAdequacy blocks invalid OKRs that miss required policy fields', () => {
+  const invalidNode: any = {
+    id: 'bad-okr',
+    title: 'Improve customer experience',
+    owner: 'Unverified Owner',
+    status: 'On Track',
+    progress: 55,
+    budget: '',
+    parentIds: [],
+    childIds: [],
+    ai: {
+      analyse: 'Needs review',
+      predict: 'Unknown',
+      recommend: 'TBD',
+      automate: 'TBD',
+      optimise: 'TBD'
+    },
+    businessProblem: {
+      problemDescription: 'Need better service',
+      impactedStakeholders: [],
+      causalChainToDollarImpact: '',
+      rootCause: '',
+      targetRemediationTiming: '',
+      metrics: []
+    }
+  };
+
+  const report = validateOkrStructuralAdequacy(invalidNode, TELCO_POLICIES, TELCO_ORG_DIRECTORY);
+
+  assert.equal(report.isAdequate, false);
+  assert.equal(report.enforcementBlocked, true);
+  assert.ok(report.requiredFieldsMissing.length > 0);
+  assert.ok(report.complianceIssues.some((issue) => issue.toLowerCase().includes('owner') || issue.toLowerCase().includes('budget')));
 });

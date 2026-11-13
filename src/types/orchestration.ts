@@ -101,7 +101,9 @@ export interface StructuredBusinessProblem {
   impactedStakeholders: string[];
   causalChainToDollarImpact: string;
   rootCause: string;
+  rootCauses?: string[];
   targetRemediationTiming: string;
+  remediationTimings?: string[];
   metrics: BusinessMetricIndicator[];
 }
 
@@ -413,6 +415,16 @@ export interface FutureTrajectoryPoint {
   milestoneEvent?: string;
 }
 
+export interface AgentInteractionRecord {
+  id: string;
+  agent: string;
+  context: string;
+  message: string;
+  response: string;
+  createdAt: string;
+  metadata?: Record<string, any>;
+}
+
 export interface IndustryDataBundle {
   id: string;
   name: string;
@@ -425,6 +437,7 @@ export interface IndustryDataBundle {
   isCustom?: boolean;
   stages: LifecycleStage[];
   traceability: Record<number, TraceabilityNode[]>;
+  nodeMap?: Record<string, TraceabilityNode>;
   knowledgeBase: KnowledgeBasePillar[];
   smartRubric: SmartCriteria;
   regressionModel: RegressionModelResult;
@@ -437,4 +450,5 @@ export interface IndustryDataBundle {
   policies?: OkrEnterprisePolicy[];
   programs?: ManagedProgram[];
   activeDisasters?: SignificantDisasterEvent[];
+  agentInteractions?: AgentInteractionRecord[];
 }

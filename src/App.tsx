@@ -26,6 +26,49 @@ import {
   ManagedProgram,
   SignificantDisasterEvent
 } from './types/orchestration';
+import { normalizeIndustryBundle, normalizeStructuredBusinessProblem } from './utils/okrNormalization';
+
+const buildNodesMap = (industry: IndustryDataBundle): Record<string, TraceabilityNode> => {
+  const map: Record<string, TraceabilityNode> = {};
+  Object.values(industry.traceability || {}).forEach((layerNodes) => {
+    (Array.isArray(layerNodes) ? layerNodes : []).forEach((node) => {
+      map[node.id] = {
+        ...node,
+        businessProblem: node.businessProblem ? normalizeStructuredBusinessProblem(node.businessProblem) : undefined
+      };
+    });
+  });
+  return map;
+};
+
+const getInitialSelectedNodeId = (
+  industry: IndustryDataBundle,
+  nodesMap: Record<string, TraceabilityNode>
+): string => {
+  return (
+    industry.traceability[2]?.[0]?.id ||
+    industry.traceability[1]?.[0]?.id ||
+    Object.keys(nodesMap)[0] ||
+    ''
+  );
+};
+
+const hasTraceabilityNodes = (traceability: Record<number, TraceabilityNode[]> | undefined): boolean => {
+  return Object.values(traceability || {}).some((nodes) => Array.isArray(nodes) && nodes.length > 0);
+};
+
+const mergeIndustryWithFallback = (
+  baseIndustry: IndustryDataBundle,
+  incomingIndustry: IndustryDataBundle
+): IndustryDataBundle => {
+  return normalizeIndustryBundle({
+    ...baseIndustry,
+    ...incomingIndustry,
+    stages: incomingIndustry.stages?.length ? incomingIndustry.stages : baseIndustry.stages,
+    knowledgeBase: incomingIndustry.knowledgeBase?.length ? incomingIndustry.knowledgeBase : baseIndustry.knowledgeBase,
+    traceability: hasTraceabilityNodes(incomingIndustry.traceability) ? incomingIndustry.traceability : baseIndustry.traceability
+  });
+};
 
 export default function App() {
   // Dynamic Industries Dictionary (includes defaults + user-created custom industries)
@@ -55,11 +98,33 @@ export default function App() {
     eventBus.seedInitialEvents(INDUSTRY_DATA['Banking'].name)
   );
 
-  const industry = industriesDict[selectedIndustry] || industriesDict['Banking'];
+  const industry = normalizeIndustryBundle(industriesDict[selectedIndustry] || industriesDict['Banking']);
+
+  const persistIndustry = useCallback(async (payload: IndustryDataBundle) => {
+    try {
+      const normalized = normalizeIndustryBundle(payload);
+      await fetch('/api/industries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(normalized)
+      });
+    } catch (error) {
+      console.warn('Industry persistence skipped; MongoDB is currently unavailable.', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (industry && industry.name) {
+      void persistIndustry(industry);
+    }
+  }, [industry, persistIndustry]);
 
   // Enterprise Governance State
   const [managedPrograms, setManagedPrograms] = useState<ManagedProgram[]>(
-    () => industry.programs || []
+    () => (industry.programs || []).map((program) => ({
+      ...program,
+      businessProblem: normalizeStructuredBusinessProblem(program.businessProblem)
+    }))
   );
   const [activeDisasters, setActiveDisasters] = useState<SignificantDisasterEvent[]>(
     () => industry.activeDisasters || []
@@ -72,19 +137,95 @@ export default function App() {
   );
 
   // Flatten nodes for the selected industry into state for live manipulation
-  const [nodesMap, setNodesMap] = useState<Record<string, TraceabilityNode>>(() => {
-    const map: Record<string, TraceabilityNode> = {};
-    Object.values(industry.traceability).forEach((layerNodes) => {
-      layerNodes.forEach((node) => {
-        map[node.id] = { ...node };
-      });
-    });
-    return map;
-  });
+  const [nodesMap, setNodesMap] = useState<Record<string, TraceabilityNode>>(() => buildNodesMap(industry));
 
   const [selectedNodeId, setSelectedNodeId] = useState<string>(() => {
-    return industry.traceability[2]?.[0]?.id || industry.traceability[1][0].id;
+    return getInitialSelectedNodeId(industry, nodesMap);
   });
+
+  const hydrateIndustryState = useCallback((nextIndustry: IndustryDataBundle, reseedEvents: boolean = true) => {
+    const nextNodesMap = buildNodesMap(nextIndustry);
+    setNodesMap(nextNodesMap);
+    setManagedPrograms((nextIndustry.programs || []).map((program) => ({
+      ...program,
+      businessProblem: normalizeStructuredBusinessProblem(program.businessProblem)
+    })));
+    setActiveDisasters(nextIndustry.activeDisasters || []);
+    setOrgDirectory(nextIndustry.orgDirectory || []);
+    setPolicies(nextIndustry.policies || []);
+    setSelectedNodeId(getInitialSelectedNodeId(nextIndustry, nextNodesMap));
+
+    if (reseedEvents) {
+      const seeded = eventBus.seedInitialEvents(nextIndustry.name);
+      setEvents(seeded);
+    }
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadIndustries = async () => {
+      try {
+        const response = await fetch('/api/industries');
+        const data = await response.json();
+        const loaded = data?.industries ?? [];
+        if (!isMounted || !Array.isArray(loaded) || loaded.length === 0) return;
+
+        const merged: Record<string, IndustryDataBundle> = { ...INDUSTRY_DATA };
+        loaded.forEach((entry: any) => {
+          const normalized = normalizeIndustryBundle(entry);
+          const base = normalizeIndustryBundle(merged[normalized.name] || normalized);
+          merged[normalized.name] = mergeIndustryWithFallback(base, normalized);
+        });
+
+        const nextIndustryKey = merged[selectedIndustry]
+          ? selectedIndustry
+          : merged['Telco']
+            ? 'Telco'
+            : Object.keys(merged)[0];
+        if (!nextIndustryKey) return;
+
+        const normalizedIndustry = normalizeIndustryBundle(merged[nextIndustryKey]);
+        setIndustriesDict(merged);
+        if (nextIndustryKey !== selectedIndustry) {
+          setSelectedIndustry(nextIndustryKey);
+        }
+        hydrateIndustryState(normalizedIndustry, false);
+      } catch (error) {
+        console.warn('Could not load industry catalog from MongoDB; using seeded defaults.', error);
+      }
+    };
+
+    void loadIndustries();
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedIndustry, hydrateIndustryState]);
+
+  const currentIndustryBundle = useMemo<IndustryDataBundle>(() => {
+    const traceability = Object.fromEntries(
+      Object.entries(industry.traceability || {}).map(([layer, layerNodes]) => {
+        const nodes = Array.isArray(layerNodes) ? layerNodes.map((node) => nodesMap[node.id] || node) : [];
+        return [layer, nodes];
+      })
+    ) as Record<number, TraceabilityNode[]>;
+
+    return normalizeIndustryBundle({
+      ...industry,
+      traceability,
+      nodeMap: nodesMap,
+      programs: managedPrograms,
+      activeDisasters,
+      orgDirectory,
+      policies
+    });
+  }, [industry, nodesMap, managedPrograms, activeDisasters, orgDirectory, policies]);
+
+  useEffect(() => {
+    if (selectedIndustry && currentIndustryBundle?.name) {
+      void persistIndustry(currentIndustryBundle);
+    }
+  }, [selectedIndustry, currentIndustryBundle, persistIndustry]);
 
   // Subscribe to Event Bus
   useEffect(() => {
@@ -96,49 +237,23 @@ export default function App() {
 
   // When switching industry, refresh nodesMap, events, and selected node
   const handleSelectIndustry = useCallback((ind: string) => {
+    const normalizedIndustry = normalizeIndustryBundle(industriesDict[ind] || industriesDict['Banking']);
     setSelectedIndustry(ind);
     setActiveStageId(1);
-    const newInd = industriesDict[ind] || industriesDict['Banking'];
-
-    const map: Record<string, TraceabilityNode> = {};
-    Object.values(newInd.traceability).forEach((layerNodes) => {
-      layerNodes.forEach((node) => {
-        map[node.id] = { ...node };
-      });
-    });
-    setNodesMap(map);
-    setManagedPrograms(newInd.programs || []);
-    setActiveDisasters(newInd.activeDisasters || []);
-    setOrgDirectory(newInd.orgDirectory || []);
-    setPolicies(newInd.policies || []);
-
-    const firstL2 = newInd.traceability[2]?.[0]?.id || newInd.traceability[1][0].id;
-    setSelectedNodeId(firstL2);
-
-    const seeded = eventBus.seedInitialEvents(newInd.name);
-    setEvents(seeded);
-  }, [industriesDict]);
+    hydrateIndustryState(normalizedIndustry, true);
+  }, [industriesDict, hydrateIndustryState]);
 
   // Add custom industry generated by Strategy & Ideation Agent
   const handleAddCustomIndustry = (newIndustry: IndustryDataBundle) => {
+    const normalizedIndustry = normalizeIndustryBundle(newIndustry);
     setIndustriesDict((prev) => ({
       ...prev,
-      [newIndustry.name]: newIndustry
+      [normalizedIndustry.name]: normalizedIndustry
     }));
 
-    setSelectedIndustry(newIndustry.name);
+    setSelectedIndustry(normalizedIndustry.name);
     setActiveStageId(1);
-
-    const map: Record<string, TraceabilityNode> = {};
-    Object.values(newIndustry.traceability).forEach((layerNodes) => {
-      layerNodes.forEach((node) => {
-        map[node.id] = { ...node };
-      });
-    });
-    setNodesMap(map);
-
-    const firstL2 = newIndustry.traceability[2]?.[0]?.id || newIndustry.traceability[1][0].id;
-    setSelectedNodeId(firstL2);
+    hydrateIndustryState(normalizedIndustry, true);
 
     // Switch to lifecycle view to see the generated strategy
     setActiveView('lifecycle');

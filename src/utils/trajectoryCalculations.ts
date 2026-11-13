@@ -18,6 +18,7 @@ export interface SupervisorValidationReport {
   okrId: string;
   okrTitle: string;
   isAdequate: boolean;
+  enforcementBlocked: boolean;
   measurabilityScore: number;
   ambitionScore: number;
   ownershipVerified: boolean;
@@ -27,6 +28,7 @@ export interface SupervisorValidationReport {
   totalCheckpoints: number;
   complianceIssues: string[];
   recommendations: string[];
+  requiredFieldsMissing: string[];
 }
 
 /**
@@ -132,84 +134,176 @@ export function validateOkrStructuralAdequacy(
 ): SupervisorValidationReport {
   const complianceIssues: string[] = [];
   const recommendations: string[] = [];
+  const requiredFieldsMissing: string[] = [];
   let checkpointsPassed = 0;
   const totalCheckpoints = 6;
 
-  // 1. Check ownership in HR Directory
+  const businessProblem = okr.businessProblem ?? {
+    problemDescription: '',
+    impactedStakeholders: [],
+    causalChainToDollarImpact: '',
+    rootCause: '',
+    targetRemediationTiming: '',
+    metrics: []
+  };
+
+  const metricList = Array.isArray(businessProblem.metrics) ? businessProblem.metrics : [];
+  const hasLeadingMetric = metricList.some((metric) => /leading|lead/i.test(metric.metricType || ''));
+  const hasLaggingMetric = metricList.some((metric) => /lagging|lag/i.test(metric.metricType || ''));
+  const hasNumericTarget = metricList.some((metric) => /\d/.test(metric.baselineValue || '') && /\d/.test(metric.targetValue || ''));
+
+  const hasMetadataField = (fieldName: string): boolean => {
+    const name = fieldName.trim();
+    switch (name) {
+      case 'owner':
+        return Boolean(okr.owner && okr.owner.trim());
+      case 'budget':
+        return Boolean(okr.budget && okr.budget !== '$0' && okr.budget.trim() !== '');
+      case 'problemDescription':
+        return Boolean(businessProblem.problemDescription && businessProblem.problemDescription.trim().length >= 15);
+      case 'impactedStakeholders':
+        return Array.isArray(businessProblem.impactedStakeholders) && businessProblem.impactedStakeholders.some((value) => String(value).trim().length > 0);
+      case 'causalChainToDollarImpact':
+        return Boolean(businessProblem.causalChainToDollarImpact && businessProblem.causalChainToDollarImpact.trim().length > 10);
+      case 'rootCause':
+        return Boolean((businessProblem.rootCause && businessProblem.rootCause.trim().length >= 10) ||
+          (Array.isArray(businessProblem.rootCauses) && businessProblem.rootCauses.some((value) => String(value).trim().length >= 10)));
+      case 'targetRemediationTiming':
+        return Boolean((businessProblem.targetRemediationTiming && businessProblem.targetRemediationTiming.trim().length >= 2) ||
+          (Array.isArray(businessProblem.remediationTimings) && businessProblem.remediationTimings.some((value) => String(value).trim().length >= 2)));
+      case 'metrics':
+        return metricList.length > 0 && hasNumericTarget;
+      default:
+        return false;
+    }
+  };
+
   const matchedOwner = orgDirectory.find(
     (member) =>
-      member.name.toLowerCase().includes(okr.owner.toLowerCase()) ||
-      okr.owner.toLowerCase().includes(member.name.toLowerCase()) ||
-      member.role.toLowerCase().includes(okr.owner.toLowerCase())
+      member.name.toLowerCase().includes((okr.owner || '').toLowerCase()) ||
+      (okr.owner || '').toLowerCase().includes(member.name.toLowerCase()) ||
+      member.role.toLowerCase().includes((okr.owner || '').toLowerCase())
   );
   const ownershipVerified = Boolean(matchedOwner);
   if (ownershipVerified) {
     checkpointsPassed++;
   } else {
-    complianceIssues.push(`Owner "${okr.owner}" not verified in individual enterprise HR directory.`);
+    requiredFieldsMissing.push('owner');
+    complianceIssues.push(`Owner "${okr.owner || 'Unassigned'}" not verified in the individual enterprise HR directory.`);
     recommendations.push(`Assign ownership to a verified executive in the HR directory (e.g. ${orgDirectory[0]?.name || 'VP Engineering'}).`);
   }
 
-  // 2. Measurability & Leading/Lagging Indicators
   let measurabilityScore = 65;
-  const hasNumbers = /\d/.test(okr.title);
-  const hasPercentage = /%|\$|ms|hours|days|bps|points|pts/i.test(okr.title);
-  if (hasNumbers && hasPercentage) {
-    measurabilityScore = 88;
+  if (hasLeadingMetric && hasLaggingMetric && hasNumericTarget) {
+    measurabilityScore = 92;
     checkpointsPassed++;
-  } else if (hasNumbers || hasPercentage) {
-    measurabilityScore = 75;
+  } else if (hasNumericTarget || hasLeadingMetric || hasLaggingMetric) {
+    measurabilityScore = 76;
     checkpointsPassed++;
   } else {
-    complianceIssues.push('Key Result statement lacks explicit quantitative units or target baseline.');
-    recommendations.push('Add numerical baseline and measurable target (e.g., "from X to Y").');
+    requiredFieldsMissing.push('metrics');
+    complianceIssues.push('OKR does not include measurable leading/lagging indicators with concrete baseline and target values.');
+    recommendations.push('Add numerical indicators such as churn %, network utilisation, and revenue impact with a current and target value.');
   }
 
-  // 3. Ambition Score
   let ambitionScore = 72;
-  if (okr.title.toLowerCase().includes('double') || okr.title.toLowerCase().includes('cut') || okr.title.toLowerCase().includes('expand') || okr.progress < 70) {
+  const titleText = `${okr.title || ''} ${businessProblem.problemDescription || ''}`.toLowerCase();
+  if (
+    /double|reduce|cut|improve|expand|accelerate|transform|drive|increase/.test(titleText) ||
+    (typeof okr.progress === 'number' && okr.progress < 70)
+  ) {
     ambitionScore = 85;
     checkpointsPassed++;
   } else {
     checkpointsPassed++;
   }
 
-  // 4. Budget & Financial Attribute Presence
-  if (okr.budget && okr.budget !== '$0' && okr.budget !== '') {
+  if (hasMetadataField('budget')) {
     checkpointsPassed++;
   } else {
+    requiredFieldsMissing.push('budget');
     complianceIssues.push('Mandatory capital/opex budget allocation attribute is missing.');
-    recommendations.push('Specify allocated budget in Planview Portfolios.');
+    recommendations.push('Specify allocated budget in the program plan or OKR record.');
   }
 
-  // 5. Causal Chain to $ Impact & Structured Business Problem
-  if (okr.businessProblem && okr.businessProblem.causalChainToDollarImpact.length > 10) {
+  if (hasMetadataField('causalChainToDollarImpact')) {
     checkpointsPassed++;
   } else {
+    requiredFieldsMissing.push('causalChainToDollarImpact');
     complianceIssues.push('Missing structured business problem causal chain to dollar revenue/cost impact.');
-    recommendations.push('Define the 6 business problem dimensions including Causal Chain to $ Impact.');
+    recommendations.push('Define the causal chain to dollar impact with a convincing business outcome narrative.');
   }
 
-  // 6. Review Schedules & Governance Checkpoints
-  const policyEnforced = policies.some((p) => p.status === 'Enforced');
-  if (policyEnforced) {
-    checkpointsPassed++;
+  if (!hasMetadataField('problemDescription')) {
+    requiredFieldsMissing.push('problemDescription');
+    complianceIssues.push('The structured business problem description is incomplete or too vague.');
+    recommendations.push('Describe the strategic issue, intent, and threat to growth in a sentence or two.');
   }
 
-  const isAdequate = checkpointsPassed >= 4 && complianceIssues.length <= 1;
+  if (!hasMetadataField('impactedStakeholders')) {
+    requiredFieldsMissing.push('impactedStakeholders');
+    complianceIssues.push('No impacted stakeholders were defined for the OKR.');
+    recommendations.push('Add the impacted customer, operational, or executive stakeholders from the industry org chart and HR directory.');
+  }
+
+  if (!hasMetadataField('rootCause')) {
+    requiredFieldsMissing.push('rootCause');
+    complianceIssues.push('Root cause is missing or insufficiently described.');
+    recommendations.push('Document the primary underlying issue and the causal dependency chain.');
+  }
+
+  if (!hasMetadataField('targetRemediationTiming')) {
+    requiredFieldsMissing.push('targetRemediationTiming');
+    complianceIssues.push('Target remediation timing is missing.');
+    recommendations.push('Set a target remediation date or milestone sprint.');
+  }
+
+  const enforcedPolicies = policies.filter((policy) => policy.status === 'Enforced');
+  enforcedPolicies.forEach((policy) => {
+    const requiredPolicyFields = Array.isArray(policy.mandatoryMetadataFields) ? policy.mandatoryMetadataFields : [];
+    if (requiredPolicyFields.length > 0) {
+      requiredPolicyFields.forEach((fieldName) => {
+        if (!hasMetadataField(fieldName)) {
+          requiredFieldsMissing.push(fieldName);
+          complianceIssues.push(`Policy "${policy.ruleName}" requires a valid "${fieldName}" attribute for this OKR.`);
+          recommendations.push(`Populate the "${fieldName}" field to satisfy the ${policy.ruleName} governance rule.`);
+        }
+      });
+    }
+
+    if (Number.isFinite(policy.minMeasurableScore) && measurabilityScore < policy.minMeasurableScore) {
+      complianceIssues.push(`Policy "${policy.ruleName}" requires measurable score >= ${policy.minMeasurableScore}%, but this OKR scored ${measurabilityScore}%.`);
+      recommendations.push(`Improve the metric quality and numeric targets to meet the ${policy.ruleName} threshold.`);
+    }
+
+    if (Number.isFinite(policy.minAmbitionScore) && ambitionScore < policy.minAmbitionScore) {
+      complianceIssues.push(`Policy "${policy.ruleName}" requires ambition score >= ${policy.minAmbitionScore}%, but this OKR scored ${ambitionScore}%.`);
+      recommendations.push(`Strengthen the stretch and outcome narrative so the ambition threshold is satisfied.`);
+    }
+  });
+
+  if (enforcedPolicies.length > 0) {
+    checkpointsPassed += enforcedPolicies.length;
+  }
+
+  const effectiveCheckpoints = Math.max(0, checkpointsPassed);
+  const isAdequate = effectiveCheckpoints >= 5 && complianceIssues.length <= 2 && measurabilityScore >= 70 && ambitionScore >= 70 && requiredFieldsMissing.length === 0;
+  const enforcementBlocked = !isAdequate;
 
   return {
     okrId: okr.id,
     okrTitle: okr.title,
     isAdequate,
+    enforcementBlocked,
     measurabilityScore,
     ambitionScore,
     ownershipVerified,
     assignedOwnerName: matchedOwner?.name || okr.owner,
     hrVerifiedEmail: matchedOwner?.email,
-    structuralCheckpointsPassed: checkpointsPassed,
+    structuralCheckpointsPassed: effectiveCheckpoints,
     totalCheckpoints,
-    complianceIssues,
-    recommendations
+    complianceIssues: Array.from(new Set(complianceIssues)),
+    recommendations: Array.from(new Set(recommendations)),
+    requiredFieldsMissing: Array.from(new Set(requiredFieldsMissing))
   };
 }

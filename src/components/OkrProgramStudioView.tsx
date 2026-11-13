@@ -4,7 +4,8 @@
  * business problems, program termination & initiation, and catastrophic event simulation.
  */
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import * as d3 from 'd3';
 import {
   Sliders,
   Sparkles,
@@ -13,6 +14,7 @@ import {
   Plus,
   Trash2,
   CheckCircle2,
+  Check,
   Activity,
   Layers,
   Edit3,
@@ -22,7 +24,10 @@ import {
   Save,
   RotateCcw,
   TrendingUp,
-  FileText
+  FileText,
+  MessageSquare,
+  Bot,
+  Send
 } from 'lucide-react';
 import {
   IndustryDataBundle,
@@ -34,7 +39,8 @@ import {
   SignificantDisasterEvent,
   OrgDirectoryMember,
   OkrEnterprisePolicy,
-  BusinessMetricIndicator
+  BusinessMetricIndicator,
+  EventTopic
 } from '../types/orchestration';
 import { eventBus } from '../utils/eventBus';
 import { validateOkrStructuralAdequacy } from '../utils/trajectoryCalculations';
@@ -43,6 +49,7 @@ import {
   parseRawProblemText,
   BusinessProblemTemplate
 } from '../utils/businessProblemLibrary';
+import { BusinessProblemManager } from './BusinessProblemManager';
 
 interface OkrProgramStudioViewProps {
   industry: IndustryDataBundle;
@@ -55,6 +62,55 @@ interface OkrProgramStudioViewProps {
   orgDirectory: OrgDirectoryMember[];
   policies: OkrEnterprisePolicy[];
   onNavigateToTrajectory?: () => void;
+}
+
+type ConversationIntent = 'create_okr' | 'update_business_problem' | 'run_orchestration' | 'clarify' | 'unknown';
+
+interface ConversationalMetricDraft {
+  indicator: string;
+  baselineValue: string;
+  targetValue: string;
+  metricType: 'Leading' | 'Lagging';
+}
+
+interface ConversationalOkrDraft {
+  title?: string;
+  parentId?: string;
+  owner?: string;
+  priority?: PriorityLevel;
+  budget?: string;
+  problemDescription?: string;
+  impactedStakeholders?: string[];
+  causalChainToDollarImpact?: string;
+  rootCause?: string;
+  remediationTimings?: string[];
+  metrics?: ConversationalMetricDraft[];
+}
+
+interface ConversationalResponse {
+  assistantMessage: string;
+  intent: ConversationIntent;
+  confidence: number;
+  questions: string[];
+  actionPlan: string[];
+  okrDraft?: ConversationalOkrDraft | null;
+  orchestrationEvents?: Array<{
+    topic: EventTopic;
+    sourceAgent: string;
+    targetAgent: string;
+    summary: string;
+    severity: 'info' | 'success' | 'warning' | 'danger';
+  }>;
+}
+
+interface ConversationTurn {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  intent?: ConversationIntent;
+  confidence?: number;
+  actionPlan?: string[];
+  questions?: string[];
 }
 
 export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
@@ -76,9 +132,26 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const [selectedOkrId, setSelectedOkrId] = useState<string | null>(null);
   const [isEditingProblem, setIsEditingProblem] = useState<boolean>(false);
   const [isAddingNewOkr, setIsAddingNewOkr] = useState<boolean>(false);
+  const [isBusinessProblemManagerOpen, setIsBusinessProblemManagerOpen] = useState<boolean>(false);
+  const [isConversationalAgentOpen, setIsConversationalAgentOpen] = useState<boolean>(false);
   const [isInitiatingProgram, setIsInitiatingProgram] = useState<boolean>(false);
   const [terminatingProgramId, setTerminatingProgramId] = useState<string | null>(null);
-  const [feedbackMessage, setFeedbackMessage] = useState<{ text: string; type: 'success' | 'warning' } | null>(null);
+  const [feedbackMessage, setFeedbackMessage] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
+  const [conversationInput, setConversationInput] = useState('');
+  const [isConversationLoading, setIsConversationLoading] = useState(false);
+  const [isReconnectingConversationalBackend, setIsReconnectingConversationalBackend] = useState(false);
+  const [isConversationalBackendOffline, setIsConversationalBackendOffline] = useState(false);
+  const [preferredConversationalOrigin, setPreferredConversationalOrigin] = useState<string | null>(null);
+  const [isDraftPendingReview, setIsDraftPendingReview] = useState(false);
+  const [conversationDraft, setConversationDraft] = useState<ConversationalOkrDraft | null>(null);
+  const [conversationTurns, setConversationTurns] = useState<ConversationTurn[]>([
+    {
+      id: 'assistant-welcome',
+      role: 'assistant',
+      text: 'Hi, I am the OKR Conversational Agent. Describe the business outcome you want, and I will draft an OKR with structured business-problem attributes.'
+    }
+  ]);
+  const dependencyGraphRef = useRef<SVGSVGElement | null>(null);
 
   // Filter OKR level nodes (Layer 3)
   const okrNodes = useMemo(() => {
@@ -89,6 +162,121 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     if (!selectedOkrId) return okrNodes[0] || null;
     return nodesMap[selectedOkrId] || okrNodes[0] || null;
   }, [selectedOkrId, nodesMap, okrNodes]);
+
+  const dependencyGraphData = useMemo(() => {
+    if (!activeOkr) return { nodes: [] as Array<{ id: string; label: string; status: string; x?: number; y?: number; fx?: number; fy?: number }>, links: [] as Array<{ source: string; target: string }> };
+
+    const relatedIds = new Set<string>([activeOkr.id]);
+    [...activeOkr.parentIds, ...activeOkr.childIds].forEach((id) => {
+      if (id) relatedIds.add(id);
+    });
+
+    const upstream = Array.from(relatedIds).flatMap((id) => {
+      const node = nodesMap[id];
+      return node ? [...(node.parentIds || []), ...(node.childIds || [])] : [];
+    });
+
+    upstream.forEach((id) => {
+      if (id) relatedIds.add(id);
+    });
+
+    const nodes = Array.from(relatedIds).map((id) => {
+      const node = nodesMap[id];
+      return {
+        id,
+        label: node?.title || id,
+        status: node?.status || 'On Track'
+      };
+    });
+
+    const links = nodes.flatMap((node) => {
+      const currentNode = nodesMap[node.id];
+      if (!currentNode) return [];
+      return currentNode.parentIds
+        .filter((parentId) => relatedIds.has(parentId))
+        .map((parentId) => ({ source: parentId, target: node.id }));
+    });
+
+    return { nodes, links };
+  }, [activeOkr, nodesMap]);
+
+  useEffect(() => {
+    if (!dependencyGraphRef.current || dependencyGraphData.nodes.length === 0) return;
+
+    const width = 620;
+    const height = 320;
+    const svg = d3.select(dependencyGraphRef.current);
+    svg.selectAll('*').remove();
+
+    const graphLinks = dependencyGraphData.links.map((link) => ({ ...link }));
+    const graphNodes = dependencyGraphData.nodes.map((node) => ({ ...node }));
+
+    const linkSelection = svg
+      .append('g')
+      .selectAll('line')
+      .data(graphLinks)
+      .join('line')
+      .attr('stroke', '#a5b4fc')
+      .attr('stroke-width', 1.5)
+      .attr('opacity', 0.8);
+
+    const nodeSelection = svg
+      .append('g')
+      .selectAll('circle')
+      .data(graphNodes)
+      .join('circle')
+      .attr('r', (d) => (d.id === activeOkr?.id ? 14 : 11))
+      .attr('fill', (d) => {
+        const node = nodesMap[d.id];
+        if (d.id === activeOkr?.id) return '#4f46e5';
+        if (node?.status === 'At Risk') return '#f59e0b';
+        if (node?.status === 'Behind') return '#ef4444';
+        return '#22c55e';
+      })
+      .attr('stroke', '#ffffff')
+      .attr('stroke-width', 2)
+      .style('cursor', 'pointer')
+      .on('click', (_, d) => {
+        setSelectedOkrId(d.id);
+      });
+
+    const labelSelection = svg
+      .append('g')
+      .selectAll('text')
+      .data(graphNodes)
+      .join('text')
+      .attr('text-anchor', 'middle')
+      .attr('dy', -18)
+      .attr('font-size', 9)
+      .attr('fill', '#1e293b')
+      .text((d) => d.label.slice(0, 18));
+
+    const simulation = d3
+      .forceSimulation(graphNodes as any)
+      .force('link', d3.forceLink(graphLinks as any).id((d: any) => d.id).distance(90))
+      .force('charge', d3.forceManyBody().strength(-260))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collision', d3.forceCollide().radius((d: any) => (d.id === activeOkr?.id ? 22 : 18)))
+      .on('tick', () => {
+        linkSelection
+          .attr('x1', (d: any) => d.source.x)
+          .attr('y1', (d: any) => d.source.y)
+          .attr('x2', (d: any) => d.target.x)
+          .attr('y2', (d: any) => d.target.y);
+
+        nodeSelection
+          .attr('cx', (d: any) => d.x)
+          .attr('cy', (d: any) => d.y);
+
+        labelSelection
+          .attr('x', (d: any) => d.x)
+          .attr('y', (d: any) => d.y);
+      });
+
+    return () => {
+      simulation.stop();
+    };
+  }, [activeOkr, dependencyGraphData, nodesMap]);
 
   // Available business problems in this industry (curated + runtime)
   const availableProblems = useMemo(() => {
@@ -199,6 +387,10 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       businessProblem: updatedProblem
     };
 
+    if (!enforceSupervisorPolicy(updatedNode)) {
+      return;
+    }
+
     onUpdateNodesMap((prev) => ({
       ...prev,
       [activeOkr.id]: updatedNode
@@ -227,6 +419,104 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setTimeout(() => setFeedbackMessage(null), 4000);
   };
 
+  const enforceSupervisorPolicy = (candidate: TraceabilityNode) => {
+    const audit = validateOkrStructuralAdequacy(candidate, policies, orgDirectory);
+    if (audit.enforcementBlocked) {
+      const issueSummary = audit.complianceIssues.length > 0
+        ? audit.complianceIssues.join('; ')
+        : 'Missing required enterprise control fields';
+
+      setFeedbackMessage({
+        text: `Supervisor Agent blocked the save for "${candidate.title}". Policy gaps: ${issueSummary}`,
+        type: 'error'
+      });
+      setTimeout(() => setFeedbackMessage(null), 6000);
+
+      eventBus.publish({
+        topic: 'GOVERNANCE_POLICY_VALIDATED',
+        sourceAgent: 'Supervisor Agent',
+        targetAgent: 'Human Executive (HITL)',
+        summary: `Policy enforcement blocked OKR save: "${candidate.title}"`,
+        payload: {
+          okrId: candidate.id,
+          title: candidate.title,
+          isAdequate: false,
+          complianceIssues: audit.complianceIssues,
+          requiredFieldsMissing: audit.requiredFieldsMissing,
+          measurabilityScore: audit.measurabilityScore,
+          ambitionScore: audit.ambitionScore
+        },
+        latencyMs: 16,
+        severity: 'warning'
+      });
+
+      return false;
+    }
+
+    return true;
+  };
+
+  const handleBusinessProblemSave = (problem: StructuredBusinessProblem) => {
+    if (!activeOkr) return;
+
+    const normalized = {
+      ...problem,
+      impactedStakeholders: Array.isArray(problem.impactedStakeholders)
+        ? Array.from(new Set(problem.impactedStakeholders.map((value) => String(value).trim()).filter(Boolean)))
+        : [],
+      rootCauses: Array.isArray(problem.rootCauses)
+        ? Array.from(new Set(problem.rootCauses.map((value) => String(value).trim()).filter(Boolean)))
+        : problem.rootCause
+          ? [String(problem.rootCause).trim()]
+          : [],
+      remediationTimings: Array.isArray(problem.remediationTimings)
+        ? Array.from(new Set(problem.remediationTimings.map((value) => String(value).trim()).filter(Boolean)))
+        : problem.targetRemediationTiming
+          ? [String(problem.targetRemediationTiming).trim()]
+          : [],
+      rootCause: problem.rootCause?.trim() || (problem.rootCauses?.[0] ?? ''),
+      targetRemediationTiming: problem.targetRemediationTiming?.trim() || (problem.remediationTimings?.[0] ?? ''),
+      metrics: Array.isArray(problem.metrics) ? problem.metrics.filter((metric) => metric && typeof metric.indicator === 'string' && metric.indicator.trim()) : []
+    };
+
+    const updatedNode: TraceabilityNode = {
+      ...activeOkr,
+      targetDate: normalized.targetRemediationTiming || activeOkr.targetDate,
+      businessProblem: normalized
+    };
+
+    if (!enforceSupervisorPolicy(updatedNode)) {
+      return;
+    }
+
+    onUpdateNodesMap((prev) => ({
+      ...prev,
+      [activeOkr.id]: updatedNode
+    }));
+
+    eventBus.publish({
+      topic: 'OKR_CREATED_OR_EDITED',
+      sourceAgent: 'Human Executive (HITL)',
+      targetAgent: 'Supervisor & Advisory Committee',
+      summary: `Business Problem Updated for OKR: "${activeOkr.title}" using BusinessProblemManager`,
+      payload: {
+        nodeId: activeOkr.id,
+        title: activeOkr.title,
+        problemDescription: normalized.problemDescription,
+        impactedStakeholders: normalized.impactedStakeholders,
+        timing: normalized.targetRemediationTiming
+      },
+      latencyMs: 14,
+      severity: 'success'
+    });
+
+    setFeedbackMessage({
+      text: `Business problem for "${activeOkr.title}" was structured and saved from the manager modal.`,
+      type: 'success'
+    });
+    setTimeout(() => setFeedbackMessage(null), 4000);
+  };
+
   // -------------------------------------------------------------
   // NEW OKR FORM STATE (WITH INDUSTRY TEMPLATE SELECTION & AI PARSER)
   // -------------------------------------------------------------
@@ -247,15 +537,82 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const [newOkrCausalChain, setNewOkrCausalChain] = useState('');
   const [newOkrRootCause, setNewOkrRootCause] = useState('');
   const [newOkrRemediationTiming, setNewOkrRemediationTiming] = useState('Q2 2027 Sprint 4');
+  const [newOkrRemediationTimings, setNewOkrRemediationTimings] = useState<string[]>(['Q2 2027 Sprint 4']);
+  const [newOkrTimingDraft, setNewOkrTimingDraft] = useState('');
   const [newOkrMetrics, setNewOkrMetrics] = useState<BusinessMetricIndicator[]>([
     { indicator: 'Operational Throughput', baselineValue: '65%', targetValue: '> 88%', metricType: 'Leading' },
     { indicator: 'Financial Degradation Impact', baselineValue: '$5.5M', targetValue: '$0', metricType: 'Lagging' }
+  ]);
+
+  const normalizedMetricCount = useMemo(() => {
+    return newOkrMetrics.filter((metric) => String(metric.indicator || '').trim()).length;
+  }, [newOkrMetrics]);
+
+  const addOkrSectionCompletion = useMemo(() => {
+    const getStatus = (filled: number, total: number): 'empty' | 'review' | 'complete' => {
+      if (filled <= 0) return 'empty';
+      if (filled >= total) return 'complete';
+      return 'review';
+    };
+
+    const basicsFilled = [
+      newOkrTitle.trim(),
+      newOkrOwner.trim(),
+      newOkrParentId.trim(),
+      newOkrBudget.trim(),
+      newOkrPriority
+    ].filter(Boolean).length;
+    const basicsStatus = getStatus(basicsFilled, 5);
+
+    const problemSourceFilled = newOkrMode === 'manual'
+      ? 1
+      : newOkrMode === 'template'
+        ? (selectedTemplateId ? 1 : 0)
+        : (rawProblemTextInput.trim() ? 1 : 0);
+    const problemSourceStatus = getStatus(problemSourceFilled, 1);
+
+    const attributesFilled = [
+      newOkrProblemDesc.trim(),
+      newOkrStakeholders.trim(),
+      newOkrCausalChain.trim(),
+      newOkrRootCause.trim(),
+      newOkrRemediationTimings.length > 0 ? 'timings' : ''
+    ].filter(Boolean).length;
+    const attributesStatus = getStatus(attributesFilled, 5);
+
+    const metricsStatus = getStatus(normalizedMetricCount > 0 ? 1 : 0, 1);
+
+    const completedSections = [basicsStatus, problemSourceStatus, attributesStatus, metricsStatus]
+      .filter((status) => status === 'complete').length;
+    return {
+      basics: basicsStatus,
+      problemSource: problemSourceStatus,
+      attributes: attributesStatus,
+      metrics: metricsStatus,
+      completedSections,
+      totalSections: 4
+    };
+  }, [
+    newOkrTitle,
+    newOkrOwner,
+    newOkrParentId,
+    newOkrMode,
+    selectedTemplateId,
+    rawProblemTextInput,
+    newOkrProblemDesc,
+    newOkrStakeholders,
+    newOkrCausalChain,
+    newOkrRootCause,
+    newOkrRemediationTimings,
+    normalizedMetricCount
   ]);
 
   // Open "Add OKR" modal and initialize defaults
   const handleOpenAddOkrModal = () => {
     setIsAddingNewOkr(true);
     setNewOkrMode('template');
+    setIsDraftPendingReview(false);
+    setNewOkrTimingDraft('');
     if (availableProblems.length > 0 && availableProblems[0]) {
       handleSelectIndustryProblem(availableProblems[0].id);
     }
@@ -271,8 +628,17 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setNewOkrStakeholders(tmpl.problem.impactedStakeholders.join(', '));
     setNewOkrCausalChain(tmpl.problem.causalChainToDollarImpact);
     setNewOkrRootCause(tmpl.problem.rootCause);
-    setNewOkrRemediationTiming(tmpl.problem.targetRemediationTiming);
-    setNewOkrTargetDate(tmpl.problem.targetRemediationTiming);
+    const nextTimings = Array.from(new Set(
+      ((tmpl.problem.remediationTimings && tmpl.problem.remediationTimings.length > 0)
+        ? tmpl.problem.remediationTimings
+        : [tmpl.problem.targetRemediationTiming]
+      ).map((value) => String(value || '').trim()).filter(Boolean)
+    ));
+    const primaryTiming = nextTimings[0] || tmpl.problem.targetRemediationTiming || 'Q2 2027 Sprint 4';
+    setNewOkrRemediationTimings(nextTimings.length > 0 ? nextTimings : [primaryTiming]);
+    setNewOkrRemediationTiming(primaryTiming);
+    setNewOkrTargetDate(primaryTiming);
+    setNewOkrTimingDraft('');
     setNewOkrMetrics(JSON.parse(JSON.stringify(tmpl.problem.metrics)));
 
     if (!newOkrTitle.trim() || newOkrTitle.startsWith('Resolve') || newOkrTitle.startsWith('Remediate')) {
@@ -289,8 +655,11 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setNewOkrStakeholders(parsed.impactedStakeholders.join(', '));
     setNewOkrCausalChain(parsed.causalChainToDollarImpact);
     setNewOkrRootCause(parsed.rootCause);
-    setNewOkrRemediationTiming(parsed.targetRemediationTiming);
-    setNewOkrTargetDate(parsed.targetRemediationTiming);
+    const primaryTiming = parsed.targetRemediationTiming || 'Q2 2027 Sprint 4';
+    setNewOkrRemediationTimings([primaryTiming]);
+    setNewOkrRemediationTiming(primaryTiming);
+    setNewOkrTargetDate(primaryTiming);
+    setNewOkrTimingDraft('');
     setNewOkrMetrics(parsed.metrics);
 
     if (!newOkrTitle.trim() || newOkrTitle.startsWith('Resolve') || newOkrTitle.startsWith('Remediate')) {
@@ -320,6 +689,334 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setNewOkrMetrics((prev) =>
       prev.map((m, i) => (i === index ? { ...m, [field]: value } : m))
     );
+  };
+
+  const applyConversationalDraftToForm = useCallback((draft: ConversationalOkrDraft) => {
+    if (draft.title) setNewOkrTitle(draft.title);
+    if (draft.parentId) setNewOkrParentId(draft.parentId);
+    if (draft.owner) setNewOkrOwner(draft.owner);
+    if (draft.priority) setNewOkrPriority(draft.priority);
+    if (draft.budget) setNewOkrBudget(draft.budget);
+    if (draft.problemDescription) setNewOkrProblemDesc(draft.problemDescription);
+    if (Array.isArray(draft.impactedStakeholders) && draft.impactedStakeholders.length > 0) {
+      setNewOkrStakeholders(draft.impactedStakeholders.join(', '));
+    }
+    if (draft.causalChainToDollarImpact) setNewOkrCausalChain(draft.causalChainToDollarImpact);
+    if (draft.rootCause) setNewOkrRootCause(draft.rootCause);
+
+    if (Array.isArray(draft.remediationTimings) && draft.remediationTimings.length > 0) {
+      const timings = draft.remediationTimings.map((value) => String(value).trim()).filter(Boolean);
+      if (timings.length > 0) {
+        setNewOkrRemediationTimings(timings);
+        setNewOkrRemediationTiming(timings[0]);
+        setNewOkrTargetDate(timings[0]);
+      }
+    }
+
+    if (Array.isArray(draft.metrics) && draft.metrics.length > 0) {
+      const cleaned = draft.metrics
+        .map((metric) => ({
+          indicator: String(metric.indicator || '').trim(),
+          baselineValue: String(metric.baselineValue || '').trim(),
+          targetValue: String(metric.targetValue || '').trim(),
+          metricType: metric.metricType === 'Lagging' ? 'Lagging' : 'Leading'
+        }))
+        .filter((metric) => metric.indicator);
+      if (cleaned.length > 0) {
+        setNewOkrMetrics(cleaned);
+      }
+    }
+
+    setIsAddingNewOkr(true);
+    setIsDraftPendingReview(true);
+    setFeedbackMessage({
+      text: 'Conversational draft applied. Review the populated Add OKR form before publishing.',
+      type: 'success'
+    });
+    setTimeout(() => setFeedbackMessage(null), 3500);
+  }, []);
+
+  const runConversationalOrchestration = useCallback((response: ConversationalResponse) => {
+    if (!Array.isArray(response.orchestrationEvents) || response.orchestrationEvents.length === 0) return;
+    response.orchestrationEvents.slice(0, 4).forEach((entry, idx) => {
+      eventBus.publish({
+        topic: entry.topic,
+        sourceAgent: entry.sourceAgent || 'Conversational Agent',
+        targetAgent: entry.targetAgent || 'Supervisor Agent',
+        summary: entry.summary || `Conversational orchestration action ${idx + 1}`,
+        payload: {
+          origin: 'conversational-agent',
+          confidence: response.confidence,
+          intent: response.intent
+        },
+        latencyMs: 20 + idx * 3,
+        severity: entry.severity || 'info'
+      });
+    });
+  }, []);
+
+  const getConversationalCandidateOrigins = useCallback(() => {
+    const currentOrigin = window.location.origin;
+    const currentUrl = new URL(currentOrigin);
+    const nextOrigins: string[] = [];
+
+    if (preferredConversationalOrigin) nextOrigins.push(preferredConversationalOrigin);
+    nextOrigins.push(currentOrigin);
+    if (currentUrl.port === '3000') nextOrigins.push(`${currentUrl.protocol}//${currentUrl.hostname}:3001`);
+    if (currentUrl.port === '3001') nextOrigins.push(`${currentUrl.protocol}//${currentUrl.hostname}:3000`);
+
+    return Array.from(new Set(nextOrigins));
+  }, [preferredConversationalOrigin]);
+
+  const reconnectConversationalBackend = useCallback(async () => {
+    if (isReconnectingConversationalBackend) return;
+    setIsReconnectingConversationalBackend(true);
+    try {
+      const candidateOrigins = getConversationalCandidateOrigins();
+      for (const origin of candidateOrigins) {
+        try {
+          const probe = await fetch(`${origin}/api/health`, { method: 'GET' });
+          if (probe.ok) {
+            setPreferredConversationalOrigin(origin);
+            setIsConversationalBackendOffline(false);
+            setFeedbackMessage({
+              text: `Conversational backend reconnected at ${origin}.`,
+              type: 'success'
+            });
+            setTimeout(() => setFeedbackMessage(null), 2500);
+            return;
+          }
+        } catch {
+          // Continue trying other candidate origins.
+        }
+      }
+
+      setIsConversationalBackendOffline(true);
+      setFeedbackMessage({
+        text: 'Backend still offline. Keep using local conversational fallback or restart the server.',
+        type: 'warning'
+      });
+      setTimeout(() => setFeedbackMessage(null), 3000);
+    } finally {
+      setIsReconnectingConversationalBackend(false);
+    }
+  }, [getConversationalCandidateOrigins, isReconnectingConversationalBackend]);
+
+  const buildLocalConversationalFallback = useCallback((message: string): ConversationalResponse => {
+    const lower = message.toLowerCase();
+    const intent: ConversationIntent =
+      /(create|add|new)\s+(okr|key result)/i.test(message)
+        ? 'create_okr'
+        : /(orchestrate|run agents|trigger agents|advisory|supervisor)/i.test(message)
+          ? 'run_orchestration'
+          : /(business problem|root cause|causal chain|stakeholder)/i.test(message)
+            ? 'update_business_problem'
+            : 'clarify';
+
+    const extractedTiming = message.match(/(Q[1-4]\s*\d{4}(?:\s*Sprint\s*\d+)?)/i)?.[1] || 'Q2 2027 Sprint 4';
+    const extractedBudget = message.match(/(\$[\d.,]+[mMkK]?)/)?.[1] || '$4.5M';
+
+    return {
+      assistantMessage: 'Backend conversational service is unreachable, so I created a local draft from your text. You can still apply and edit it.',
+      intent,
+      confidence: 0.64,
+      questions: [
+        'Who should be the accountable owner?',
+        'Do you want additional remediation timing milestones?',
+        'Which leading and lagging metrics matter most?'
+      ],
+      actionPlan: [
+        'Generate draft from free-text intent',
+        'Apply draft into Add OKR form',
+        'Validate and publish after review'
+      ],
+      okrDraft: {
+        title: intent === 'create_okr' ? `Resolve ${industry.sector} execution bottleneck` : 'Refine business problem structure',
+        parentId: potentialParents[0]?.id || '',
+        owner: orgDirectory[0]?.name || 'Executive Lead',
+        priority: lower.includes('critical') ? 'P0 - Critical' : 'P1 - High',
+        budget: extractedBudget,
+        problemDescription: message,
+        impactedStakeholders: ['Executive Board', 'Operations Team'],
+        causalChainToDollarImpact: 'Operational friction → delayed outcomes → measurable financial impact',
+        rootCause: 'Capacity and process constraints',
+        remediationTimings: [extractedTiming],
+        metrics: [
+          { indicator: 'Cycle Time', baselineValue: '9 days', targetValue: '3 days', metricType: 'Leading' },
+          { indicator: 'Revenue Risk', baselineValue: '$6.0M', targetValue: '$0', metricType: 'Lagging' }
+        ]
+      },
+      orchestrationEvents: intent === 'run_orchestration'
+        ? [
+            {
+              topic: 'ORCHESTRATION_STARTED',
+              sourceAgent: 'Local Conversational Fallback',
+              targetAgent: 'Supervisor Agent',
+              summary: 'Triggered local orchestration plan from conversational fallback',
+              severity: 'info'
+            }
+          ]
+        : []
+    };
+  }, [industry.sector, orgDirectory, potentialParents]);
+
+  const handleConversationalSend = async () => {
+    const trimmed = conversationInput.trim();
+    if (!trimmed || isConversationLoading) return;
+
+    const userTurn: ConversationTurn = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      text: trimmed
+    };
+    const priorTurns = conversationTurns.slice(-8).map((turn) => ({ role: turn.role, text: turn.text }));
+    setConversationTurns((prev) => [...prev, userTurn]);
+    setConversationInput('');
+    setIsConversationLoading(true);
+
+    try {
+      const requestPayload = {
+        message: trimmed,
+        history: priorTurns,
+        context: {
+          industryName: industry.name,
+          sector: industry.sector,
+          quarter: industry.quarter,
+          owners: orgDirectory.map((member) => member.name).filter(Boolean).slice(0, 20),
+          parentOptions: potentialParents.slice(0, 20).map((parent) => ({ id: parent.id, title: parent.title })),
+          existingOkrTitles: okrNodes.slice(0, 20).map((node) => node.title),
+          priorityOptions: ['P0 - Critical', 'P1 - High', 'P2 - Medium', 'AI_RECOMMENDED']
+        }
+      };
+
+      const candidateOrigins = getConversationalCandidateOrigins();
+
+      let response: Response | null = null;
+      let responseOrigin: string | null = null;
+      let lastErrorStatus: number | null = null;
+      let networkFailure = false;
+
+      for (const origin of candidateOrigins) {
+        const endpoint = `${origin}/api/okr-conversational-agent`;
+        let attempt: Response;
+        try {
+          attempt = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestPayload)
+          });
+        } catch (requestError) {
+          networkFailure = true;
+          void requestError;
+          continue;
+        }
+
+        if (attempt.ok) {
+          response = attempt;
+          responseOrigin = origin;
+          break;
+        }
+
+        lastErrorStatus = attempt.status;
+        if (attempt.status !== 404) {
+          response = attempt;
+          break;
+        }
+      }
+
+      if (!response && networkFailure) {
+        setIsConversationalBackendOffline(true);
+        const fallbackPayload = buildLocalConversationalFallback(trimmed);
+        const assistantTurn: ConversationTurn = {
+          id: `assistant-local-${Date.now()}`,
+          role: 'assistant',
+          text: fallbackPayload.assistantMessage,
+          intent: fallbackPayload.intent,
+          confidence: fallbackPayload.confidence,
+          actionPlan: fallbackPayload.actionPlan,
+          questions: fallbackPayload.questions
+        };
+        setConversationTurns((prev) => [...prev, assistantTurn]);
+        setConversationDraft(fallbackPayload.okrDraft || null);
+        runConversationalOrchestration(fallbackPayload);
+        setFeedbackMessage({
+          text: 'Conversational backend is offline. Local intent fallback generated a draft.',
+          type: 'warning'
+        });
+        setTimeout(() => setFeedbackMessage(null), 3500);
+        return;
+      }
+
+      if (!response || !response.ok) {
+        setIsConversationalBackendOffline(true);
+        throw new Error(`Conversational endpoint returned ${lastErrorStatus ?? response?.status ?? 'unknown'}`);
+      }
+
+      const payload = (await response.json()) as ConversationalResponse & { success?: boolean };
+      if (responseOrigin) {
+        setPreferredConversationalOrigin(responseOrigin);
+      }
+      setIsConversationalBackendOffline(false);
+      const assistantTurn: ConversationTurn = {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        text: payload.assistantMessage || 'I can help draft your OKR. Please add more detail.',
+        intent: payload.intent,
+        confidence: payload.confidence,
+        actionPlan: payload.actionPlan,
+        questions: payload.questions
+      };
+      setConversationTurns((prev) => [...prev, assistantTurn]);
+      setConversationDraft(payload.okrDraft || null);
+      runConversationalOrchestration(payload);
+    } catch (error) {
+      setIsConversationalBackendOffline(true);
+      const fallbackPayload = buildLocalConversationalFallback(trimmed);
+      setConversationTurns((prev) => [
+        ...prev,
+        {
+          id: `assistant-error-${Date.now()}`,
+          role: 'assistant',
+          text: fallbackPayload.assistantMessage,
+          intent: fallbackPayload.intent,
+          confidence: fallbackPayload.confidence,
+          actionPlan: fallbackPayload.actionPlan,
+          questions: fallbackPayload.questions
+        }
+      ]);
+      setConversationDraft(fallbackPayload.okrDraft || null);
+      runConversationalOrchestration(fallbackPayload);
+      setFeedbackMessage({
+        text: 'Backend request failed. Local conversational fallback is active.',
+        type: 'warning'
+      });
+      setTimeout(() => setFeedbackMessage(null), 3500);
+      void error;
+    } finally {
+      setIsConversationLoading(false);
+    }
+  };
+
+  const handleAddNewOkrTiming = () => {
+    const value = newOkrTimingDraft.trim();
+    if (!value) return;
+    setNewOkrRemediationTimings((prev) => {
+      const next = Array.from(new Set([...prev, value]));
+      setNewOkrRemediationTiming(next[0] || value);
+      setNewOkrTargetDate(next[0] || value);
+      return next;
+    });
+    setNewOkrTimingDraft('');
+  };
+
+  const handleRemoveNewOkrTiming = (value: string) => {
+    setNewOkrRemediationTimings((prev) => {
+      const next = prev.filter((entry) => entry !== value);
+      const fallback = next[0] || '';
+      setNewOkrRemediationTiming(fallback);
+      setNewOkrTargetDate(fallback || newOkrTargetDate);
+      return next;
+    });
   };
 
   // Terminate Program Form state
@@ -374,7 +1071,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     });
 
     setFeedbackMessage({
-      text: `Human-in-the-Loop priority set to ${priority} for "${target.title}". Advisory agent recomputed future trajectory!`,
+      text: `Priority set to ${priority} for "${target.title}". Advisory agent recomputed future trajectory!`,
       type: 'success'
     });
     setTimeout(() => setFeedbackMessage(null), 4000);
@@ -391,12 +1088,22 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
 
+    const normalizedRemediationTimings = Array.from(
+      new Set(
+        (newOkrRemediationTimings.length > 0 ? newOkrRemediationTimings : [newOkrRemediationTiming, newOkrTargetDate])
+          .map((value) => String(value || '').trim())
+          .filter(Boolean)
+      )
+    );
+    const primaryTiming = normalizedRemediationTimings[0] || newOkrRemediationTiming || newOkrTargetDate || 'Q2 2027 Sprint 4';
+
     const structuredProblem: StructuredBusinessProblem = {
       problemDescription: newOkrProblemDesc || `Strategic gap in ${industry.sector} execution identified by executive leadership.`,
       impactedStakeholders: stakeholdersList.length > 0 ? stakeholdersList : ['Executive Board', 'Customer Base', 'Agile Delivery Squads'],
       causalChainToDollarImpact: newOkrCausalChain || 'Execution friction -> 12% schedule slippage -> revenue opportunity loss of $4.5M.',
       rootCause: newOkrRootCause || 'Under-resourced specialized engineering headcount and competing dependencies.',
-      targetRemediationTiming: newOkrRemediationTiming || newOkrTargetDate,
+      targetRemediationTiming: primaryTiming,
+      remediationTimings: normalizedRemediationTimings,
       metrics: newOkrMetrics.length > 0 ? newOkrMetrics : [
         { indicator: 'Operational Efficiency', baselineValue: '65%', targetValue: '> 88%', metricType: 'Leading' },
         { indicator: 'Financial Degradation', baselineValue: '$5.0M', targetValue: '$0', metricType: 'Lagging' }
@@ -414,10 +1121,10 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       budget: newOkrBudget,
       parentIds: [parentId],
       childIds: [],
-      targetDate: newOkrRemediationTiming || newOkrTargetDate,
+      targetDate: primaryTiming,
       manualPriority: {
         priority: newOkrPriority,
-        overrideReason: 'Newly initiated strategic OKR created with human-in-the-loop priority and 6-dimension business problem.',
+        overrideReason: 'Newly initiated strategic OKR created with priority and 6-dimension business problem.',
         overriddenBy: newOkrOwner,
         overrideTimestamp: new Date().toISOString()
       },
@@ -430,6 +1137,10 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         optimise: 'Resource allocation verified across org directory.'
       }
     };
+
+    if (!enforceSupervisorPolicy(newNode)) {
+      return;
+    }
 
     // Update parent node childIds as well
     onUpdateNodesMap((prev) => {
@@ -462,6 +1173,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     });
 
     setIsAddingNewOkr(false);
+    setIsDraftPendingReview(false);
     setSelectedOkrId(newId);
     setFeedbackMessage({
       text: `Successfully created and published new OKR "${newOkrTitle}"! All 6 business problem dimensions structured & validated.`,
@@ -686,13 +1398,22 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                 <h3 className="text-base font-bold text-slate-900">Active Enterprise OKRs</h3>
                 <p className="text-xs text-slate-500">Override AI priority with manual Human-in-the-Loop authority.</p>
               </div>
-              <button
-                onClick={handleOpenAddOkrModal}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-xs cursor-pointer transition-all"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Add OKR</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setIsConversationalAgentOpen(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-violet-200 bg-violet-50 hover:bg-violet-100 text-violet-700 text-xs font-semibold shadow-xs cursor-pointer transition-all"
+                >
+                  <MessageSquare className="w-3.5 h-3.5" />
+                  <span>Conversational Agent</span>
+                </button>
+                <button
+                  onClick={handleOpenAddOkrModal}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-xs cursor-pointer transition-all"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add OKR</span>
+                </button>
+              </div>
             </div>
 
             <div className="space-y-3 max-h-[660px] overflow-y-auto pr-1">
@@ -781,13 +1502,22 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                   </div>
 
                   {!isEditingProblem ? (
-                    <button
-                      onClick={handleStartEditingProblem}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-indigo-200 bg-indigo-50/70 hover:bg-indigo-100/70 text-indigo-700 text-xs font-semibold cursor-pointer transition-all shrink-0 shadow-2xs"
-                    >
-                      <Edit3 className="w-3.5 h-3.5 text-indigo-600" />
-                      <span>Edit Business Problem</span>
-                    </button>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={handleStartEditingProblem}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-indigo-200 bg-indigo-50/70 hover:bg-indigo-100/70 text-indigo-700 text-xs font-semibold cursor-pointer transition-all shadow-2xs"
+                      >
+                        <Edit3 className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>Edit Business Problem</span>
+                      </button>
+                      <button
+                        onClick={() => setIsBusinessProblemManagerOpen(true)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-semibold cursor-pointer transition-all"
+                      >
+                        <Layers className="w-3.5 h-3.5 text-slate-600" />
+                        <span>BusinessProblemManager</span>
+                      </button>
+                    </div>
                   ) : (
                     <div className="flex items-center gap-2 shrink-0">
                       <button
@@ -1370,12 +2100,155 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         </div>
       )}
 
+      {/* MODAL: CONVERSATIONAL OKR AGENT */}
+      {isConversationalAgentOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-2xl max-w-4xl w-full p-5 shadow-2xl border border-slate-200 my-8 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <span className="p-1.5 rounded-lg bg-violet-100 text-violet-700">
+                  <Bot className="w-4 h-4" />
+                </span>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">Conversational OKR Agent</h3>
+                  <p className="text-xs text-slate-500">
+                    Describe goals in free text. Agent interprets intent, drafts OKRs, and suggests orchestration actions.
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={reconnectConversationalBackend}
+                  disabled={isReconnectingConversationalBackend}
+                  className={`px-2 py-0.5 rounded-full border text-[10px] font-bold transition-all ${
+                    isConversationalBackendOffline
+                      ? 'bg-amber-100 text-amber-800 border-amber-300 hover:bg-amber-200'
+                      : 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200'
+                  } ${isReconnectingConversationalBackend ? 'opacity-70 cursor-not-allowed' : ''}`}
+                  title={isConversationalBackendOffline ? 'Backend offline. Click to reconnect.' : 'Backend online. Click to re-check connection.'}
+                >
+                  {isReconnectingConversationalBackend
+                    ? 'Checking...'
+                    : isConversationalBackendOffline
+                      ? 'Backend offline'
+                      : 'Backend online'}
+                </button>
+                <button onClick={() => setIsConversationalAgentOpen(false)} className="text-slate-400 hover:text-slate-600 cursor-pointer">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
+              <p className="text-[11px] font-semibold text-slate-700">Try prompts:</p>
+              <div className="flex flex-wrap gap-2">
+                {[
+                  'Create a P1 OKR to reduce onboarding time from 9 days to 3 days by Q2 2027.',
+                  'Draft a business problem for rising churn caused by 5G streaming issues.',
+                  'Suggest orchestration actions for a critical reliability incident.'
+                ].map((prompt) => (
+                  <button
+                    key={prompt}
+                    type="button"
+                    onClick={() => setConversationInput(prompt)}
+                    className="px-2.5 py-1 rounded-full border border-slate-300 bg-white text-[11px] text-slate-700 hover:bg-slate-100"
+                  >
+                    {prompt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-white p-3 h-[340px] overflow-y-auto space-y-3">
+              {conversationTurns.map((turn) => (
+                <div key={turn.id} className={`flex ${turn.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] rounded-xl px-3 py-2 text-xs ${
+                    turn.role === 'user'
+                      ? 'bg-indigo-600 text-white'
+                      : 'bg-slate-100 text-slate-800 border border-slate-200'
+                  }`}>
+                    <p className="whitespace-pre-wrap">{turn.text}</p>
+                    {turn.role === 'assistant' && (turn.intent || turn.actionPlan?.length || turn.questions?.length) && (
+                      <div className="mt-2 space-y-1.5 text-[10px]">
+                        {turn.intent && (
+                          <p>
+                            <span className="font-bold">Intent:</span> {turn.intent}
+                            {typeof turn.confidence === 'number' && (
+                              <span className="ml-1">({Math.round(turn.confidence * 100)}%)</span>
+                            )}
+                          </p>
+                        )}
+                        {Array.isArray(turn.actionPlan) && turn.actionPlan.length > 0 && (
+                          <div>
+                            <p className="font-bold mb-0.5">Action Plan</p>
+                            <ul className="list-disc pl-4 space-y-0.5">
+                              {turn.actionPlan.slice(0, 3).map((item) => <li key={item}>{item}</li>)}
+                            </ul>
+                          </div>
+                        )}
+                        {Array.isArray(turn.questions) && turn.questions.length > 0 && (
+                          <div>
+                            <p className="font-bold mb-0.5">Need Clarification</p>
+                            <ul className="list-disc pl-4 space-y-0.5">
+                              {turn.questions.slice(0, 3).map((item) => <li key={item}>{item}</li>)}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {isConversationLoading && (
+                <div className="text-xs text-slate-500">Agent is thinking...</div>
+              )}
+            </div>
+
+            {conversationDraft && (
+              <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <div>
+                  <p className="text-xs font-bold text-emerald-800">Draft OKR detected</p>
+                  <p className="text-[11px] text-emerald-900">Apply extracted draft to Add OKR form for final validation and publish.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => applyConversationalDraftToForm(conversationDraft)}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                >
+                  Apply Draft to Form
+                </button>
+              </div>
+            )}
+
+            <div className="flex items-end gap-2">
+              <textarea
+                rows={2}
+                value={conversationInput}
+                onChange={(e) => setConversationInput(e.target.value)}
+                placeholder="Tell the agent what outcome you want, constraints, owner, and target timeline..."
+                className="flex-1 px-3 py-2 border border-slate-300 rounded-xl text-xs text-slate-800"
+              />
+              <button
+                type="button"
+                onClick={handleConversationalSend}
+                disabled={isConversationLoading || !conversationInput.trim()}
+                className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-semibold flex items-center gap-1"
+              >
+                <Send className="w-3.5 h-3.5" />
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ------------------------------------------------------------- */}
       {/* MODAL: ADD NEW OKR (ENHANCED WITH 6 ATTRIBUTES & INDUSTRY DB) */}
       {/* ------------------------------------------------------------- */}
       {isAddingNewOkr && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
-          <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4 border border-slate-200 my-8">
+          <div className="bg-white rounded-2xl max-w-6xl w-full p-6 shadow-2xl space-y-4 border border-slate-200 my-8">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <div className="flex items-center gap-2">
                 <span className="p-1.5 rounded-lg bg-indigo-100 text-indigo-700">
@@ -1388,323 +2261,485 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                   </p>
                 </div>
               </div>
-              <button onClick={() => setIsAddingNewOkr(false)} className="text-slate-400 hover:text-slate-600 cursor-pointer">
+              <button onClick={() => { setIsAddingNewOkr(false); setIsDraftPendingReview(false); }} className="text-slate-400 hover:text-slate-600 cursor-pointer">
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* Business Problem Setup Mode Selector */}
-            <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2.5">
-              <span className="text-xs font-bold text-slate-700 block">
-                How would you like to define the 6-dimension Business Problem?
-              </span>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs font-semibold">
-                <button
-                  type="button"
-                  onClick={() => setNewOkrMode('template')}
-                  className={`p-2 rounded-lg border flex items-center gap-2 justify-center cursor-pointer transition-all ${
-                    newOkrMode === 'template'
-                      ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
-                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
-                  }`}
-                >
-                  <BookOpen className="w-3.5 h-3.5" />
-                  <span>Select Industry Problem</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setNewOkrMode('parse')}
-                  className={`p-2 rounded-lg border flex items-center gap-2 justify-center cursor-pointer transition-all ${
-                    newOkrMode === 'parse'
-                      ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
-                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
-                  }`}
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>AI Smart Text Parser</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setNewOkrMode('manual')}
-                  className={`p-2 rounded-lg border flex items-center gap-2 justify-center cursor-pointer transition-all ${
-                    newOkrMode === 'manual'
-                      ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
-                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
-                  }`}
-                >
-                  <Sliders className="w-3.5 h-3.5" />
-                  <span>Manual Entry</span>
-                </button>
-              </div>
-
-              {/* Mode A: Select Existing Problem */}
-              {newOkrMode === 'template' && (
-                <div className="pt-1 space-y-1.5 animate-in fade-in">
-                  <label className="text-[11px] font-bold text-slate-600 block">
-                    Available Business Problems for {industry.name} ({availableProblems.length} available):
-                  </label>
-                  <select
-                    value={selectedTemplateId}
-                    onChange={(e) => handleSelectIndustryProblem(e.target.value)}
-                    className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs font-medium text-slate-800 cursor-pointer focus:ring-2 focus:ring-indigo-500"
-                  >
-                    {availableProblems.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.title}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-
-              {/* Mode B: AI Smart Text Parser */}
-              {newOkrMode === 'parse' && (
-                <div className="pt-1 space-y-2 animate-in fade-in">
-                  <label className="text-[11px] font-bold text-slate-600 block">
-                    Paste raw operational problem, issues report, or strategic friction:
-                  </label>
-                  <textarea
-                    rows={2}
-                    value={rawProblemTextInput}
-                    onChange={(e) => setRawProblemTextInput(e.target.value)}
-                    placeholder="e.g. During peak hours, 5G video buffering triggers 3.5% subscriber churn, costing $12.4M in annual ARPU due to saturated optical links; target fix by Q2 2027."
-                    className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs text-slate-800"
-                  />
-                  <div className="flex justify-end">
-                    <button
-                      type="button"
-                      onClick={handleRunAiSmartParser}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold cursor-pointer shadow-xs"
-                    >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>Parse into 6 Dimensions</span>
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
             {/* OKR Form */}
-            <form onSubmit={handleCreateNewOkr} className="space-y-3.5 text-xs">
-              <div>
-                <label className="font-bold text-slate-700 block mb-1">Key Result Title *</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Expand 5G C-Band Coverage to 88% Population"
-                  value={newOkrTitle}
-                  onChange={(e) => setNewOkrTitle(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">Parent Objective / Theme *</label>
-                  <select
-                    value={newOkrParentId}
-                    onChange={(e) => setNewOkrParentId(e.target.value)}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
-                  >
-                    {potentialParents.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        [{p.id}] {p.title}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">Owner (HR Directory) *</label>
-                  <select
-                    value={newOkrOwner}
-                    onChange={(e) => setNewOkrOwner(e.target.value)}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
-                  >
-                    {orgDirectory.map((m) => (
-                      <option key={m.id} value={m.name}>
-                        {m.name} ({m.title})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">Human-in-the-Loop Priority *</label>
-                  <select
-                    value={newOkrPriority}
-                    onChange={(e) => setNewOkrPriority(e.target.value as PriorityLevel)}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-semibold"
-                  >
-                    <option value="P0 - Critical">P0 - Critical</option>
-                    <option value="P1 - High">P1 - High</option>
-                    <option value="P2 - Medium">P2 - Medium</option>
-                    <option value="AI_RECOMMENDED">AI_RECOMMENDED</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">Allocated Budget *</label>
-                  <input
-                    type="text"
-                    value={newOkrBudget}
-                    onChange={(e) => setNewOkrBudget(e.target.value)}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
-                  />
-                </div>
-
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">Target Remediation Timing *</label>
-                  <input
-                    type="text"
-                    value={newOkrRemediationTiming}
-                    onChange={(e) => {
-                      setNewOkrRemediationTiming(e.target.value);
-                      setNewOkrTargetDate(e.target.value);
-                    }}
-                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-semibold"
-                  />
-                </div>
-              </div>
-
-              {/* 6 Structured Attributes Preview / Edit Container */}
-              <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-3">
-                <span className="text-xs font-bold text-slate-900 uppercase tracking-wider block">
-                  6-Dimension Business Problem Attributes
-                </span>
-
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">1. Problem Description *</label>
-                  <textarea
-                    rows={2}
-                    required
-                    value={newOkrProblemDesc}
-                    onChange={(e) => setNewOkrProblemDesc(e.target.value)}
-                    placeholder="Underlying operational friction and intent..."
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white"
-                  />
-                </div>
-
-                <div>
-                  <label className="font-bold text-slate-700 block mb-1">2. Impacted Stakeholders *</label>
-                  <input
-                    type="text"
-                    required
-                    value={newOkrStakeholders}
-                    onChange={(e) => setNewOkrStakeholders(e.target.value)}
-                    placeholder="e.g. 14.8M Mobile Subscribers, Field Operations, Executive Board"
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white"
-                  />
-                </div>
-
-                <div>
-                  <label className="font-bold text-red-700 block mb-1">3. Causal Chain to $ Impact *</label>
-                  <input
-                    type="text"
-                    required
-                    value={newOkrCausalChain}
-                    onChange={(e) => setNewOkrCausalChain(e.target.value)}
-                    placeholder="e.g. Backhaul congestion -> customer churn -> $14.5M revenue loss"
-                    className="w-full px-3 py-1.5 border border-red-200 bg-red-50/50 rounded-lg text-xs text-red-950 font-medium"
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="font-bold text-slate-700 block mb-1">4. Root Cause *</label>
-                    <input
-                      type="text"
-                      required
-                      value={newOkrRootCause}
-                      onChange={(e) => setNewOkrRootCause(e.target.value)}
-                      placeholder="e.g. Saturated optical transport and permit delays"
-                      className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white"
-                    />
+            <form onSubmit={handleCreateNewOkr} className="text-xs">
+              <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
+                <aside className="xl:col-span-2 rounded-xl border border-slate-200 bg-slate-50 p-3 h-fit">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-2">Form Navigation</p>
+                  <p className="text-[11px] text-slate-600 mb-2">
+                    Completion: <span className="font-bold text-indigo-700">{addOkrSectionCompletion.completedSections}/{addOkrSectionCompletion.totalSections}</span>
+                  </p>
+                  {isDraftPendingReview && (
+                    <div className="mb-2 rounded-lg border border-amber-200 bg-amber-50 p-2">
+                      <p className="text-[10px] font-bold uppercase tracking-wide text-amber-700">Review required</p>
+                      <p className="text-[11px] text-amber-900 mt-0.5">Draft was applied from conversational agent. Review amber sections, then mark reviewed and publish.</p>
+                      <button
+                        type="button"
+                        onClick={() => setIsDraftPendingReview(false)}
+                        className="mt-1.5 px-2 py-1 rounded-md border border-amber-300 bg-white text-[10px] font-bold text-amber-700 hover:bg-amber-100"
+                      >
+                        Mark draft reviewed
+                      </button>
+                    </div>
+                  )}
+                  <nav className="space-y-1.5">
+                    <a href="#okr-basics" className="flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-700 hover:bg-slate-200">
+                      <span>1. OKR Basics</span>
+                      {addOkrSectionCompletion.basics === 'complete' && !isDraftPendingReview ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      ) : addOkrSectionCompletion.basics === 'empty' ? (
+                        <span className="w-2 h-2 rounded-full bg-slate-300" />
+                      ) : (
+                        <span className="w-2 h-2 rounded-full bg-amber-500" />
+                      )}
+                    </a>
+                    <a href="#problem-source" className="flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-700 hover:bg-slate-200">
+                      <span>2. Problem Source</span>
+                      {addOkrSectionCompletion.problemSource === 'complete' && !isDraftPendingReview ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      ) : addOkrSectionCompletion.problemSource === 'empty' ? (
+                        <span className="w-2 h-2 rounded-full bg-slate-300" />
+                      ) : (
+                        <span className="w-2 h-2 rounded-full bg-amber-500" />
+                      )}
+                    </a>
+                    <a href="#structured-attributes" className="flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-700 hover:bg-slate-200">
+                      <span>3. Structured Attributes</span>
+                      {addOkrSectionCompletion.attributes === 'complete' && !isDraftPendingReview ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      ) : addOkrSectionCompletion.attributes === 'empty' ? (
+                        <span className="w-2 h-2 rounded-full bg-slate-300" />
+                      ) : (
+                        <span className="w-2 h-2 rounded-full bg-amber-500" />
+                      )}
+                    </a>
+                    <a href="#metric-definitions" className="flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-700 hover:bg-slate-200">
+                      <span>4. Metric Definitions</span>
+                      {addOkrSectionCompletion.metrics === 'complete' && !isDraftPendingReview ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      ) : addOkrSectionCompletion.metrics === 'empty' ? (
+                        <span className="w-2 h-2 rounded-full bg-slate-300" />
+                      ) : (
+                        <span className="w-2 h-2 rounded-full bg-amber-500" />
+                      )}
+                    </a>
+                  </nav>
+                  <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 p-2">
+                    <p className="text-[10px] font-bold uppercase tracking-wide text-indigo-700">Tip</p>
+                    <p className="text-[11px] text-indigo-800 mt-0.5">
+                      Fill sections top-to-bottom. Use AI parser for fast drafting, then refine causal chain and timings.
+                    </p>
                   </div>
-                  <div>
-                    <label className="font-bold text-slate-700 block mb-1">5. Remediation Timing *</label>
-                    <input
-                      type="text"
-                      required
-                      value={newOkrRemediationTiming}
-                      onChange={(e) => setNewOkrRemediationTiming(e.target.value)}
-                      className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-semibold"
-                    />
-                  </div>
-                </div>
+                </aside>
 
-                {/* Metrics */}
-                <div className="pt-1 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <label className="font-bold text-slate-700 text-xs">6. Measurable Indicators (Metrics) *</label>
-                    <button
-                      type="button"
-                      onClick={handleAddNewOkrMetric}
-                      className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer"
-                    >
-                      + Add Metric
-                    </button>
-                  </div>
+                <div className="xl:col-span-6 space-y-4 max-h-[62vh] overflow-y-auto pr-1">
+                  <section id="okr-basics" className="space-y-3 rounded-xl border border-slate-200 bg-white p-3.5">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700">1. OKR Basics</h4>
+                    <div>
+                      <label className="font-bold text-slate-700 block mb-1">Key Result Title *</label>
+                      <input
+                        type="text"
+                        required
+                        placeholder="e.g. Expand 5G C-Band Coverage to 88% Population"
+                        value={newOkrTitle}
+                        onChange={(e) => setNewOkrTitle(e.target.value)}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
+                      />
+                    </div>
 
-                  {newOkrMetrics.map((m, idx) => (
-                    <div key={idx} className="grid grid-cols-12 gap-2 items-center bg-white p-2 rounded-lg border border-slate-200">
-                      <div className="col-span-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="font-bold text-slate-700 block mb-1">Parent Objective / Theme *</label>
                         <select
-                          value={m.metricType}
-                          onChange={(e) => handleUpdateNewOkrMetric(idx, 'metricType', e.target.value)}
-                          className="w-full px-2 py-1 border border-slate-200 rounded text-[10px] font-bold text-slate-700"
+                          value={newOkrParentId}
+                          onChange={(e) => setNewOkrParentId(e.target.value)}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
                         >
-                          <option value="Leading">Leading</option>
-                          <option value="Lagging">Lagging</option>
+                          {potentialParents.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              [{p.id}] {p.title}
+                            </option>
+                          ))}
                         </select>
                       </div>
-                      <div className="col-span-4">
-                        <input
-                          type="text"
-                          value={m.indicator}
-                          onChange={(e) => handleUpdateNewOkrMetric(idx, 'indicator', e.target.value)}
-                          placeholder="Indicator name"
-                          className="w-full px-2 py-1 border border-slate-200 rounded text-xs"
-                        />
-                      </div>
-                      <div className="col-span-2">
-                        <input
-                          type="text"
-                          value={m.baselineValue}
-                          onChange={(e) => handleUpdateNewOkrMetric(idx, 'baselineValue', e.target.value)}
-                          placeholder="Base"
-                          className="w-full px-2 py-1 border border-slate-200 rounded text-xs"
-                        />
-                      </div>
-                      <div className="col-span-2">
-                        <input
-                          type="text"
-                          value={m.targetValue}
-                          onChange={(e) => handleUpdateNewOkrMetric(idx, 'targetValue', e.target.value)}
-                          placeholder="Target"
-                          className="w-full px-2 py-1 border border-slate-200 rounded text-xs font-bold text-emerald-700"
-                        />
-                      </div>
-                      <div className="col-span-1 flex justify-end">
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveNewOkrMetric(idx)}
-                          className="text-slate-400 hover:text-red-600 cursor-pointer"
+
+                      <div>
+                        <label className="font-bold text-slate-700 block mb-1">Owner (HR Directory) *</label>
+                        <select
+                          value={newOkrOwner}
+                          onChange={(e) => setNewOkrOwner(e.target.value)}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                          {orgDirectory.map((m) => (
+                            <option key={m.id} value={m.name}>
+                              {m.name} ({m.title})
+                            </option>
+                          ))}
+                        </select>
                       </div>
                     </div>
-                  ))}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div>
+                        <label className="font-bold text-slate-700 block mb-1">Priority *</label>
+                        <select
+                          value={newOkrPriority}
+                          onChange={(e) => setNewOkrPriority(e.target.value as PriorityLevel)}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-semibold"
+                        >
+                          <option value="P0 - Critical">P0 - Critical</option>
+                          <option value="P1 - High">P1 - High</option>
+                          <option value="P2 - Medium">P2 - Medium</option>
+                          <option value="AI_RECOMMENDED">AI_RECOMMENDED</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="font-bold text-slate-700 block mb-1">Allocated Budget *</label>
+                        <input
+                          type="text"
+                          value={newOkrBudget}
+                          onChange={(e) => setNewOkrBudget(e.target.value)}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="font-bold text-slate-700 block mb-1">Target Timing Snapshot</label>
+                        <input
+                          type="text"
+                          value={newOkrRemediationTimings[0] || newOkrTargetDate}
+                          readOnly
+                          className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-semibold bg-slate-50 text-slate-600"
+                        />
+                      </div>
+                    </div>
+                  </section>
+
+                  <section id="problem-source" className="space-y-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3.5">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700">2. Business Problem Source</h4>
+                    <span className="text-[11px] text-slate-600 block">
+                      Choose how to populate the 6-dimension business problem model.
+                    </span>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs font-semibold">
+                      <button
+                        type="button"
+                        onClick={() => setNewOkrMode('template')}
+                        className={`p-2 rounded-lg border flex items-center gap-2 justify-center cursor-pointer transition-all ${
+                          newOkrMode === 'template'
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                            : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                        }`}
+                      >
+                        <BookOpen className="w-3.5 h-3.5" />
+                        <span>Select Industry Problem</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setNewOkrMode('parse')}
+                        className={`p-2 rounded-lg border flex items-center gap-2 justify-center cursor-pointer transition-all ${
+                          newOkrMode === 'parse'
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                            : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                        }`}
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>AI Smart Text Parser</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setNewOkrMode('manual')}
+                        className={`p-2 rounded-lg border flex items-center gap-2 justify-center cursor-pointer transition-all ${
+                          newOkrMode === 'manual'
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                            : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                        }`}
+                      >
+                        <Sliders className="w-3.5 h-3.5" />
+                        <span>Manual Entry</span>
+                      </button>
+                    </div>
+
+                    {newOkrMode === 'template' && (
+                      <div className="pt-1 space-y-1.5 animate-in fade-in">
+                        <label className="text-[11px] font-bold text-slate-600 block">
+                          Available Business Problems for {industry.name} ({availableProblems.length} available):
+                        </label>
+                        <select
+                          value={selectedTemplateId}
+                          onChange={(e) => handleSelectIndustryProblem(e.target.value)}
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs font-medium text-slate-800 cursor-pointer focus:ring-2 focus:ring-indigo-500"
+                        >
+                          {availableProblems.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.title}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {newOkrMode === 'parse' && (
+                      <div className="pt-1 space-y-2 animate-in fade-in">
+                        <label className="text-[11px] font-bold text-slate-600 block">
+                          Paste raw operational problem, issues report, or strategic friction:
+                        </label>
+                        <textarea
+                          rows={2}
+                          value={rawProblemTextInput}
+                          onChange={(e) => setRawProblemTextInput(e.target.value)}
+                          placeholder="e.g. During peak hours, 5G video buffering triggers 3.5% subscriber churn..."
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs text-slate-800"
+                        />
+                        <div className="flex justify-end">
+                          <button
+                            type="button"
+                            onClick={handleRunAiSmartParser}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold cursor-pointer shadow-xs"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            <span>Parse into 6 Dimensions</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </section>
+
+                  <section id="structured-attributes" className="space-y-3 rounded-xl border border-slate-200 bg-white p-3.5">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700">3. Structured Attributes Data Entry</h4>
+                    <div>
+                      <label className="font-bold text-slate-700 block mb-1">1. Problem Description *</label>
+                      <textarea
+                        rows={2}
+                        required
+                        value={newOkrProblemDesc}
+                        onChange={(e) => setNewOkrProblemDesc(e.target.value)}
+                        placeholder="Underlying operational friction and intent..."
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="font-bold text-slate-700 block mb-1">2. Impacted Stakeholders *</label>
+                      <input
+                        type="text"
+                        required
+                        value={newOkrStakeholders}
+                        onChange={(e) => setNewOkrStakeholders(e.target.value)}
+                        placeholder="e.g. 14.8M Mobile Subscribers, Field Operations, Executive Board"
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="font-bold text-red-700 block mb-1">3. Causal Chain to $ Impact *</label>
+                      <p className="text-[11px] text-slate-500 mb-1.5">
+                        Use this format: <span className="font-semibold">Root trigger → Operational effect → Financial impact</span>
+                      </p>
+                      <textarea
+                        rows={2}
+                        required
+                        value={newOkrCausalChain}
+                        onChange={(e) => setNewOkrCausalChain(e.target.value)}
+                        placeholder="e.g. Backhaul congestion → increased video buffering → +3.5% churn and $14.5M annual revenue loss"
+                        className="w-full px-3 py-1.5 border border-red-200 bg-red-50/50 rounded-lg text-xs text-red-950 font-medium"
+                      />
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setNewOkrCausalChain('Infrastructure bottleneck → service degradation → revenue leakage and cost-to-serve escalation')}
+                          className="px-2 py-1 rounded-md border border-red-200 bg-white text-[10px] font-semibold text-red-700 hover:bg-red-50"
+                        >
+                          Use quick template
+                        </button>
+                        <span className="text-[10px] text-slate-500 self-center">Keep one clear chain. Avoid multiple unrelated causes here.</span>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="font-bold text-slate-700 block mb-1">4. Root Cause *</label>
+                        <input
+                          type="text"
+                          required
+                          value={newOkrRootCause}
+                          onChange={(e) => setNewOkrRootCause(e.target.value)}
+                          placeholder="e.g. Saturated optical transport and permit delays"
+                          className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="font-bold text-slate-700 block mb-1">5. Remediation Timings *</label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            value={newOkrTimingDraft}
+                            onChange={(e) => setNewOkrTimingDraft(e.target.value)}
+                            placeholder="e.g. Q2 2027 Sprint 4"
+                            className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-semibold"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleAddNewOkrTiming}
+                            className="px-2.5 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-bold hover:bg-indigo-700"
+                          >
+                            Add
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {newOkrRemediationTimings.length > 0 ? newOkrRemediationTimings.map((timing) => (
+                            <span key={timing} className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-slate-100 border border-slate-200 text-[10px] font-semibold text-slate-700">
+                              {timing}
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveNewOkrTiming(timing)}
+                                className="text-slate-500 hover:text-red-600"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </span>
+                          )) : (
+                            <span className="text-[10px] text-slate-500">No timings added yet.</span>
+                          )}
+                        </div>
+                        <p className="text-[10px] text-slate-500">First timing is treated as primary target date.</p>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section id="metric-definitions" className="pt-1 space-y-2 rounded-xl border border-slate-200 bg-white p-3.5">
+                    <div className="flex items-center justify-between">
+                      <label className="font-bold text-slate-700 text-xs">4. Metric Definitions</label>
+                      <button
+                        type="button"
+                        onClick={handleAddNewOkrMetric}
+                        className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer"
+                      >
+                        + Add Metric
+                      </button>
+                    </div>
+
+                    {newOkrMetrics.map((m, idx) => (
+                      <div key={idx} className="grid grid-cols-12 gap-2 items-center bg-white p-2 rounded-lg border border-slate-200">
+                        <div className="col-span-3">
+                          <select
+                            value={m.metricType}
+                            onChange={(e) => handleUpdateNewOkrMetric(idx, 'metricType', e.target.value)}
+                            className="w-full px-2 py-1 border border-slate-200 rounded text-[10px] font-bold text-slate-700"
+                          >
+                            <option value="Leading">Leading</option>
+                            <option value="Lagging">Lagging</option>
+                          </select>
+                        </div>
+                        <div className="col-span-4">
+                          <input
+                            type="text"
+                            value={m.indicator}
+                            onChange={(e) => handleUpdateNewOkrMetric(idx, 'indicator', e.target.value)}
+                            placeholder="Indicator name"
+                            className="w-full px-2 py-1 border border-slate-200 rounded text-xs"
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <input
+                            type="text"
+                            value={m.baselineValue}
+                            onChange={(e) => handleUpdateNewOkrMetric(idx, 'baselineValue', e.target.value)}
+                            placeholder="Base"
+                            className="w-full px-2 py-1 border border-slate-200 rounded text-xs"
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <input
+                            type="text"
+                            value={m.targetValue}
+                            onChange={(e) => handleUpdateNewOkrMetric(idx, 'targetValue', e.target.value)}
+                            placeholder="Target"
+                            className="w-full px-2 py-1 border border-slate-200 rounded text-xs font-bold text-emerald-700"
+                          />
+                        </div>
+                        <div className="col-span-1 flex justify-end">
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveNewOkrMetric(idx)}
+                            className="text-slate-400 hover:text-red-600 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </section>
                 </div>
+
+                <aside className="xl:col-span-4 space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-3.5 h-fit xl:sticky xl:top-4 self-start">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-bold text-slate-900 uppercase tracking-wider">6 Structured Attributes Preview</p>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 border border-indigo-200">
+                      {addOkrSectionCompletion.completedSections}/{addOkrSectionCompletion.totalSections} complete
+                    </span>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-white px-2.5 py-2">
+                    <p className="text-[10px] font-bold uppercase tracking-wide text-slate-500">Selection status</p>
+                    <p className="text-[11px] text-slate-700 mt-0.5">
+                      Active source: <span className="font-semibold text-indigo-700">{newOkrMode === 'template' ? 'Industry Problem' : newOkrMode === 'parse' ? 'AI Smart Text Parser' : 'Manual Entry'}</span>
+                    </p>
+                    <p className="text-[11px] text-slate-600 mt-0.5">
+                      Primary timing: <span className="font-semibold text-slate-800">{newOkrRemediationTimings[0] || newOkrTargetDate || 'Not set'}</span>
+                    </p>
+                  </div>
+                  <div className="space-y-2 text-[11px] text-slate-700">
+                    <div><span className="font-bold text-slate-900">Title:</span> {newOkrTitle || 'Not set'}</div>
+                    <div><span className="font-bold text-slate-900">Owner:</span> {newOkrOwner || 'Not set'}</div>
+                    <div><span className="font-bold text-slate-900">Priority:</span> {newOkrPriority}</div>
+                    <div><span className="font-bold text-slate-900">1. Description:</span> {newOkrProblemDesc || 'Not set'}</div>
+                    <div><span className="font-bold text-slate-900">2. Stakeholders:</span> {newOkrStakeholders || 'Not set'}</div>
+                    <div><span className="font-bold text-slate-900">3. Causal Chain:</span> {newOkrCausalChain || 'Not set'}</div>
+                    <div><span className="font-bold text-slate-900">4. Root Cause:</span> {newOkrRootCause || 'Not set'}</div>
+                    <div>
+                      <span className="font-bold text-slate-900">5. Remediation Timings:</span>
+                      <ul className="mt-1 space-y-1">
+                        {newOkrRemediationTimings.length > 0 ? newOkrRemediationTimings.map((timing) => (
+                          <li key={timing} className="rounded-md border border-slate-200 bg-white px-2 py-0.5">{timing}</li>
+                        )) : (
+                          <li className="text-slate-500">Not set</li>
+                        )}
+                      </ul>
+                    </div>
+                    <div className="pt-2 border-t border-slate-200">
+                      <p className="font-bold text-slate-900 mb-1">6. Metrics</p>
+                      <ul className="space-y-1">
+                        {newOkrMetrics.length > 0 ? newOkrMetrics.map((metric, idx) => (
+                          <li key={`${metric.indicator}-${idx}`} className="rounded-lg border border-slate-200 bg-white px-2 py-1">
+                            <span className="font-semibold">{metric.metricType}</span> • {metric.indicator || 'Unnamed'}: {metric.baselineValue || '-'} → {metric.targetValue || '-'}
+                          </li>
+                        )) : (
+                          <li className="text-slate-500">No metrics added yet.</li>
+                        )}
+                      </ul>
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2">
+                    <p className="text-[10px] font-bold uppercase tracking-wide text-amber-700">Help context</p>
+                    <ul className="mt-1 space-y-0.5 text-[11px] text-amber-900 list-disc pl-4">
+                      <li>Use one causal chain statement with measurable impact.</li>
+                      <li>Add multiple remediation timings for phased delivery plans.</li>
+                      <li>Add at least one leading or lagging metric.</li>
+                    </ul>
+                  </div>
+                </aside>
               </div>
 
-              <div className="pt-3 border-t border-slate-100 flex justify-end gap-2">
+              <div className="pt-3 mt-4 border-t border-slate-100 flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setIsAddingNewOkr(false)}
+                  onClick={() => { setIsAddingNewOkr(false); setIsDraftPendingReview(false); }}
                   className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-50 cursor-pointer font-medium"
                 >
                   Cancel
@@ -1816,6 +2851,15 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* MODAL: BUSINESS PROBLEM MANAGER */}
+      <BusinessProblemManager
+        isOpen={isBusinessProblemManagerOpen}
+        onClose={() => setIsBusinessProblemManagerOpen(false)}
+        problem={activeOkr?.businessProblem || null}
+        orgDirectory={orgDirectory}
+        onSave={handleBusinessProblemSave}
+      />
 
       {/* MODAL: TERMINATE PROGRAM CONFIRMATION */}
       {terminatingProgramId && (
