@@ -1,0 +1,256 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile synchronized from Google Sign-In.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name shown in the header workspace account chip.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified email address of the authenticated user.",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Optional avatar image URL from Google Auth.",
+          "maxLength": 512
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest sign-in."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        }
+      },
+      "required": ["uid", "displayName", "email", "createdAt", "lastLoginAt"]
+    },
+    "UserPreference": {
+      "title": "UserPreference",
+      "description": "User workspace preferences including ordered secondary navigation tabs.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the preference owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "navButtonOrder": {
+          "type": "array",
+          "description": "Ordered sequence of primary and secondary workspace navigation view IDs."
+        },
+        "preferredIndustry": {
+          "type": "string",
+          "description": "Last active industry key selected by the user.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest preference update."
+        }
+      },
+      "required": ["ownerUid", "navButtonOrder", "updatedAt"]
+    },
+    "UserIndustrySnapshot": {
+      "title": "UserIndustrySnapshot",
+      "description": "User-customized 5-pillar knowledge base and OKR studio edits for a specific industry.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the snapshot owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "industryId": {
+          "type": "string",
+          "description": "Identifier of the industry bundle.",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "industryName": {
+          "type": "string",
+          "description": "Human-readable industry name.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "knowledgeBase": {
+          "type": "array",
+          "description": "Native list of up to 5 KnowledgeBasePillar maps updated by RAG ingestion."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the snapshot was last saved."
+        }
+      },
+      "required": ["ownerUid", "industryId", "industryName", "knowledgeBase", "updatedAt"]
+    },
+    "ChatSession": {
+      "title": "ChatSession",
+      "description": "Multi-turn Gemini executive strategy chatbot conversation session.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the session owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Short title summarizing the conversation.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "model": {
+          "type": "string",
+          "description": "Selected Gemini model identifier.",
+          "enum": [
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-3.1-flash-lite"
+          ]
+        },
+        "rolePresetId": {
+          "type": "string",
+          "description": "Active system instruction preset key.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "systemInstruction": {
+          "type": "string",
+          "description": "System instruction guiding Gemini behavior for this session.",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "industryContext": {
+          "type": "string",
+          "description": "Active industry key grounded in this session.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "messageCount": {
+          "type": "integer",
+          "description": "Number of messages recorded in the subcollection."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest message turn."
+        }
+      },
+      "required": [
+        "ownerUid",
+        "title",
+        "model",
+        "rolePresetId",
+        "systemInstruction",
+        "messageCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "Individual turn in a Gemini multi-turn chat session.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the message owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "Parent ChatSession document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "description": "Speaker role in the multi-turn conversation.",
+          "enum": ["user", "model"]
+        },
+        "text": {
+          "type": "string",
+          "description": "Turn message content.",
+          "minLength": 1,
+          "maxLength": 16000
+        },
+        "model": {
+          "type": "string",
+          "description": "Gemini model used for this turn.",
+          "enum": [
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+            "gemini-4-carbon",
+            "gemini-3.1-flash-lite"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Immutable server creation timestamp."
+        }
+      },
+      "required": ["ownerUid", "sessionId", "role", "text", "model", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private authenticated user profile document keyed by Firebase Auth UID."
+    },
+    "/users/{userId}/preferences/{prefId}": {
+      "schema": { "$ref": "#/entities/UserPreference" },
+      "description": "User workspace navigation order and industry preference settings."
+    },
+    "/users/{userId}/industries/{industryId}": {
+      "schema": { "$ref": "#/entities/UserIndustrySnapshot" },
+      "description": "User-updated 5-pillar RAG knowledge base snapshots keyed by industryId."
+    },
+    "/users/{userId}/chats/{chatId}": {
+      "schema": { "$ref": "#/entities/ChatSession" },
+      "description": "Multi-turn Gemini AI Copilot chat sessions belonging to the user."
+    },
+    "/users/{userId}/chats/{chatId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Ordered message turns belonging to a user chat session."
+    }
+  }
+}

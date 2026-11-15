@@ -86,3 +86,20 @@ test('validateOkrStructuralAdequacy blocks invalid OKRs that miss required polic
   assert.ok(report.requiredFieldsMissing.length > 0);
   assert.ok(report.complianceIssues.some((issue) => issue.toLowerCase().includes('owner') || issue.toLowerCase().includes('budget')));
 });
+
+test('validateOkrStructuralAdequacy verifies non-empty owner when orgDirectory is empty and rejects blank owner', () => {
+  const testNode = {
+    ...TELCO_DATA.traceability[3][0],
+    owner: 'Retail Strategy Lead'
+  };
+
+  const reportWithOwner = validateOkrStructuralAdequacy(testNode, TELCO_POLICIES, []);
+  assert.equal(reportWithOwner.ownershipVerified, true);
+  assert.ok(!reportWithOwner.requiredFieldsMissing.includes('owner'));
+
+  const reportMissingOwner = validateOkrStructuralAdequacy({ ...testNode, owner: '   ' }, TELCO_POLICIES, []);
+  assert.equal(reportMissingOwner.ownershipVerified, false);
+  assert.ok(reportMissingOwner.requiredFieldsMissing.includes('owner'));
+  assert.ok(reportMissingOwner.complianceIssues.some((issue) => issue.toLowerCase().includes('missing')));
+});
+

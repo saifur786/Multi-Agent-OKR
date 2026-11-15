@@ -2,12 +2,17 @@ import React, { useMemo, useState } from 'react';
 import { X, Plus, Trash2, Users, AlertTriangle, Clock3, Gauge, Target, Building2 } from 'lucide-react';
 import { OrgDirectoryMember, StructuredBusinessProblem } from '../types/orchestration';
 
+import { BusinessProblemAttributeKey } from '../utils/okrHealthChecker';
+
 interface BusinessProblemManagerProps {
   isOpen: boolean;
   onClose: () => void;
   problem: StructuredBusinessProblem | null;
   orgDirectory: OrgDirectoryMember[];
-  onSave: (nextProblem: StructuredBusinessProblem) => void;
+  onSave: (nextProblem: StructuredBusinessProblem, nextOwner?: string) => boolean | void;
+  initialAttribute?: BusinessProblemAttributeKey;
+  okrOwner?: string;
+  validationError?: string | null;
 }
 
 const ATTRIBUTE_OPTIONS = [
@@ -37,7 +42,10 @@ export const BusinessProblemManager: React.FC<BusinessProblemManagerProps> = ({
   onClose,
   problem,
   orgDirectory,
-  onSave
+  onSave,
+  initialAttribute,
+  okrOwner,
+  validationError
 }) => {
   const normalizeProblemShape = (candidate: Partial<StructuredBusinessProblem> | null | undefined): StructuredBusinessProblem => {
     const safeProblem = { ...defaultProblem(), ...(candidate ?? {}) };
@@ -60,8 +68,9 @@ export const BusinessProblemManager: React.FC<BusinessProblemManagerProps> = ({
 
   const activeProblem = useMemo(() => normalizeProblemShape(problem), [problem]);
 
-  const [selectedAttribute, setSelectedAttribute] = useState<AttributeKey>('Description');
+  const [selectedAttribute, setSelectedAttribute] = useState<AttributeKey>(initialAttribute || 'Description');
   const [draft, setDraft] = useState<StructuredBusinessProblem>(activeProblem);
+  const [selectedOwner, setSelectedOwner] = useState<string>(okrOwner || '');
   const [newStakeholder, setNewStakeholder] = useState('');
   const [newRootCause, setNewRootCause] = useState('');
   const [newTiming, setNewTiming] = useState('');
@@ -74,9 +83,20 @@ export const BusinessProblemManager: React.FC<BusinessProblemManagerProps> = ({
 
   React.useEffect(() => {
     setDraft(normalizeProblemShape(problem));
-  }, [problem, isOpen]);
+    if (isOpen) {
+      setSelectedAttribute(initialAttribute || 'Description');
+      setSelectedOwner(okrOwner || '');
+    }
+  }, [problem, isOpen, initialAttribute, okrOwner]);
 
   if (!isOpen) return null;
+
+  const isOwnerVerified = orgDirectory.length === 0 || orgDirectory.some(
+    (member) =>
+      member.name.toLowerCase().includes(selectedOwner.toLowerCase()) ||
+      selectedOwner.toLowerCase().includes(member.name.toLowerCase()) ||
+      member.role.toLowerCase().includes(selectedOwner.toLowerCase())
+  );
 
   const stakeholderOptions = orgDirectory.map((member) => member.name).filter(Boolean);
 
@@ -403,6 +423,46 @@ export const BusinessProblemManager: React.FC<BusinessProblemManagerProps> = ({
           </div>
 
           <div className="col-span-8 space-y-4">
+            {validationError && (
+              <div className="rounded-xl border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-800 flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <span>{validationError}</span>
+              </div>
+            )}
+
+            {okrOwner !== undefined && orgDirectory.length > 0 && !isOwnerVerified && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900 flex flex-col gap-2">
+                <div>
+                  <span className="font-semibold">HR Owner Verification Required:</span>{' '}
+                  <span>&ldquo;{selectedOwner || 'Unassigned'}&rdquo; is not in the HR directory.</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    aria-label="Assign verified HR owner"
+                    value={orgDirectory.some((m) => m.name === selectedOwner) ? selectedOwner : ''}
+                    onChange={(e) => {
+                      if (e.target.value) setSelectedOwner(e.target.value);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg border border-amber-300 bg-white text-xs text-slate-800 flex-1 min-w-[200px]"
+                  >
+                    <option value="">Select HR Owner...</option>
+                    {orgDirectory.map((member) => (
+                      <option key={member.id} value={member.name}>
+                        {member.name} ({member.role})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedOwner(orgDirectory[0].name)}
+                    className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-semibold cursor-pointer whitespace-nowrap"
+                  >
+                    Assign {orgDirectory[0].name}
+                  </button>
+                </div>
+              </div>
+            )}
+
             {renderAttributeEditor()}
 
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
@@ -418,17 +478,19 @@ export const BusinessProblemManager: React.FC<BusinessProblemManagerProps> = ({
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-5 py-4">
-          <button type="button" onClick={onClose} className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700">
+          <button type="button" onClick={onClose} className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700 cursor-pointer">
             Cancel
           </button>
           <button
             type="button"
             onClick={() => {
               const next = syncDerivedFields(draft);
-              onSave(next);
-              onClose();
+              const saved = onSave(next, selectedOwner || undefined);
+              if (saved !== false) {
+                onClose();
+              }
             }}
-            className="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white"
+            className="rounded-xl bg-indigo-600 hover:bg-indigo-700 px-4 py-2 text-xs font-semibold text-white cursor-pointer"
           >
             Save business problem
           </button>

@@ -5,7 +5,6 @@
  */
 
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
-import * as d3 from 'd3';
 import {
   Sliders,
   Sparkles,
@@ -61,11 +60,25 @@ import {
   parseConversationalOkrInput
 } from '../utils/conversationalOkrParser';
 import { BusinessProblemManager } from './BusinessProblemManager';
+import { OKRHealthChecker } from './OKRHealthChecker';
+import { SevenLayerTraceabilityGraph } from './SevenLayerTraceabilityGraph';
+import { BusinessProblemAttributeKey, scanOkrHealth, scanPortfolioOkrHealth } from '../utils/okrHealthChecker';
+
+interface StudioRequestedTarget {
+  tab: 'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor';
+  okrId?: string;
+  nonce: number;
+}
 
 interface OkrProgramStudioViewProps {
   industry: IndustryDataBundle;
   nodesMap: Record<string, TraceabilityNode>;
   onUpdateNodesMap: React.Dispatch<React.SetStateAction<Record<string, TraceabilityNode>>>;
+  onCommitNodesMap?: (
+    updater:
+      | Record<string, TraceabilityNode>
+      | ((prev: Record<string, TraceabilityNode>) => Record<string, TraceabilityNode>)
+  ) => Promise<boolean>;
   managedPrograms: ManagedProgram[];
   onUpdateManagedPrograms: React.Dispatch<React.SetStateAction<ManagedProgram[]>>;
   activeDisasters: SignificantDisasterEvent[];
@@ -73,6 +86,7 @@ interface OkrProgramStudioViewProps {
   orgDirectory: OrgDirectoryMember[];
   policies: OkrEnterprisePolicy[];
   onNavigateToTrajectory?: () => void;
+  requestedTarget?: StudioRequestedTarget | null;
 }
 
 type ConversationalResponse = ConversationalParseResult;
@@ -92,22 +106,34 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   industry,
   nodesMap,
   onUpdateNodesMap,
+  onCommitNodesMap,
   managedPrograms,
   onUpdateManagedPrograms,
   activeDisasters,
   onUpdateActiveDisasters,
   orgDirectory,
   policies,
-  onNavigateToTrajectory
+  onNavigateToTrajectory,
+  requestedTarget
 }) => {
-  // Tabs: 'okrs' | 'programs' | 'disasters' | 'supervisor'
-  const [activeTab, setActiveTab] = useState<'okrs' | 'programs' | 'disasters' | 'supervisor'>('okrs');
+  // Tabs: 'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor'
+  const [activeTab, setActiveTab] = useState<'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor'>('okrs');
 
   // Selected OKR for editing or problem drill-down
   const [selectedOkrId, setSelectedOkrId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!requestedTarget) return;
+    setActiveTab(requestedTarget.tab);
+    if (requestedTarget.okrId) {
+      setSelectedOkrId(requestedTarget.okrId);
+    }
+  }, [requestedTarget]);
   const [isEditingProblem, setIsEditingProblem] = useState<boolean>(false);
   const [isAddingNewOkr, setIsAddingNewOkr] = useState<boolean>(false);
   const [isBusinessProblemManagerOpen, setIsBusinessProblemManagerOpen] = useState<boolean>(false);
+  const [managerInitialAttribute, setManagerInitialAttribute] = useState<BusinessProblemAttributeKey>('Description');
+  const [managerValidationError, setManagerValidationError] = useState<string | null>(null);
   const [isConversationalAgentOpen, setIsConversationalAgentOpen] = useState<boolean>(false);
   const [isInitiatingProgram, setIsInitiatingProgram] = useState<boolean>(false);
   const [terminatingProgramId, setTerminatingProgramId] = useState<string | null>(null);
@@ -116,9 +142,21 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const [isConversationLoading, setIsConversationLoading] = useState(false);
   const [isReconnectingConversationalBackend, setIsReconnectingConversationalBackend] = useState(false);
   const [isConversationalBackendOffline, setIsConversationalBackendOffline] = useState(false);
+  const [geminiAgenticReady, setGeminiAgenticReady] = useState<boolean | null>(null);
   const [preferredConversationalOrigin, setPreferredConversationalOrigin] = useState<string | null>(null);
   const [isDraftPendingReview, setIsDraftPendingReview] = useState(false);
   const [newOkrValidationError, setNewOkrValidationError] = useState<string | null>(null);
+  const [conversationalApplyError, setConversationalApplyError] = useState<string | null>(null);
+  const [conversationalApplySuccess, setConversationalApplySuccess] = useState<{
+    okrId: string;
+    okrTitle: string;
+    persisted: boolean;
+  } | null>(null);
+  const [isApplyingActiveProblem, setIsApplyingActiveProblem] = useState<boolean>(false);
+  const conversationalErrorRef = useRef<HTMLDivElement | null>(null);
+  const conversationalSuccessRef = useRef<HTMLDivElement | null>(null);
+  const [inlineProblemError, setInlineProblemError] = useState<string | null>(null);
+  const [targetActiveOkrIdForApply, setTargetActiveOkrIdForApply] = useState<string>('');
   const [conversationDraft, setConversationDraft] = useState<ConversationalOkrDraft | null>(null);
   const [conversationBusinessProblem, setConversationBusinessProblem] = useState<StructuredBusinessProblem | null>(null);
   const [conversationGapReport, setConversationGapReport] = useState<{
@@ -141,7 +179,6 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       text: 'Hi, I am the OKR Conversational Agent. Describe the outcome you want — I will detect missing OKR & 6-dimension Business Problem attributes, ask targeted questions, and construct a Supervisor-ready draft for Apply Draft to Form.'
     }
   ]);
-  const dependencyGraphRef = useRef<SVGSVGElement | null>(null);
 
   // Filter OKR level nodes (Layer 3)
   const okrNodes = useMemo(() => {
@@ -153,120 +190,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     return nodesMap[selectedOkrId] || okrNodes[0] || null;
   }, [selectedOkrId, nodesMap, okrNodes]);
 
-  const dependencyGraphData = useMemo(() => {
-    if (!activeOkr) return { nodes: [] as Array<{ id: string; label: string; status: string; x?: number; y?: number; fx?: number; fy?: number }>, links: [] as Array<{ source: string; target: string }> };
-
-    const relatedIds = new Set<string>([activeOkr.id]);
-    [...activeOkr.parentIds, ...activeOkr.childIds].forEach((id) => {
-      if (id) relatedIds.add(id);
-    });
-
-    const upstream = Array.from(relatedIds).flatMap((id) => {
-      const node = nodesMap[id];
-      return node ? [...(node.parentIds || []), ...(node.childIds || [])] : [];
-    });
-
-    upstream.forEach((id) => {
-      if (id) relatedIds.add(id);
-    });
-
-    const nodes = Array.from(relatedIds).map((id) => {
-      const node = nodesMap[id];
-      return {
-        id,
-        label: node?.title || id,
-        status: node?.status || 'On Track'
-      };
-    });
-
-    const links = nodes.flatMap((node) => {
-      const currentNode = nodesMap[node.id];
-      if (!currentNode) return [];
-      return currentNode.parentIds
-        .filter((parentId) => relatedIds.has(parentId))
-        .map((parentId) => ({ source: parentId, target: node.id }));
-    });
-
-    return { nodes, links };
-  }, [activeOkr, nodesMap]);
-
-  useEffect(() => {
-    if (!dependencyGraphRef.current || dependencyGraphData.nodes.length === 0) return;
-
-    const width = 620;
-    const height = 320;
-    const svg = d3.select(dependencyGraphRef.current);
-    svg.selectAll('*').remove();
-
-    const graphLinks = dependencyGraphData.links.map((link) => ({ ...link }));
-    const graphNodes = dependencyGraphData.nodes.map((node) => ({ ...node }));
-
-    const linkSelection = svg
-      .append('g')
-      .selectAll('line')
-      .data(graphLinks)
-      .join('line')
-      .attr('stroke', '#a5b4fc')
-      .attr('stroke-width', 1.5)
-      .attr('opacity', 0.8);
-
-    const nodeSelection = svg
-      .append('g')
-      .selectAll('circle')
-      .data(graphNodes)
-      .join('circle')
-      .attr('r', (d: { id: string; label: string; status: string }) => (d.id === activeOkr?.id ? 14 : 11))
-      .attr('fill', (d: { id: string; label: string; status: string }) => {
-        const node = nodesMap[d.id];
-        if (d.id === activeOkr?.id) return '#4f46e5';
-        if (node?.status === 'At Risk') return '#f59e0b';
-        if (node?.status === 'Behind') return '#ef4444';
-        return '#22c55e';
-      })
-      .attr('stroke', '#ffffff')
-      .attr('stroke-width', 2)
-      .style('cursor', 'pointer')
-      .on('click', (_: unknown, d: { id: string; label: string; status: string }) => {
-        setSelectedOkrId(d.id);
-      });
-
-    const labelSelection = svg
-      .append('g')
-      .selectAll('text')
-      .data(graphNodes)
-      .join('text')
-      .attr('text-anchor', 'middle')
-      .attr('dy', -18)
-      .attr('font-size', 9)
-      .attr('fill', '#1e293b')
-      .text((d: { id: string; label: string; status: string }) => d.label.slice(0, 18));
-
-    const simulation = d3
-      .forceSimulation(graphNodes as any)
-      .force('link', d3.forceLink(graphLinks as any).id((d: any) => d.id).distance(90))
-      .force('charge', d3.forceManyBody().strength(-260))
-      .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius((d: any) => (d.id === activeOkr?.id ? 22 : 18)))
-      .on('tick', () => {
-        linkSelection
-          .attr('x1', (d: any) => d.source.x)
-          .attr('y1', (d: any) => d.source.y)
-          .attr('x2', (d: any) => d.target.x)
-          .attr('y2', (d: any) => d.target.y);
-
-        nodeSelection
-          .attr('cx', (d: any) => d.x)
-          .attr('cy', (d: any) => d.y);
-
-        labelSelection
-          .attr('x', (d: any) => d.x)
-          .attr('y', (d: any) => d.y);
-      });
-
-    return () => {
-      simulation.stop();
-    };
-  }, [activeOkr, dependencyGraphData, nodesMap]);
+  const healthSummary = useMemo(() => scanPortfolioOkrHealth(okrNodes), [okrNodes]);
 
   // Available business problems in this industry (curated + runtime)
   const availableProblems = useMemo(() => {
@@ -322,9 +246,14 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   }, [activeOkr, industry.name]);
 
   // Initialize or synchronize inline editor values when active OKR changes or editor opens
-  const handleStartEditingProblem = () => {
-    if (!activeOkr) return;
-    const bp = activeOkr.businessProblem;
+  const handleStartEditingProblem = (okrOverride?: TraceabilityNode) => {
+    const target = okrOverride || activeOkr;
+    if (!target) return;
+    if (okrOverride) {
+      setSelectedOkrId(okrOverride.id);
+      setActiveTab('okrs');
+    }
+    const bp = target.businessProblem;
     setEditProblemDesc(
       bp?.problemDescription || `Operational bottleneck in ${industry.name} delaying execution against benchmark growth targets.`
     );
@@ -338,7 +267,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       bp?.causalChainToDollarImpact || 'Execution friction -> 14% delivery slippage -> $6.2M annualised revenue degradation.'
     );
     setEditRootCause(bp?.rootCause || 'Constrained specialized engineering headcount and legacy architectural debt.');
-    setEditRemediationTiming(bp?.targetRemediationTiming || activeOkr.targetDate || 'Q2 2027 Sprint 4');
+    setEditRemediationTiming(bp?.targetRemediationTiming || target.targetDate || 'Q2 2027 Sprint 4');
     setEditMetrics(
       bp?.metrics && bp.metrics.length > 0
         ? JSON.parse(JSON.stringify(bp.metrics))
@@ -347,6 +276,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
             { indicator: 'Financial Dollar Impact', baselineValue: '$12.0M loss rate', targetValue: '$0', metricType: 'Lagging' }
           ]
     );
+    setInlineProblemError(null);
     setIsEditingProblem(true);
   };
 
@@ -390,12 +320,16 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
 
+    const rootCauseVal = editRootCause.trim() || 'Architectural debt and specialized capacity constraints.';
+    const timingVal = editRemediationTiming.trim() || 'Q2 2027 Sprint 4';
     const updatedProblem: StructuredBusinessProblem = {
       problemDescription: editProblemDesc.trim() || 'Operational execution bottleneck.',
       impactedStakeholders: stakeholdersList.length > 0 ? stakeholdersList : ['Executive Leadership', 'Core Customers'],
       causalChainToDollarImpact: editCausalChain.trim() || 'Friction -> delay -> $4.5M revenue leakage.',
-      rootCause: editRootCause.trim() || 'Architectural debt and specialized capacity constraints.',
-      targetRemediationTiming: editRemediationTiming.trim() || 'Q2 2027 Sprint 4',
+      rootCause: rootCauseVal,
+      rootCauses: [rootCauseVal],
+      targetRemediationTiming: timingVal,
+      remediationTimings: [timingVal],
       metrics: editMetrics.length > 0 ? editMetrics : [
         { indicator: 'Operational Throughput', baselineValue: '70%', targetValue: '> 90%', metricType: 'Leading' },
         { indicator: 'Annual Financial Impact', baselineValue: '$5.0M', targetValue: '$0', metricType: 'Lagging' }
@@ -404,11 +338,11 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
 
     const updatedNode: TraceabilityNode = {
       ...activeOkr,
-      targetDate: editRemediationTiming.trim() || activeOkr.targetDate,
+      targetDate: timingVal || activeOkr.targetDate,
       businessProblem: updatedProblem
     };
 
-    if (!enforceSupervisorPolicy(updatedNode)) {
+    if (!enforceSupervisorPolicy(updatedNode, 'inlineProblem')) {
       return;
     }
 
@@ -432,6 +366,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       severity: 'info'
     });
 
+    setInlineProblemError(null);
     setIsEditingProblem(false);
     setFeedbackMessage({
       text: `Business problem for "${activeOkr.title}" successfully saved with all 6 dimensions! Supervisor Agent verified compliance.`,
@@ -440,7 +375,10 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setTimeout(() => setFeedbackMessage(null), 4000);
   };
 
-  const enforceSupervisorPolicy = (candidate: TraceabilityNode, showModalInline = false) => {
+  const enforceSupervisorPolicy = (
+    candidate: TraceabilityNode,
+    errorTarget: boolean | 'newOkr' | 'inlineProblem' | 'conversational' | 'manager' = false
+  ): boolean => {
     const audit = validateOkrStructuralAdequacy(candidate, policies, orgDirectory);
     if (audit.enforcementBlocked) {
       const issueSummary = audit.complianceIssues.length > 0
@@ -452,8 +390,14 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         text: msg,
         type: 'error'
       });
-      if (showModalInline) {
+      if (errorTarget === true || errorTarget === 'newOkr') {
         setNewOkrValidationError(msg);
+      } else if (errorTarget === 'inlineProblem') {
+        setInlineProblemError(msg);
+      } else if (errorTarget === 'conversational') {
+        setConversationalApplyError(msg);
+      } else if (errorTarget === 'manager') {
+        setManagerValidationError(msg);
       }
       setTimeout(() => setFeedbackMessage(null), 6000);
 
@@ -478,14 +422,26 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       return false;
     }
 
-    if (showModalInline) {
+    if (errorTarget === true || errorTarget === 'newOkr') {
       setNewOkrValidationError(null);
+    } else if (errorTarget === 'inlineProblem') {
+      setInlineProblemError(null);
+    } else if (errorTarget === 'conversational') {
+      setConversationalApplyError(null);
+    } else if (errorTarget === 'manager') {
+      setManagerValidationError(null);
     }
     return true;
   };
 
-  const handleBusinessProblemSave = (problem: StructuredBusinessProblem) => {
-    if (!activeOkr) return;
+  const commitBusinessProblemSave = (
+    problem: StructuredBusinessProblem,
+    targetOkrOverride?: TraceabilityNode,
+    errorTarget: 'conversational' | 'inlineProblem' | 'manager' | false = false,
+    ownerOverride?: string
+  ): { saved: boolean; persistencePromise?: Promise<boolean>; updatedNode?: TraceabilityNode } => {
+    const targetNode = targetOkrOverride || activeOkr;
+    if (!targetNode) return { saved: false };
 
     const normalized = {
       ...problem,
@@ -508,28 +464,36 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     };
 
     const updatedNode: TraceabilityNode = {
-      ...activeOkr,
-      targetDate: normalized.targetRemediationTiming || activeOkr.targetDate,
+      ...targetNode,
+      owner: ownerOverride?.trim() ? ownerOverride.trim() : targetNode.owner,
+      targetDate: normalized.targetRemediationTiming || targetNode.targetDate,
       businessProblem: normalized
     };
 
-    if (!enforceSupervisorPolicy(updatedNode)) {
-      return;
+    if (!enforceSupervisorPolicy(updatedNode, errorTarget)) {
+      return { saved: false };
     }
 
-    onUpdateNodesMap((prev) => ({
+    const applyUpdater = (prev: Record<string, TraceabilityNode>) => ({
       ...prev,
-      [activeOkr.id]: updatedNode
-    }));
+      [targetNode.id]: updatedNode
+    });
+
+    const persistencePromise = onCommitNodesMap
+      ? onCommitNodesMap(applyUpdater)
+      : (() => {
+          onUpdateNodesMap(applyUpdater);
+          return Promise.resolve(true);
+        })();
 
     eventBus.publish({
       topic: 'OKR_CREATED_OR_EDITED',
       sourceAgent: 'Human Executive (HITL)',
       targetAgent: 'Supervisor & Advisory Committee',
-      summary: `Business Problem Updated for OKR: "${activeOkr.title}" using BusinessProblemManager`,
+      summary: `Business Problem Updated for OKR: "${targetNode.title}" (${targetOkrOverride ? 'Conversational Agent' : 'BusinessProblemManager'})`,
       payload: {
-        nodeId: activeOkr.id,
-        title: activeOkr.title,
+        nodeId: targetNode.id,
+        title: targetNode.title,
         problemDescription: normalized.problemDescription,
         impactedStakeholders: normalized.impactedStakeholders,
         timing: normalized.targetRemediationTiming
@@ -539,10 +503,20 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     });
 
     setFeedbackMessage({
-      text: `Business problem for "${activeOkr.title}" was structured and saved from the manager modal.`,
+      text: `Business problem for "${targetNode.title}" was structured and saved cleanly.`,
       type: 'success'
     });
     setTimeout(() => setFeedbackMessage(null), 4000);
+    return { saved: true, persistencePromise, updatedNode };
+  };
+
+  const handleBusinessProblemSave = (
+    problem: StructuredBusinessProblem,
+    targetOkrOverride?: TraceabilityNode,
+    errorTarget: 'conversational' | 'inlineProblem' | 'manager' | false = 'manager',
+    ownerOverride?: string
+  ): boolean => {
+    return commitBusinessProblemSave(problem, targetOkrOverride, errorTarget, ownerOverride).saved;
   };
 
   // -------------------------------------------------------------
@@ -778,14 +752,211 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setTimeout(() => setFeedbackMessage(null), 3500);
   }, [potentialParents]);
 
-  const applyConversationalBusinessProblemToActiveOkr = useCallback(() => {
-    if (!activeOkr || (!conversationBusinessProblem && !conversationDraft)) return;
-    const problem =
-      conversationBusinessProblem ||
-      buildStructuredBusinessProblemFromDraft(conversationDraft || {}, industry.sector, '');
-    handleBusinessProblemSave(problem);
-    setIsConversationalAgentOpen(false);
-  }, [activeOkr, conversationBusinessProblem, conversationDraft, industry.sector]);
+  useEffect(() => {
+    if (activeOkr?.id && (!targetActiveOkrIdForApply || !nodesMap[targetActiveOkrIdForApply])) {
+      setTargetActiveOkrIdForApply(activeOkr.id);
+    }
+  }, [activeOkr?.id, targetActiveOkrIdForApply, nodesMap]);
+
+  useEffect(() => {
+    if (conversationalApplyError) {
+      conversationalErrorRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [conversationalApplyError]);
+
+  useEffect(() => {
+    if (conversationalApplySuccess) {
+      conversationalSuccessRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [conversationalApplySuccess]);
+
+  const applyConversationalBusinessProblemToActiveOkr = useCallback(
+    async (options?: { autoSyncCompliance?: boolean; openInInlineEditor?: boolean }) => {
+      if (isApplyingActiveProblem) return;
+      const targetOkr = (targetActiveOkrIdForApply && nodesMap[targetActiveOkrIdForApply]) || activeOkr;
+      if (!targetOkr || (!conversationBusinessProblem && !conversationDraft)) {
+        setConversationalApplySuccess(null);
+        setConversationalApplyError('Select a target OKR and generate a draft problem first.');
+        return;
+      }
+
+      setConversationalApplySuccess(null);
+
+      const rawProblem =
+        conversationBusinessProblem ||
+        buildStructuredBusinessProblemFromDraft(conversationDraft || {}, industry.sector, '');
+
+      const preparedMetrics = Array.isArray(rawProblem.metrics) ? [...rawProblem.metrics] : [];
+      let preparedOkr: TraceabilityNode = targetOkr;
+
+      let preparedProblem: StructuredBusinessProblem = {
+        ...rawProblem,
+        metrics: preparedMetrics
+      };
+
+      if (options?.autoSyncCompliance) {
+        const hasLeading = preparedMetrics.some((m) => /leading|lead/i.test(m.metricType || ''));
+        const hasLagging = preparedMetrics.some((m) => /lagging|lag/i.test(m.metricType || ''));
+        if (!hasLeading) {
+          const fallbackLeading = targetOkr.businessProblem?.metrics?.find((m) => /leading|lead/i.test(m.metricType || '')) || {
+            indicator: 'Operational Execution Throughput',
+            baselineValue: '65%',
+            targetValue: '> 88%',
+            metricType: 'Leading' as const
+          };
+          preparedMetrics.push(fallbackLeading);
+        }
+        if (!hasLagging) {
+          const fallbackLagging = targetOkr.businessProblem?.metrics?.find((m) => /lagging|lag/i.test(m.metricType || '')) || {
+            indicator: 'Financial Exposure Risk',
+            baselineValue: '$5.5M',
+            targetValue: '$0',
+            metricType: 'Lagging' as const
+          };
+          preparedMetrics.push(fallbackLagging);
+        }
+
+        const ownerMatchesDirectory =
+          orgDirectory.length === 0 ||
+          orgDirectory.some(
+            (m) =>
+              m.name.toLowerCase().includes((targetOkr.owner || '').toLowerCase()) ||
+              (targetOkr.owner || '').toLowerCase().includes(m.name.toLowerCase()) ||
+              m.role.toLowerCase().includes((targetOkr.owner || '').toLowerCase())
+          );
+
+        const draftOwnerMatchesDirectory =
+          Boolean(conversationDraft?.owner) &&
+          orgDirectory.some(
+            (m) =>
+              m.name.toLowerCase().includes((conversationDraft?.owner || '').toLowerCase()) ||
+              (conversationDraft?.owner || '').toLowerCase().includes(m.name.toLowerCase())
+          );
+
+        let syncedDesc = (preparedProblem.problemDescription || '').trim();
+        if (syncedDesc.length < 15) {
+          syncedDesc = targetOkr.businessProblem?.problemDescription || `Improve execution outcomes and reduce churn exposure for ${targetOkr.title}.`;
+        }
+        const combinedAmbitionText = `${targetOkr.title || ''} ${syncedDesc}`.toLowerCase();
+        if (!/double|reduce|cut|improve|expand|accelerate|transform|drive|increase/.test(combinedAmbitionText)) {
+          syncedDesc = `Improve execution resilience and reduce churn exposure: ${syncedDesc}`;
+        }
+
+        const syncedRootCause =
+          (preparedProblem.rootCause || '').trim().length >= 10
+            ? preparedProblem.rootCause.trim()
+            : targetOkr.businessProblem?.rootCause || 'Execution bottlenecks and legacy platform coordination latency.';
+
+        const syncedCausalChain =
+          (preparedProblem.causalChainToDollarImpact || '').trim().length > 10
+            ? preparedProblem.causalChainToDollarImpact.trim()
+            : targetOkr.businessProblem?.causalChainToDollarImpact || 'Operational friction -> service degradation -> $5.5M annualised revenue impact.';
+
+        const syncedStakeholders =
+          Array.isArray(preparedProblem.impactedStakeholders) && preparedProblem.impactedStakeholders.length > 0
+            ? preparedProblem.impactedStakeholders
+            : targetOkr.businessProblem?.impactedStakeholders?.length
+              ? targetOkr.businessProblem.impactedStakeholders
+              : ['Executive Leadership', 'Enterprise Customers', 'Delivery Squads'];
+
+        const syncedTiming =
+          (preparedProblem.targetRemediationTiming || '').trim().length >= 2
+            ? preparedProblem.targetRemediationTiming.trim()
+            : targetOkr.businessProblem?.targetRemediationTiming || targetOkr.targetDate || 'Q2 2027 Sprint 4';
+
+        preparedOkr = {
+          ...targetOkr,
+          owner: ownerMatchesDirectory
+            ? targetOkr.owner
+            : draftOwnerMatchesDirectory && conversationDraft?.owner
+              ? conversationDraft.owner
+              : orgDirectory[0]?.name || targetOkr.owner || 'Executive Lead',
+          budget: targetOkr.budget && targetOkr.budget.trim() && targetOkr.budget !== '$0'
+            ? targetOkr.budget
+            : conversationDraft?.budget || '$4.5M'
+        };
+
+        preparedProblem = {
+          ...preparedProblem,
+          problemDescription: syncedDesc,
+          impactedStakeholders: syncedStakeholders,
+          causalChainToDollarImpact: syncedCausalChain,
+          rootCause: syncedRootCause,
+          rootCauses: Array.isArray(preparedProblem.rootCauses) && preparedProblem.rootCauses.length > 0
+            ? preparedProblem.rootCauses
+            : [syncedRootCause],
+          targetRemediationTiming: syncedTiming,
+          remediationTimings: Array.isArray(preparedProblem.remediationTimings) && preparedProblem.remediationTimings.length > 0
+            ? preparedProblem.remediationTimings
+            : [syncedTiming],
+          metrics: preparedMetrics
+        };
+      }
+
+      if (options?.openInInlineEditor) {
+        setSelectedOkrId(targetOkr.id);
+        setActiveTab('okrs');
+        setEditProblemDesc(preparedProblem.problemDescription || '');
+        setEditStakeholders((preparedProblem.impactedStakeholders || []).join(', '));
+        setEditCausalChain(preparedProblem.causalChainToDollarImpact || '');
+        setEditRootCause(preparedProblem.rootCause || preparedProblem.rootCauses?.[0] || '');
+        setEditRemediationTiming(
+          preparedProblem.targetRemediationTiming || preparedProblem.remediationTimings?.[0] || targetOkr.targetDate || 'Q2 2027 Sprint 4'
+        );
+        setEditMetrics(JSON.parse(JSON.stringify(preparedMetrics)));
+
+        const previewAudit = validateOkrStructuralAdequacy(
+          { ...preparedOkr, businessProblem: preparedProblem },
+          policies,
+          orgDirectory
+        );
+        setInlineProblemError(
+          previewAudit.enforcementBlocked && previewAudit.complianceIssues.length > 0
+            ? `Review before saving: ${previewAudit.complianceIssues.join('; ')}`
+            : null
+        );
+        setIsEditingProblem(true);
+        setConversationalApplyError(null);
+        setConversationalApplySuccess(null);
+        setIsConversationalAgentOpen(false);
+        return;
+      }
+
+      setIsApplyingActiveProblem(true);
+      try {
+        const result = commitBusinessProblemSave(preparedProblem, preparedOkr, 'conversational');
+        if (!result.saved) {
+          setConversationalApplySuccess(null);
+          return;
+        }
+
+        const persisted = result.persistencePromise ? await result.persistencePromise : true;
+        setSelectedOkrId(targetOkr.id);
+        setIsEditingProblem(false);
+        setInlineProblemError(null);
+        setConversationalApplyError(null);
+        setConversationalApplySuccess({
+          okrId: targetOkr.id,
+          okrTitle: targetOkr.title,
+          persisted
+        });
+      } finally {
+        setIsApplyingActiveProblem(false);
+      }
+    },
+    [
+      isApplyingActiveProblem,
+      targetActiveOkrIdForApply,
+      nodesMap,
+      activeOkr,
+      conversationBusinessProblem,
+      conversationDraft,
+      industry.sector,
+      orgDirectory,
+      policies,
+      commitBusinessProblemSave
+    ]
+  );
 
   const runConversationalOrchestration = useCallback((response: ConversationalResponse) => {
     if (!Array.isArray(response.orchestrationEvents) || response.orchestrationEvents.length === 0) return;
@@ -819,7 +990,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     return Array.from(new Set(nextOrigins));
   }, [preferredConversationalOrigin]);
 
-  const reconnectConversationalBackend = useCallback(async () => {
+  const reconnectConversationalBackend = useCallback(async (silent = false) => {
     if (isReconnectingConversationalBackend) return;
     setIsReconnectingConversationalBackend(true);
     try {
@@ -828,13 +999,19 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         try {
           const probe = await fetch(`${origin}/api/health`, { method: 'GET' });
           if (probe.ok) {
+            const healthData = await probe.json().catch(() => null);
             setPreferredConversationalOrigin(origin);
             setIsConversationalBackendOffline(false);
-            setFeedbackMessage({
-              text: `Conversational backend reconnected at ${origin}.`,
-              type: 'success'
-            });
-            setTimeout(() => setFeedbackMessage(null), 2500);
+            setGeminiAgenticReady(typeof healthData?.geminiConfigured === 'boolean' ? healthData.geminiConfigured : null);
+            if (!silent) {
+              setFeedbackMessage({
+                text: healthData?.geminiConfigured
+                  ? `Google Agentic Communication active (${healthData.geminiModel || 'gemini-4-hydrogen'}) at ${origin}.`
+                  : `Conversational backend reconnected at ${origin} (local deterministic engine ready).`,
+                type: 'success'
+              });
+              setTimeout(() => setFeedbackMessage(null), 2500);
+            }
             return;
           }
         } catch {
@@ -843,15 +1020,24 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       }
 
       setIsConversationalBackendOffline(true);
-      setFeedbackMessage({
-        text: 'Backend still offline. Keep using local conversational fallback or restart the server.',
-        type: 'warning'
-      });
-      setTimeout(() => setFeedbackMessage(null), 3000);
+      setGeminiAgenticReady(false);
+      if (!silent) {
+        setFeedbackMessage({
+          text: 'Backend still offline. Keep using local conversational fallback or restart the server.',
+          type: 'warning'
+        });
+        setTimeout(() => setFeedbackMessage(null), 3000);
+      }
     } finally {
       setIsReconnectingConversationalBackend(false);
     }
   }, [getConversationalCandidateOrigins, isReconnectingConversationalBackend]);
+
+  useEffect(() => {
+    if (isConversationalAgentOpen) {
+      void reconnectConversationalBackend(true);
+    }
+  }, [isConversationalAgentOpen]);
 
   const buildLocalConversationalFallback = useCallback(
     (
@@ -882,6 +1068,8 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const resetConversationalSession = useCallback(() => {
     setConversationDraft(null);
     setConversationBusinessProblem(null);
+    setConversationalApplyError(null);
+    setConversationalApplySuccess(null);
     setConversationGapReport({
       missingAttributes: [],
       capturedAttributes: [],
@@ -901,6 +1089,8 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const handleConversationalSend = async (overrideMessage?: string, autoCompleteRemaining = false) => {
     const trimmed = (overrideMessage ?? conversationInput).trim();
     if (!trimmed || isConversationLoading) return;
+    setConversationalApplyError(null);
+    setConversationalApplySuccess(null);
 
     const userTurn: ConversationTurn = {
       id: `user-${Date.now()}`,
@@ -1031,9 +1221,12 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         throw new Error(`Conversational endpoint returned ${lastErrorStatus ?? response?.status ?? 'unknown'}`);
       }
 
-      const payload = (await response.json()) as ConversationalResponse & { success?: boolean };
+      const payload = (await response.json()) as ConversationalResponse & { success?: boolean; source?: string };
       if (responseOrigin) {
         setPreferredConversationalOrigin(responseOrigin);
+      }
+      if (payload.source && payload.source.includes('gemini')) {
+        setGeminiAgenticReady(true);
       }
       setIsConversationalBackendOffline(false);
       applyParsedResponse(payload);
@@ -1429,6 +1622,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
           <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 p-1 rounded-xl text-xs font-semibold">
             <button
               onClick={() => setActiveTab('okrs')}
+              data-studio-tab="okrs"
               className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
                 activeTab === 'okrs'
                   ? 'bg-white text-slate-900 shadow-xs'
@@ -1438,7 +1632,38 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
               Manual OKRs ({okrNodes.length})
             </button>
             <button
+              onClick={() => setActiveTab('network')}
+              data-studio-tab="network"
+              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                activeTab === 'network'
+                  ? 'bg-white text-indigo-700 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>7-Layer Traceability Graph</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('health')}
+              data-studio-tab="health"
+              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                activeTab === 'health'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : healthSummary.flaggedCount > 0
+                    ? 'text-amber-800 hover:bg-amber-50'
+                    : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <span>OKR Health Checker</span>
+              <span className={`tabular-nums font-bold ${
+                healthSummary.flaggedCount > 0 ? 'text-amber-700' : 'text-emerald-700'
+              }`}>
+                ({healthSummary.flaggedCount > 0 ? `${healthSummary.flaggedCount} Flagged` : '6/6 Ready'})
+              </span>
+            </button>
+            <button
               onClick={() => setActiveTab('programs')}
+              data-studio-tab="programs"
               className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
                 activeTab === 'programs'
                   ? 'bg-white text-slate-900 shadow-xs'
@@ -1449,6 +1674,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
             </button>
             <button
               onClick={() => setActiveTab('disasters')}
+              data-studio-tab="disasters"
               className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
                 activeTab === 'disasters'
                   ? 'bg-red-600 text-white shadow-xs'
@@ -1460,6 +1686,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
             </button>
             <button
               onClick={() => setActiveTab('supervisor')}
+              data-studio-tab="supervisor"
               className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
                 activeTab === 'supervisor'
                   ? 'bg-white text-slate-900 shadow-xs'
@@ -1473,8 +1700,22 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
 
         {/* Global Feedback Banner */}
         {feedbackMessage && (
-          <div className="mt-4 p-3 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center gap-2.5 text-xs text-emerald-800 animate-in fade-in">
-            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <div
+            className={`mt-4 p-3 rounded-xl flex items-center gap-2.5 text-xs border animate-in fade-in ${
+              feedbackMessage.type === 'error'
+                ? 'bg-red-50 border-red-200 text-red-800'
+                : feedbackMessage.type === 'warning'
+                  ? 'bg-amber-50 border-amber-200 text-amber-800'
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+            }`}
+          >
+            {feedbackMessage.type === 'error' ? (
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            ) : feedbackMessage.type === 'warning' ? (
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            ) : (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            )}
             <span className="font-semibold">{feedbackMessage.text}</span>
           </div>
         )}
@@ -1508,10 +1749,30 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
               </div>
             </div>
 
+            {healthSummary.flaggedCount > 0 && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50/70 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 text-amber-900">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span>
+                    <strong className="tabular-nums">{healthSummary.flaggedCount}</strong> of{' '}
+                    <strong className="tabular-nums">{healthSummary.totalOkrs}</strong> OKRs have missing Business Problem attributes.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('health')}
+                  className="px-2.5 py-1 rounded-lg border border-amber-300 bg-white hover:bg-amber-100 text-amber-900 font-semibold text-[11px] cursor-pointer transition-colors whitespace-nowrap"
+                >
+                  Open OKR Health Checker
+                </button>
+              </div>
+            )}
+
             <div className="space-y-3 max-h-[660px] overflow-y-auto pr-1">
               {okrNodes.map((okr) => {
                 const isSelected = activeOkr?.id === okr.id;
                 const manualPriority = okr.manualPriority?.priority || 'AI_RECOMMENDED';
+                const okrHealth = scanOkrHealth(okr);
 
                 return (
                   <div
@@ -1527,7 +1788,15 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{okr.id}</span>
+                      <div className="flex items-center gap-1.5 text-[10px]">
+                        <span className="font-bold text-slate-400 uppercase tracking-wider">{okr.id}</span>
+                        <span className="text-slate-300" aria-hidden="true">·</span>
+                        <span className={`font-semibold tabular-nums ${okrHealth.isFlagged ? 'text-amber-700' : 'text-emerald-700'}`}>
+                          {okrHealth.isFlagged
+                            ? `${okrHealth.missingAttributes.length} missing attrs`
+                            : '6/6 complete'}
+                        </span>
+                      </div>
                       <span
                         className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${
                           manualPriority === 'P0 - Critical'
@@ -1596,14 +1865,18 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                   {!isEditingProblem ? (
                     <div className="flex items-center gap-2 shrink-0">
                       <button
-                        onClick={handleStartEditingProblem}
+                        onClick={() => handleStartEditingProblem()}
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-indigo-200 bg-indigo-50/70 hover:bg-indigo-100/70 text-indigo-700 text-xs font-semibold cursor-pointer transition-all shadow-2xs"
                       >
                         <Edit3 className="w-3.5 h-3.5 text-indigo-600" />
                         <span>Edit Business Problem</span>
                       </button>
                       <button
-                        onClick={() => setIsBusinessProblemManagerOpen(true)}
+                        onClick={() => {
+                          setManagerInitialAttribute('Description');
+                          setManagerValidationError(null);
+                          setIsBusinessProblemManagerOpen(true);
+                        }}
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-semibold cursor-pointer transition-all"
                       >
                         <Layers className="w-3.5 h-3.5 text-slate-600" />
@@ -1634,6 +1907,43 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                 {/* ----------------------------------------------------------------- */}
                 {isEditingProblem ? (
                   <form onSubmit={handleSaveBusinessProblem} className="space-y-4">
+                    {inlineProblemError && (
+                      <div className="p-3 rounded-xl border border-red-200 bg-red-50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-xs text-red-800">
+                        <div className="flex items-start gap-2">
+                          <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                          <span>{inlineProblemError}</span>
+                        </div>
+                        {inlineProblemError.toLowerCase().includes('hr directory') && orgDirectory[0] && activeOkr && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const patchedNode: TraceabilityNode = {
+                                ...activeOkr,
+                                owner: orgDirectory[0].name,
+                                businessProblem: {
+                                  problemDescription: editProblemDesc.trim(),
+                                  impactedStakeholders: editStakeholders.split(',').map((s) => s.trim()).filter(Boolean),
+                                  causalChainToDollarImpact: editCausalChain.trim(),
+                                  rootCause: editRootCause.trim(),
+                                  targetRemediationTiming: editRemediationTiming.trim(),
+                                  metrics: editMetrics
+                                }
+                              };
+                              onUpdateNodesMap((prev) => ({ ...prev, [activeOkr.id]: patchedNode }));
+                              const recheck = validateOkrStructuralAdequacy(patchedNode, policies, orgDirectory);
+                              setInlineProblemError(
+                                recheck.enforcementBlocked && recheck.complianceIssues.length > 0
+                                  ? `Review before saving: ${recheck.complianceIssues.join('; ')}`
+                                  : null
+                              );
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-white border border-red-300 hover:bg-red-100 text-[11px] font-semibold text-red-800 shrink-0 cursor-pointer"
+                          >
+                            Assign HR Owner ({orgDirectory[0].name})
+                          </button>
+                        )}
+                      </div>
+                    )}
                     {/* Auto-fill from Industry Library Helper */}
                     <div className="p-3 bg-indigo-50/80 rounded-xl border border-indigo-200/70 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                       <div className="flex items-center gap-2 text-indigo-900 text-xs font-semibold">
@@ -1922,6 +2232,47 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
             )}
           </div>
         </div>
+      )}
+
+      {/* TAB: 7-LAYER D3 FORCE-DIRECTED TRACEABILITY NETWORK */}
+      {activeTab === 'network' && (
+        <SevenLayerTraceabilityGraph
+          industry={industry}
+          nodesMap={nodesMap}
+          selectedOkrId={activeOkr?.id || null}
+          onSelectOkr={(okrId) => setSelectedOkrId(okrId)}
+          onJumpToStudioOkr={(okrId) => {
+            setSelectedOkrId(okrId);
+            setIsEditingProblem(false);
+            setActiveTab('okrs');
+          }}
+        />
+      )}
+
+      {/* TAB: OKR HEALTH CHECKER */}
+      {activeTab === 'health' && (
+        <OKRHealthChecker
+          okrNodes={okrNodes}
+          industryName={industry.name}
+          selectedOkrId={selectedOkrId}
+          onInspectOkr={(okrId) => {
+            setSelectedOkrId(okrId);
+            setIsEditingProblem(false);
+            setActiveTab('okrs');
+          }}
+          onFixOkrInManager={(okrId, targetAttribute) => {
+            setSelectedOkrId(okrId);
+            setManagerInitialAttribute(targetAttribute || 'Description');
+            setManagerValidationError(null);
+            setIsBusinessProblemManagerOpen(true);
+          }}
+          onFixOkrInline={(okrId) => {
+            const target = nodesMap[okrId];
+            if (target) {
+              handleStartEditingProblem(target);
+            }
+          }}
+        />
       )}
 
       {/* TAB 2: PROGRAM LIFECYCLE MANAGEMENT (TERMINATE & INITIATE) */}
@@ -2219,20 +2570,30 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={reconnectConversationalBackend}
+                  onClick={() => void reconnectConversationalBackend(false)}
                   disabled={isReconnectingConversationalBackend}
                   className={`px-2 py-0.5 rounded-full border text-[10px] font-bold transition-all ${
                     isConversationalBackendOffline
                       ? 'bg-amber-100 text-amber-800 border-amber-300 hover:bg-amber-200'
-                      : 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200'
+                      : geminiAgenticReady
+                        ? 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200'
+                        : 'bg-sky-100 text-sky-800 border-sky-300 hover:bg-sky-200'
                   } ${isReconnectingConversationalBackend ? 'opacity-70 cursor-not-allowed' : ''}`}
-                  title={isConversationalBackendOffline ? 'Backend offline. Click to reconnect.' : 'Backend online. Click to re-check connection.'}
+                  title={
+                    isConversationalBackendOffline
+                      ? 'Backend offline. Click to reconnect.'
+                      : geminiAgenticReady
+                        ? 'Google Gemini Agentic Communication active (gemini-4-hydrogen). Click to re-check.'
+                        : 'Backend online using local intelligent OKR engine (add GEMINI_API_KEY in .env for live Gemini synthesis). Click to re-check.'
+                  }
                 >
                   {isReconnectingConversationalBackend
                     ? 'Checking...'
                     : isConversationalBackendOffline
                       ? 'Backend offline'
-                      : 'Backend online'}
+                      : geminiAgenticReady
+                        ? 'Gemini Agentic Online'
+                        : 'Backend online'}
                 </button>
                 <button
                   type="button"
@@ -2327,7 +2688,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
               </div>
             )}
 
-            <div className="rounded-xl border border-slate-200 bg-white p-3 h-[280px] overflow-y-auto space-y-3">
+            <div className="rounded-xl border border-slate-200 bg-white p-3 h-[220px] overflow-y-auto space-y-3">
               {conversationTurns.map((turn) => (
                 <div key={turn.id} className={`flex ${turn.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <div className={`max-w-[85%] rounded-xl px-3 py-2 text-xs ${
@@ -2372,6 +2733,66 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
               )}
             </div>
 
+            {conversationalApplyError && (
+              <div
+                ref={conversationalErrorRef}
+                className="rounded-xl border border-red-300 bg-red-50 p-3 space-y-2 text-[11px] text-red-900 shadow-xs"
+              >
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                  <span>{conversationalApplyError}</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isApplyingActiveProblem}
+                    onClick={() => void applyConversationalBusinessProblemToActiveOkr({ autoSyncCompliance: true })}
+                    className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-semibold cursor-pointer disabled:opacity-60"
+                  >
+                    {isApplyingActiveProblem ? 'Syncing & Saving...' : 'Auto-Sync Compliance & Apply'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isApplyingActiveProblem}
+                    onClick={() => void applyConversationalBusinessProblemToActiveOkr({ openInInlineEditor: true })}
+                    className="px-3 py-1.5 rounded-lg border border-red-300 bg-white hover:bg-red-100 text-red-800 text-[11px] font-semibold cursor-pointer disabled:opacity-60"
+                  >
+                    Review &amp; Edit in Active OKR Form
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {conversationalApplySuccess && (
+              <div
+                ref={conversationalSuccessRef}
+                className="rounded-xl border border-emerald-300 bg-emerald-50 p-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-[11px] text-emerald-900 shadow-xs"
+              >
+                <div className="flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold">
+                      Applied &amp; {conversationalApplySuccess.persisted ? 'Persisted' : 'Saved'} to Active OKR [{conversationalApplySuccess.okrId}]
+                    </p>
+                    <p className="text-emerald-800">
+                      &ldquo;{conversationalApplySuccess.okrTitle}&rdquo; updated with structured 6-dimension Business Problem. You can continue drafting or view it in the studio.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedOkrId(conversationalApplySuccess.okrId);
+                    setActiveTab('okrs');
+                    setIsConversationalAgentOpen(false);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold shrink-0 cursor-pointer"
+                >
+                  Done &amp; View OKR
+                </button>
+              </div>
+            )}
+
             {conversationDraft && (
               <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-2.5">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
@@ -2388,15 +2809,35 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
-                    {activeOkr && conversationBusinessProblem && (
-                      <button
-                        type="button"
-                        onClick={applyConversationalBusinessProblemToActiveOkr}
-                        className="px-3 py-1.5 rounded-lg border border-emerald-600 bg-white hover:bg-emerald-100 text-emerald-800 text-xs font-semibold cursor-pointer"
+                    {okrNodes.length > 0 && (
+                      <select
+                        aria-label="Target Active OKR"
+                        value={targetActiveOkrIdForApply || activeOkr?.id || ''}
+                        onChange={(e) => {
+                          setTargetActiveOkrIdForApply(e.target.value);
+                          setConversationalApplyError(null);
+                          setConversationalApplySuccess(null);
+                        }}
+                        className="max-w-[230px] px-2 py-1.5 rounded-lg border border-emerald-300 bg-white text-[11px] font-medium text-slate-800"
                       >
-                        Apply to Active OKR Problem
-                      </button>
+                        {okrNodes.map((okr) => (
+                          <option key={okr.id} value={okr.id}>
+                            [{okr.id}] {okr.title}
+                          </option>
+                        ))}
+                      </select>
                     )}
+                    {(targetActiveOkrIdForApply ? nodesMap[targetActiveOkrIdForApply] : activeOkr) &&
+                      (conversationBusinessProblem || conversationDraft) && (
+                        <button
+                          type="button"
+                          disabled={isApplyingActiveProblem}
+                          onClick={() => void applyConversationalBusinessProblemToActiveOkr()}
+                          className="px-3 py-1.5 rounded-lg border border-emerald-600 bg-white hover:bg-emerald-100 text-emerald-800 text-xs font-semibold cursor-pointer disabled:opacity-60"
+                        >
+                          {isApplyingActiveProblem ? 'Applying...' : 'Apply to Active OKR Problem'}
+                        </button>
+                      )}
                     <button
                       type="button"
                       onClick={() => applyConversationalDraftToForm(conversationDraft)}
@@ -3144,10 +3585,18 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       {/* MODAL: BUSINESS PROBLEM MANAGER */}
       <BusinessProblemManager
         isOpen={isBusinessProblemManagerOpen}
-        onClose={() => setIsBusinessProblemManagerOpen(false)}
+        onClose={() => {
+          setIsBusinessProblemManagerOpen(false);
+          setManagerValidationError(null);
+        }}
         problem={effectiveActiveBusinessProblem}
         orgDirectory={orgDirectory}
-        onSave={handleBusinessProblemSave}
+        onSave={(nextProblem, nextOwner) =>
+          handleBusinessProblemSave(nextProblem, undefined, 'manager', nextOwner)
+        }
+        initialAttribute={managerInitialAttribute}
+        okrOwner={activeOkr?.owner}
+        validationError={managerValidationError}
       />
 
       {/* MODAL: TERMINATE PROGRAM CONFIRMATION */}

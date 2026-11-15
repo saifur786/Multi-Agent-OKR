@@ -11,7 +11,24 @@ import {
   mergeConversationalDrafts,
   parseConversationalOkrInput
 } from './src/utils/conversationalOkrParser';
+import {
+  DEFAULT_USER_PREFERENCES,
+  normalizeUserPreferences
+} from './src/utils/navOrder';
+import {
+  buildDeterministicIngestionPreview,
+  classifyDocumentPillar,
+  extractReadableTextFromPdfBytes,
+  PILLAR_TITLES,
+  type KnowledgePillarId
+} from './src/utils/ragIngestion';
+import {
+  isAllowedGeminiChatModel,
+  resolveGeminiChatModel,
+  sanitizeChatHistoryForApi
+} from './src/utils/geminiChatConfig';
 
+dotenv.config({ path: '.env.local' });
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -41,6 +58,14 @@ const memoryInteractions: Array<{
   createdAt: string;
   metadata: Record<string, any>;
 }> = [];
+let memoryUserPreferences: {
+  id: string;
+  navButtonOrder: string[];
+  updatedAt?: string;
+} = {
+  id: 'default',
+  ...DEFAULT_USER_PREFERENCES
+};
 
 async function connectMongo(): Promise<Db | null> {
   if (mongoDb) return mongoDb;
@@ -89,7 +114,7 @@ async function seedIndustriesIfEmpty() {
 
 function startServerOnPort(port: number): Promise<number> {
   return new Promise((resolve, reject) => {
-    const server = app.listen(port, () => {
+    const server = app.listen(port, '0.0.0.0', () => {
       console.log(`Planview Anvi Multi-Agent System server running on http://localhost:${port}`);
       resolve(port);
     });
@@ -109,7 +134,83 @@ function startServerOnPort(port: number): Promise<number> {
   });
 }
 
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '15mb' }));
+
+// Allow cross-port local dev communication (e.g. Vite :5173 or fallback :3001 <-> :3000)
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  return next();
+});
+
+function getGeminiApiKey(): string {
+  const raw = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
+  if (!raw || raw === 'MY_GEMINI_API_KEY') return '';
+  return raw;
+}
+
+const GEMINI_MODEL = 'gemini-4-hydrogen';
+let cachedGeminiClient: GoogleGenAI | null = null;
+let cachedGeminiKey = '';
+
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) return null;
+  if (cachedGeminiClient && cachedGeminiKey === apiKey) {
+    return cachedGeminiClient;
+  }
+  cachedGeminiKey = apiKey;
+  cachedGeminiClient = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build'
+      }
+    }
+  });
+  return cachedGeminiClient;
+}
+
+function parseGeminiJsonSafe<T = any>(rawText: string | undefined): T | null {
+  if (!rawText) return null;
+  const cleaned = rawText
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+  return JSON.parse(cleaned) as T;
+}
+
+async function generateWithGeminiRetry<T>(
+  operation: (client: GoogleGenAI) => Promise<T>,
+  retries = 2
+): Promise<T | null> {
+  const client = getGeminiClient();
+  if (!client) return null;
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await operation(client);
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 350 * Math.pow(2, attempt)));
+      }
+    }
+  }
+  throw lastError;
+}
 
 app.get('/api/health', async (_req, res) => {
   const db = await connectMongo();
@@ -117,7 +218,9 @@ app.get('/api/health', async (_req, res) => {
     ok: true,
     mongo: !!db,
     mode: db ? 'mongodb' : 'memory',
-    database: DATABASE_NAME
+    database: DATABASE_NAME,
+    geminiConfigured: Boolean(getGeminiApiKey()),
+    geminiModel: GEMINI_MODEL
   });
 });
 
@@ -157,6 +260,40 @@ app.post('/api/industries', async (req, res) => {
   );
 
   return res.status(201).json({ industry: timestamped, source: 'mongodb', upserted: result.upsertedCount > 0 });
+});
+
+app.get('/api/user-preferences', async (_req, res) => {
+  const db = await connectMongo();
+  if (!db) {
+    return res.json({
+      preferences: normalizeUserPreferences(memoryUserPreferences),
+      source: 'memory'
+    });
+  }
+
+  const doc = await db.collection('user_preferences').findOne({ id: 'default' });
+  const preferences = doc ? normalizeUserPreferences(doc) : { ...DEFAULT_USER_PREFERENCES };
+  return res.json({ preferences, source: 'mongodb' });
+});
+
+app.post('/api/user-preferences', async (req, res) => {
+  const db = await connectMongo();
+  const normalized = normalizeUserPreferences({
+    ...req.body,
+    updatedAt: req.body?.updatedAt || new Date().toISOString()
+  });
+
+  if (!db) {
+    memoryUserPreferences = { id: 'default', ...normalized };
+    return res.json({ preferences: normalized, source: 'memory' });
+  }
+
+  await db.collection('user_preferences').updateOne(
+    { id: 'default' },
+    { $set: { id: 'default', ...normalized } },
+    { upsert: true }
+  );
+  return res.json({ preferences: normalized, source: 'mongodb' });
 });
 
 app.get('/api/agent-interactions', async (req, res) => {
@@ -252,19 +389,6 @@ const conversationalEventTopics = [
   'ADVISORY_COMMITTEE_EVALUATED'
 ] as const;
 
-// Initialize GoogleGenAI server-side client
-let ai: GoogleGenAI | null = null;
-if (process.env.GEMINI_API_KEY) {
-  ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build'
-      }
-    }
-  });
-}
-
 app.post('/api/okr-conversational-agent', async (req, res) => {
   try {
     const body = req.body ?? {};
@@ -282,7 +406,7 @@ app.post('/api/okr-conversational-agent', async (req, res) => {
 
     const fallback = parseConversationalOkrInput(message, context, history, currentDraft);
 
-    if (ai && process.env.GEMINI_API_KEY) {
+    if (getGeminiClient()) {
       try {
         const missingListText =
           fallback.missingAttributes.length > 0
@@ -325,70 +449,71 @@ Return:
 - okrDraft with title, parentId, owner, priority, budget, targetDate, problemDescription, impactedStakeholders[], causalChainToDollarImpact, rootCause, rootCauses[], targetRemediationTiming, remediationTimings[], metrics[]
 - orchestrationEvents[] where topic is one of ${conversationalEventTopics.join(', ')}`;
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                assistantMessage: { type: Type.STRING },
-                intent: { type: Type.STRING },
-                confidence: { type: Type.NUMBER },
-                questions: { type: Type.ARRAY, items: { type: Type.STRING } },
-                actionPlan: { type: Type.ARRAY, items: { type: Type.STRING } },
-                okrDraft: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    parentId: { type: Type.STRING },
-                    owner: { type: Type.STRING },
-                    priority: { type: Type.STRING },
-                    budget: { type: Type.STRING },
-                    targetDate: { type: Type.STRING },
-                    problemDescription: { type: Type.STRING },
-                    impactedStakeholders: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    causalChainToDollarImpact: { type: Type.STRING },
-                    rootCause: { type: Type.STRING },
-                    rootCauses: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    targetRemediationTiming: { type: Type.STRING },
-                    remediationTimings: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    metrics: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          indicator: { type: Type.STRING },
-                          baselineValue: { type: Type.STRING },
-                          targetValue: { type: Type.STRING },
-                          metricType: { type: Type.STRING }
+        const response = await generateWithGeminiRetry((client) =>
+          client.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  assistantMessage: { type: Type.STRING },
+                  intent: { type: Type.STRING },
+                  confidence: { type: Type.NUMBER },
+                  questions: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  actionPlan: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  okrDraft: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING },
+                      parentId: { type: Type.STRING },
+                      owner: { type: Type.STRING },
+                      priority: { type: Type.STRING },
+                      budget: { type: Type.STRING },
+                      targetDate: { type: Type.STRING },
+                      problemDescription: { type: Type.STRING },
+                      impactedStakeholders: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      causalChainToDollarImpact: { type: Type.STRING },
+                      rootCause: { type: Type.STRING },
+                      rootCauses: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      targetRemediationTiming: { type: Type.STRING },
+                      remediationTimings: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      metrics: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            indicator: { type: Type.STRING },
+                            baselineValue: { type: Type.STRING },
+                            targetValue: { type: Type.STRING },
+                            metricType: { type: Type.STRING }
+                          }
                         }
                       }
                     }
-                  }
-                },
-                orchestrationEvents: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      topic: { type: Type.STRING },
-                      sourceAgent: { type: Type.STRING },
-                      targetAgent: { type: Type.STRING },
-                      summary: { type: Type.STRING },
-                      severity: { type: Type.STRING }
+                  },
+                  orchestrationEvents: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        topic: { type: Type.STRING },
+                        sourceAgent: { type: Type.STRING },
+                        targetAgent: { type: Type.STRING },
+                        summary: { type: Type.STRING },
+                        severity: { type: Type.STRING }
+                      }
                     }
                   }
                 }
               }
             }
-          }
-        });
+          })
+        );
 
-        const text = response.text;
-        if (text) {
-          const parsed = JSON.parse(text);
+        const parsed = parseGeminiJsonSafe(response?.text);
+        if (parsed) {
           const effectiveIntent =
             (parsed.intent === 'clarify' || parsed.intent === 'unknown') &&
             (fallback.intent === 'create_okr' || fallback.intent === 'update_business_problem')
@@ -466,7 +591,7 @@ app.post('/api/generate-strategy', async (req, res) => {
     }
 
     // If Gemini API is available and configured, use it for real-world strategic synthesis
-    if (ai && process.env.GEMINI_API_KEY) {
+    if (getGeminiClient()) {
       try {
         const prompt = `You are Planview Anvi's Strategy & Ideation Agent. Generate a comprehensive, real-world, measurable OKR strategy and 7-layer traceability structure for an enterprise in the following domain:
 Industry/Name: ${industryName}
@@ -485,19 +610,20 @@ Generate a structured JSON response containing:
 7. "outcomes": array of 2 top-line business outcomes with expected ROI and customer/operational impact.
 8. "knowledgeBase": array of 5 knowledge pillars (Historical Performance, Market Data, Customer Feedback, Project Runner, Resources) with metrics and bullet points.`;
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: prompt,
-          config: {
-            systemInstruction: 'You are an enterprise strategic portfolio architect for Planview. Respond exclusively with valid JSON conforming to the requested schema.',
-            responseMimeType: 'application/json'
-          }
-        });
+        const response = await generateWithGeminiRetry((client) =>
+          client.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: prompt,
+            config: {
+              systemInstruction: 'You are an enterprise strategic portfolio architect for Planview. Respond exclusively with valid JSON conforming to the requested schema.',
+              responseMimeType: 'application/json'
+            }
+          })
+        );
 
-        const text = response.text;
-        if (text) {
-          const parsed = JSON.parse(text);
-          return res.json({ success: true, strategy: parsed, source: 'gemini-4-hydrogen' });
+        const parsed = parseGeminiJsonSafe(response?.text);
+        if (parsed) {
+          return res.json({ success: true, strategy: parsed, source: GEMINI_MODEL });
         }
       } catch (geminiError) {
         const msg = geminiError instanceof Error ? geminiError.message : 'Gemini call failed';
@@ -511,6 +637,249 @@ Generate a structured JSON response containing:
   } catch (error: any) {
     console.error('Error generating strategy:', error);
     return res.status(500).json({ error: error.message || 'Internal server error' });
+  }
+});
+
+/**
+ * API route: RAG Knowledge Base Document Ingestion (PDF / Text / Reports)
+ * Parses local industry documents via server-side @google/genai (with deterministic fallback)
+ * to update the 5-Pillar AI Knowledge Base.
+ */
+app.post('/api/rag/ingest', async (req, res) => {
+  try {
+    const {
+      industryName = 'Enterprise',
+      sector = 'Enterprise Technology',
+      targetPillarId = 'auto',
+      fileName = 'uploaded-document.txt',
+      mimeType = 'text/plain',
+      textContent = '',
+      base64Content = ''
+    } = req.body ?? {};
+
+    const cleanFileName = String(fileName || 'uploaded-document.txt').slice(0, 140);
+    const isPdf = String(mimeType).toLowerCase().includes('pdf') || cleanFileName.toLowerCase().endsWith('.pdf');
+
+    let extractedText = typeof textContent === 'string' ? textContent.trim() : '';
+    if (!extractedText && isPdf && typeof base64Content === 'string' && base64Content.trim()) {
+      const pdfBytes = Uint8Array.from(Buffer.from(base64Content, 'base64'));
+      extractedText = extractReadableTextFromPdfBytes(pdfBytes);
+    }
+
+    if (!extractedText && !base64Content) {
+      return res.status(400).json({
+        error: 'Document text or file content is required for RAG ingestion.'
+      });
+    }
+
+    const client = getGeminiClient();
+    const requestedPillar: KnowledgePillarId | 'auto' =
+      ['kb1', 'kb2', 'kb3', 'kb4', 'kb5'].includes(String(targetPillarId))
+        ? (String(targetPillarId) as KnowledgePillarId)
+        : 'auto';
+
+    if (client) {
+      try {
+        const instructionPrompt = `You are the Planview Anvi RAG Knowledge Base Ingestion Pipeline for ${industryName} (${sector}).
+Analyze the uploaded document "${cleanFileName}" and extract structured enterprise vector knowledge to update one of the 5 Knowledge Base Pillars:
+- kb1: Historical Performance (attainment, sprint velocity, SLAs, historical benchmarks)
+- kb2: Market Data (industry standards, regulatory policies, compliance mandates, market benchmarks)
+- kb3: Customer Feedback (NPS, CSAT, adoption friction, voice of customer)
+- kb4: Project Runner & Outcome (ROI, program delivery lessons, epics, postmortems)
+- kb5: Resources & Utilisation (FTE capacity, squad allocation, bottlenecks, staffing)
+
+${requestedPillar !== 'auto' ? `Target Pillar MUST be "${requestedPillar}".` : 'Choose the best matching targetPillarId from kb1..kb5.'}
+Produce 3 to 6 concise, self-contained semantic vector chunks suitable for RAG retrieval, a 1-sentence executive summary, a concise KPI metricHighlight (under 28 chars), a short trendTag (under 24 chars), and 3 keyInsights.`;
+
+        const parts: Array<Record<string, any>> = [];
+        if (isPdf && typeof base64Content === 'string' && base64Content.trim().length > 0) {
+          parts.push({
+            inlineData: {
+              mimeType: 'application/pdf',
+              data: base64Content.trim()
+            }
+          });
+        } else {
+          parts.push({
+            text: `Document Content (${cleanFileName}):\n${extractedText.slice(0, 24000)}`
+          });
+        }
+        parts.push({ text: instructionPrompt });
+
+        const response = await generateWithGeminiRetry((ai) =>
+          ai.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: { parts },
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  targetPillarId: {
+                    type: Type.STRING,
+                    description: 'One of kb1, kb2, kb3, kb4, kb5'
+                  },
+                  summary: {
+                    type: Type.STRING,
+                    description: 'Concise 1-2 sentence executive summary of the document.'
+                  },
+                  metricHighlight: {
+                    type: Type.STRING,
+                    description: 'Primary numeric KPI headline under 28 characters.'
+                  },
+                  trendTag: {
+                    type: Type.STRING,
+                    description: 'Short badge label under 24 characters.'
+                  },
+                  keyInsights: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING }
+                  },
+                  chunks: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING }
+                  }
+                },
+                required: ['targetPillarId', 'summary', 'metricHighlight', 'trendTag', 'keyInsights', 'chunks']
+              }
+            }
+          })
+        );
+
+        const parsed = parseGeminiJsonSafe<{
+          targetPillarId?: string;
+          summary?: string;
+          metricHighlight?: string;
+          trendTag?: string;
+          keyInsights?: string[];
+          chunks?: string[];
+        }>(response?.text);
+
+        if (parsed && Array.isArray(parsed.chunks) && parsed.chunks.length > 0) {
+          const resolvedPillar: KnowledgePillarId =
+            requestedPillar !== 'auto'
+              ? requestedPillar
+              : ['kb1', 'kb2', 'kb3', 'kb4', 'kb5'].includes(String(parsed.targetPillarId))
+                ? (String(parsed.targetPillarId) as KnowledgePillarId)
+                : classifyDocumentPillar(extractedText, cleanFileName, 'auto');
+
+          return res.json({
+            success: true,
+            preview: {
+              targetPillarId: resolvedPillar,
+              targetPillarTitle: PILLAR_TITLES[resolvedPillar],
+              fileName: cleanFileName,
+              summary: String(parsed.summary || '').trim() || `Indexed ${cleanFileName} via Gemini RAG pipeline.`,
+              metricHighlight: String(parsed.metricHighlight || `${parsed.chunks.length} Vectors Indexed`).slice(0, 32),
+              trendTag: String(parsed.trendTag || `RAG · ${cleanFileName.slice(0, 18)}`).slice(0, 28),
+              keyInsights: (parsed.keyInsights || []).map((k) => String(k).trim()).filter(Boolean).slice(0, 5),
+              chunks: parsed.chunks
+                .map((c, idx) => ({
+                  id: `rag-doc-${Date.now()}-${idx + 1}`,
+                  text: String(c).trim().slice(0, 320),
+                  source: cleanFileName
+                }))
+                .filter((c) => c.text.length > 0)
+                .slice(0, 8),
+              engine: 'gemini-rag'
+            }
+          });
+        }
+      } catch (geminiError: any) {
+        const msg = geminiError instanceof Error ? geminiError.message : 'Gemini RAG call failed';
+        console.warn(`Gemini RAG ingestion fallback (${msg})`);
+      }
+    }
+
+    const fallbackText =
+      extractedText ||
+      `Uploaded policy/performance document ${cleanFileName} for ${industryName} (${sector}).`;
+    const preview = buildDeterministicIngestionPreview({
+      fileName: cleanFileName,
+      textContent: fallbackText,
+      targetPillarId: requestedPillar,
+      industryName: String(industryName)
+    });
+
+    return res.json({ success: true, preview });
+  } catch (error: any) {
+    console.error('RAG document ingestion error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to ingest document.' });
+  }
+});
+
+/**
+ * API route: Multi-Turn Gemini Chatbot (powered by @google/genai ai.chats)
+ * Supports selectable Gemini models (gemini-4-carbon, gemini-4-argon, gemini-4-hydrogen, gemini-3.1-flash-lite)
+ * and customizable role-based system instructions.
+ */
+app.post('/api/gemini/chat', async (req, res) => {
+  try {
+    const {
+      model: requestedModel,
+      systemInstruction = '',
+      history = [],
+      message = '',
+      industryContext = ''
+    } = req.body ?? {};
+
+    const cleanMessage = typeof message === 'string' ? message.trim() : '';
+    if (!cleanMessage) {
+      return res.status(400).json({ error: 'Chat message cannot be empty.' });
+    }
+
+    if (requestedModel && !isAllowedGeminiChatModel(String(requestedModel))) {
+      return res.status(400).json({
+        error: `Unsupported model "${String(requestedModel)}". Allowed models: gemini-4-hydrogen, gemini-4-argon, gemini-4-carbon, gemini-3.1-flash-lite.`
+      });
+    }
+
+    const activeModel = resolveGeminiChatModel(requestedModel);
+    const client = getGeminiClient();
+    if (!client) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured on the server. Set GEMINI_API_KEY in Settings > Secrets to enable live chat responses.'
+      });
+    }
+
+    const fullSystemInstruction = [
+      String(systemInstruction || 'You are the Planview Anvi Enterprise Strategy & OKR Copilot.').trim(),
+      industryContext ? `\nLive Portfolio Context:\n${String(industryContext).slice(0, 6000)}` : ''
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const formattedHistory = sanitizeChatHistoryForApi(Array.isArray(history) ? history : []);
+
+    const chat = client.chats.create({
+      model: activeModel,
+      config: {
+        systemInstruction: fullSystemInstruction
+      },
+      history: formattedHistory
+    });
+
+    const response = await chat.sendMessage({ message: cleanMessage });
+    const replyText = (response.text || '').trim();
+
+    if (!replyText) {
+      return res.status(502).json({
+        error: `Model ${activeModel} returned an empty response. Please try again.`
+      });
+    }
+
+    return res.json({
+      success: true,
+      model: activeModel,
+      reply: replyText
+    });
+  } catch (error: any) {
+    console.error('Gemini multi-turn chat error:', error);
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    const message = error?.message || 'Gemini chat request failed.';
+    return res.status(status >= 400 && status < 600 ? status : 500).json({
+      error: message
+    });
   }
 });
 

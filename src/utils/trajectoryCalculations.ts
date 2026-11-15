@@ -194,12 +194,17 @@ export function validateOkrStructuralAdequacy(
       (okr.owner || '').toLowerCase().includes(member.name.toLowerCase()) ||
       member.role.toLowerCase().includes((okr.owner || '').toLowerCase())
   );
-  const ownershipVerified = Boolean(matchedOwner);
+  const hasAnyOwner = Boolean(okr.owner && okr.owner.trim());
+  const ownershipVerified = orgDirectory.length === 0 ? hasAnyOwner : Boolean(matchedOwner);
   if (ownershipVerified) {
     checkpointsPassed++;
   } else {
     requiredFieldsMissing.push('owner');
-    complianceIssues.push(`Owner "${okr.owner || 'Unassigned'}" not verified in the individual enterprise HR directory.`);
+    complianceIssues.push(
+      orgDirectory.length === 0
+        ? 'OKR owner is missing.'
+        : `Owner "${okr.owner || 'Unassigned'}" not verified in the individual enterprise HR directory.`
+    );
     recommendations.push(`Assign ownership to a verified executive in the HR directory (e.g. ${orgDirectory[0]?.name || 'VP Engineering'}).`);
   }
 
