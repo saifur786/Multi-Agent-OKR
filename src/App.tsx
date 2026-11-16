@@ -1407,8 +1407,12 @@ export default function App() {
                     title={isNavCollapsed ? view.label : undefined}
                   >
                     {!isNavCollapsed && (
-                      <span className="absolute right-2 top-2 flex cursor-grab items-center justify-center rounded-md border border-slate-200 bg-white/80 p-1 text-slate-400 opacity-70 transition group-hover:opacity-100">
-                        <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
+                      <span
+                        className="absolute right-2 top-2 flex cursor-grab items-center justify-center rounded-md border border-slate-200 bg-white/90 p-1.5 text-slate-500 opacity-0 shadow-sm transition-all duration-200 group-hover:scale-105 group-hover:opacity-100 group-hover:border-slate-300 group-hover:text-slate-700"
+                        title="Drag to reorder"
+                        aria-label="Drag to reorder"
+                      >
+                        <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
                           <circle cx="8" cy="6" r="1.5" />
                           <circle cx="8" cy="12" r="1.5" />
                           <circle cx="8" cy="18" r="1.5" />
