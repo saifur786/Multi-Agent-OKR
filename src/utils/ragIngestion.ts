@@ -10,7 +10,7 @@ export interface ParsedDocumentPreview {
   metricHighlight: string;
   trendTag: string;
   keyInsights: string[];
-  chunks: Array<{ id: string; text: string; source: string }>;
+  chunks: Array<{ id: string; text: string; source: string; sourceDocument?: string; ingestedAt?: string }>;
   engine: 'gemini-rag' | 'deterministic-fallback';
 }
 
@@ -140,16 +140,19 @@ export function chunkDocumentText(
     .filter((s) => s.length >= 12);
 
   const units = sentences.length > 0 ? sentences : [normalized];
-  const chunks: Array<{ id: string; text: string; source: string }> = [];
+  const chunks: Array<{ id: string; text: string; source: string; sourceDocument?: string; ingestedAt?: string }> = [];
   let buffer = '';
 
   const pushBuffer = (val: string) => {
     const trimmed = val.trim().slice(0, maxChunkLength);
     if (!trimmed) return;
+    const ingestedAt = new Date().toISOString();
     chunks.push({
       id: `doc-vec-${Date.now()}-${chunks.length + 1}`,
       text: trimmed,
-      source: sourceLabel.slice(0, 90)
+      source: sourceLabel.slice(0, 90),
+      sourceDocument: sourceLabel.slice(0, 90),
+      ingestedAt
     });
   };
 

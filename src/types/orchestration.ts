@@ -152,6 +152,8 @@ export interface KnowledgeBasePillar {
     id: string;
     text: string;
     source: string;
+    sourceDocument?: string;
+    ingestedAt?: string;
     embeddingVector?: number[];
   }[];
 }

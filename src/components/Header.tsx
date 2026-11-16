@@ -91,6 +91,14 @@ interface HeaderProps {
   onDismissNotification: (id: string) => void;
   onOpenNotification: (notification: PortfolioNotification) => void;
   onOpenGeminiChat?: () => void;
+  demoUsers?: Array<{ id: string; email: string; name: string; label: string; role: string; permissions: string[] }>;
+  currentDemoUser?: { id: string; email: string; name: string; label: string; role: string; permissions: string[] };
+  onSelectDemoUser?: React.Dispatch<React.SetStateAction<{ id: string; email: string; name: string; label: string; role: string; permissions: string[] }>>;
+  workerAgentStatuses?: Array<{ id: string; name: string; status: 'active' | 'idle' | 'error' | string; label: string; reason?: string; action?: string }>;
+  canCreateOkr?: boolean;
+  canExecuteLifecycle?: boolean;
+  canMonitor?: boolean;
+  canManagePolicy?: boolean;
 }
 
 const DEFAULT_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -200,13 +208,22 @@ export const Header: React.FC<HeaderProps> = ({
   onMarkAllNotificationsRead,
   onDismissNotification,
   onOpenNotification,
-  onOpenGeminiChat
+  onOpenGeminiChat,
+  demoUsers = [],
+  currentDemoUser,
+  onSelectDemoUser,
+  workerAgentStatuses = [],
+  canCreateOkr = true,
+  canExecuteLifecycle = true,
+  canMonitor = true,
+  canManagePolicy = true
 }) => {
   const { user, authReady, isSigningIn, authError, signInWithGoogle, signOutUser } = useFirebase();
   const navOrder = normalizeNavOrder(userPreferences.navButtonOrder);
   const [draggedView, setDraggedView] = useState<ActiveNavView | null>(null);
   const [dragOverView, setDragOverView] = useState<ActiveNavView | null>(null);
   const [isNavHelpOpen, setIsNavHelpOpen] = useState<boolean>(false);
+  const [isCompactWorkspaceView, setIsCompactWorkspaceView] = useState<boolean>(false);
 
   // Notification Center state
   const [isNotificationCenterOpen, setIsNotificationCenterOpen] = useState<boolean>(false);
@@ -219,6 +236,14 @@ export const Header: React.FC<HeaderProps> = ({
 
   const notificationContainerRef = useRef<HTMLDivElement | null>(null);
   const pipelineContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(max-width: 1024px)');
+    const syncWorkspaceViewMode = () => setIsCompactWorkspaceView(mediaQuery.matches);
+    syncWorkspaceViewMode();
+    mediaQuery.addEventListener('change', syncWorkspaceViewMode);
+    return () => mediaQuery.removeEventListener('change', syncWorkspaceViewMode);
+  }, []);
 
   useEffect(() => {
     const handlePointerDown = (e: MouseEvent) => {
@@ -359,12 +384,32 @@ export const Header: React.FC<HeaderProps> = ({
               </button>
             )}
 
+            {demoUsers.length > 0 && (
+              <div className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5 whitespace-nowrap shrink-0">
+                <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">User</span>
+                <select
+                  aria-label="Select demo application role"
+                  value={currentDemoUser?.id || demoUsers[0].id}
+                  onChange={(event) => {
+                    const nextUser = demoUsers.find((user) => user.id === event.target.value) || demoUsers[0];
+                    onSelectDemoUser?.(nextUser);
+                  }}
+                  className="max-w-[170px] bg-transparent text-xs font-semibold text-slate-700 focus:outline-none"
+                >
+                  {demoUsers.map((user) => (
+                    <option key={user.id} value={user.id}>{user.label} · {user.email}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
             {onOpenGovernance && (
               <button
                 type="button"
-                onClick={onOpenGovernance}
+                onClick={canManagePolicy ? onOpenGovernance : undefined}
+                disabled={!canManagePolicy}
                 aria-label="Configure Enterprise Governance, Policies & Org Data"
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 transition-all cursor-pointer whitespace-nowrap shrink-0"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <ShieldCheck className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
                 <span>Policies &amp; Org</span>
@@ -705,8 +750,8 @@ export const Header: React.FC<HeaderProps> = ({
               <button
                 type="button"
                 data-testid="orchestrate-pipeline-btn"
-                onClick={() => onRunFullOrchestration('full-pipeline')}
-                disabled={isOrchestratingAll}
+                onClick={() => canExecuteLifecycle && onRunFullOrchestration('full-pipeline')}
+                disabled={isOrchestratingAll || !canExecuteLifecycle}
                 aria-label={`Orchestrate ${selectedIndustry} OKR & Program Pipeline across Stages 1 through 6`}
                 title={`Run Stages 1–6 OKR & Program orchestration for ${industry.name}`}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-l-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-xs disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0 border border-indigo-600"
@@ -923,262 +968,301 @@ export const Header: React.FC<HeaderProps> = ({
           </span>
         </div>
 
-        {/* Primary Workspace Views Switcher, Executive Strip & Navigation Help */}
-        <div className="mt-2.5 pt-2.5 border-t border-slate-100 space-y-2.5">
-          <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs min-w-0">
-              <span className="inline-flex items-center gap-1.5 font-semibold text-slate-800 whitespace-nowrap">
-                <Compass className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-                <span>Primary Workspace Views</span>
-              </span>
-              <span className="text-slate-300" aria-hidden="true">|</span>
-              <span className="text-slate-600 truncate">
-                Active: <strong className="font-semibold text-slate-900">{activeMeta.label}</strong>
-                <span className="text-slate-400 mx-1.5" aria-hidden="true">·</span>
-                <span>{activeMeta.shortHint}</span>
-              </span>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3 shrink-0">
-              {/* Executive Metrics Summary */}
-              <div className="flex flex-wrap items-center gap-2.5 text-xs text-slate-600 tabular-nums">
-                <span className="inline-flex items-center gap-1 whitespace-nowrap">
-                  <Target className="w-3.5 h-3.5 text-indigo-600" />
-                  <span>Attainment <strong className="text-slate-900">{industry.attainment}%</strong></span>
-                </span>
-                <span className="text-slate-300" aria-hidden="true">·</span>
-                <span className="inline-flex items-center gap-1 whitespace-nowrap">
-                  <DollarSign className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Portfolio <strong className="text-slate-900">{industry.totalBudget}</strong></span>
-                </span>
-                <span className="text-slate-300" aria-hidden="true">·</span>
-                <span className="whitespace-nowrap">
-                  Agents Active <strong className="text-slate-900">{industry.activeAgents}</strong>
-                </span>
-                <StatusBadge status={industry.overallHealth} />
+        {workerAgentStatuses.length > 0 && (
+          <div className="mt-2.5 pt-2.5 border-t border-slate-100">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">
+                <span>Worker Agent Status</span>
               </div>
-
-              <button
-                type="button"
-                onClick={() => setIsNavHelpOpen((prev) => !prev)}
-                aria-expanded={isNavHelpOpen}
-                aria-controls="workspace-nav-help-panel"
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                  isNavHelpOpen
-                    ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
-                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50 hover:text-slate-900'
-                }`}
-              >
-                <HelpCircle className="w-3.5 h-3.5" />
-                <span>{isNavHelpOpen ? 'Close Nav Help' : 'Navigation Tips & Help'}</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Primary Workspace Rail */}
-          <nav
-            className="bg-slate-50/90 border border-slate-200 rounded-xl p-1.5 flex flex-wrap items-center gap-1.5"
-            aria-label="Primary Workspace Views"
-          >
-            {navOrder.map((view) => {
-              const meta = NAV_BUTTON_META[view];
-              const isPrimary = view === 'studio';
-              const isActive = activeView === view;
-              const isDragging = draggedView === view;
-              const isDropTarget = dragOverView === view && draggedView && draggedView !== view;
-
-              return (
-                <button
-                  key={view}
-                  type="button"
-                  data-nav-view={view}
-                  draggable={!isPrimary}
-                  onClick={() => onSelectView(view)}
-                  onDragStart={(e) => {
-                    if (isPrimary) {
-                      e.preventDefault();
-                      return;
-                    }
-                    setDraggedView(view);
-                    e.dataTransfer.effectAllowed = 'move';
-                    e.dataTransfer.setData('text/plain', view);
-                  }}
-                  onDragOver={(e) => {
-                    if (!draggedView || draggedView === view || draggedView === 'studio') return;
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = 'move';
-                    if (dragOverView !== view) {
-                      setDragOverView(view);
-                    }
-                  }}
-                  onDragLeave={() => {
-                    if (dragOverView === view) {
-                      setDragOverView(null);
-                    }
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    const source = (draggedView || e.dataTransfer.getData('text/plain')) as ActiveNavView;
-                    if (source && source !== 'studio' && source !== view) {
-                      commitNavOrder(reorderSecondaryNavButtons(navOrder, source, view));
-                    }
-                    setDraggedView(null);
-                    setDragOverView(null);
-                  }}
-                  onDragEnd={() => {
-                    setDraggedView(null);
-                    setDragOverView(null);
-                  }}
-                  onKeyDown={(e) => {
-                    if (isPrimary || !e.altKey) return;
-                    if (e.key === 'ArrowLeft') {
-                      e.preventDefault();
-                      commitNavOrder(shiftSecondaryNavButton(navOrder, view, 'prev'));
-                    } else if (e.key === 'ArrowRight') {
-                      e.preventDefault();
-                      commitNavOrder(shiftSecondaryNavButton(navOrder, view, 'next'));
-                    }
-                  }}
-                  title={
-                    isPrimary
-                      ? `Primary Workspace (Pinned First): ${meta.shortHint}`
-                      : `${meta.shortHint} — Drag tab or press Alt + Left/Right to reorder`
-                  }
-                  aria-label={meta.ariaLabel}
-                  aria-current={isActive ? 'page' : undefined}
-                  className={`group inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-all cursor-pointer select-none whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
-                    isPrimary
-                      ? isActive
-                        ? 'bg-indigo-600 text-white font-semibold shadow-xs border border-indigo-600'
-                        : 'bg-white text-indigo-800 font-semibold border border-indigo-300 hover:bg-indigo-50 shadow-2xs'
-                      : isActive
-                        ? 'bg-white text-slate-900 font-semibold shadow-xs border border-slate-300'
-                        : 'bg-transparent text-slate-600 font-medium border border-transparent hover:bg-white/80 hover:text-slate-900 hover:border-slate-200/80'
-                  } ${isDragging ? 'opacity-50 scale-[0.98]' : ''} ${
-                    isDropTarget ? 'ring-2 ring-indigo-500 bg-indigo-50/80 border-indigo-300' : ''
-                  }`}
-                >
-                  {!isPrimary && (
-                    <GripVertical
-                      className={`w-3 h-3 shrink-0 cursor-grab transition-colors ${
-                        isActive ? 'text-slate-400' : 'text-slate-300 group-hover:text-slate-500'
-                      }`}
-                    />
-                  )}
-                  <span className={isPrimary ? (isActive ? 'text-white' : 'text-indigo-600') : isActive ? 'text-indigo-600' : 'text-slate-500 group-hover:text-slate-700'}>
-                    {meta.icon}
-                  </span>
-                  <span>{meta.label}</span>
-                  {isPrimary && (
-                    <span className={`text-[10px] font-medium pl-1 border-l ${isActive ? 'border-indigo-400 text-indigo-100' : 'border-indigo-200 text-indigo-600'}`}>
-                      Primary
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-
-            {isCustomNavOrder && (
-              <button
-                type="button"
-                onClick={() => commitNavOrder(DEFAULT_NAV_ORDER)}
-                aria-label="Reset navigation button order"
-                title="Reset action buttons to default sequence"
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-white border border-slate-200 transition-colors cursor-pointer whitespace-nowrap shrink-0 ml-auto"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Reset order</span>
-              </button>
-            )}
-          </nav>
-
-          {/* Subtle Always-Available Navigation Tip Line */}
-          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 px-0.5">
-            <span>
-              <strong className="font-semibold text-slate-700">Tip:</strong> Drag any secondary workspace tab or press{' '}
-              <kbd className="px-1.5 py-0.5 rounded border border-slate-200 bg-slate-50 font-mono text-[10px] text-slate-700">Alt + ←/→</kbd>{' '}
-              while focused to save your preferred sequence. <span className="text-slate-400">·</span>{' '}
-              <span className="text-slate-700 font-medium">OKR &amp; Program Studio</span> stays pinned first for quick health checks and overrides.
-            </span>
-            {!isNavHelpOpen && (
-              <button
-                type="button"
-                onClick={() => setIsNavHelpOpen(true)}
-                className="text-indigo-600 hover:text-indigo-800 font-medium cursor-pointer whitespace-nowrap"
-              >
-                Browse view guide
-              </button>
-            )}
-          </div>
-
-          {/* Expandable Navigation Tips & Help Context Drawer */}
-          {isNavHelpOpen && (
-            <div
-              id="workspace-nav-help-panel"
-              className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <h2 className="text-xs font-bold text-slate-900">
-                    Workspace Navigation Guide &amp; Customization Tips
-                  </h2>
-                  <p className="text-[11px] text-slate-600 mt-0.5">
-                    Select any workspace below to navigate directly, or reorder secondary tabs to match your executive review cadence.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setIsNavHelpOpen(false)}
-                  aria-label="Close navigation help"
-                  className="p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-                {navOrder.map((view, idx) => {
-                  const meta = NAV_BUTTON_META[view];
-                  const isCurrent = activeView === view;
+              <div className="flex flex-wrap items-center gap-1.5">
+                {workerAgentStatuses.map((agent) => {
+                  const actionText = agent.action || 'Continue monitoring the current workflow.';
+                  const reasonText = agent.reason || 'Live status is healthy and ready for the next stage.';
                   return (
-                    <button
-                      key={view}
-                      type="button"
-                      onClick={() => {
-                        onSelectView(view);
-                        setIsNavHelpOpen(false);
-                      }}
-                      className={`text-left p-2.5 rounded-lg border transition-colors cursor-pointer flex flex-col justify-between gap-1.5 ${
-                        isCurrent
-                          ? 'bg-white border-indigo-500 ring-1 ring-indigo-500/20'
-                          : 'bg-white border-slate-200 hover:border-slate-300'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 truncate">
-                          <span className="text-indigo-600 shrink-0">{meta.icon}</span>
-                          <span className="truncate">{meta.label}</span>
-                        </span>
-                        <span className="text-[10px] font-mono text-slate-400 tabular-nums shrink-0">
-                          {view === 'studio' ? 'Pinned #1' : `#${idx + 1}`}
-                        </span>
+                    <div key={agent.id} className="group relative inline-flex">
+                      <div
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-semibold ${
+                          agent.status === 'active'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                            : agent.status === 'error'
+                            ? 'border-red-200 bg-red-50 text-red-700'
+                            : 'border-slate-200 bg-slate-50 text-slate-600'
+                        }`}
+                        title={`${agent.name}: ${reasonText}`}
+                      >
+                        <span className={`inline-block h-2 w-2 rounded-full ${
+                          agent.status === 'active' ? 'bg-emerald-500' : agent.status === 'error' ? 'bg-red-500' : 'bg-slate-400'
+                        }`} />
+                        <span>{agent.name}</span>
+                        <span className="text-[9px] uppercase">{agent.label}</span>
                       </div>
-                      <p className="text-[11px] text-slate-600 leading-relaxed line-clamp-2">
-                        {meta.helpSummary}
-                      </p>
-                      <div className="flex items-center justify-between text-[10px] font-medium pt-0.5">
-                        <span className={isCurrent ? 'text-indigo-700' : 'text-slate-500'}>
-                          {isCurrent ? 'Currently open' : 'Open view'}
-                        </span>
-                        <ArrowRight className="w-3 h-3 text-slate-400" />
+
+                      <div className="pointer-events-none absolute left-1/2 top-full z-40 mt-2 w-64 -translate-x-1/2 rounded-xl border border-slate-200 bg-white p-2.5 shadow-lg opacity-0 translate-y-[-4px] group-hover:opacity-100 group-hover:translate-y-0 transition-all duration-200">
+                        <div className="text-[9px] font-bold uppercase tracking-[0.12em] text-slate-500">Agent Status</div>
+                        <p className="mt-1 text-[11px] font-semibold text-slate-800">{reasonText}</p>
+                        <p className="mt-1 text-[10px] text-slate-600">Action: {actionText}</p>
                       </div>
-                    </button>
+                    </div>
                   );
                 })}
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        )}
+
+        {!isCompactWorkspaceView && (
+          <div className="mt-2.5 pt-2.5 border-t border-slate-100 space-y-2.5">
+            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs min-w-0">
+                <span className="inline-flex items-center gap-1.5 font-semibold text-slate-800 whitespace-nowrap">
+                  <Compass className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                  <span>Primary Workspace Views</span>
+                </span>
+                <span className="text-slate-300" aria-hidden="true">|</span>
+                <span className="text-slate-600 truncate">
+                  Active: <strong className="font-semibold text-slate-900">{activeMeta.label}</strong>
+                  <span className="text-slate-400 mx-1.5" aria-hidden="true">·</span>
+                  <span>{activeMeta.shortHint}</span>
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 shrink-0">
+                <div className="flex flex-wrap items-center gap-2.5 text-xs text-slate-600 tabular-nums">
+                  <span className="inline-flex items-center gap-1 whitespace-nowrap">
+                    <Target className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>Attainment <strong className="text-slate-900">{industry.attainment}%</strong></span>
+                  </span>
+                  <span className="text-slate-300" aria-hidden="true">·</span>
+                  <span className="inline-flex items-center gap-1 whitespace-nowrap">
+                    <DollarSign className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Portfolio <strong className="text-slate-900">{industry.totalBudget}</strong></span>
+                  </span>
+                  <span className="text-slate-300" aria-hidden="true">·</span>
+                  <span className="whitespace-nowrap">
+                    Agents Active <strong className="text-slate-900">{industry.activeAgents}</strong>
+                  </span>
+                  <StatusBadge status={industry.overallHealth} />
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setIsNavHelpOpen((prev) => !prev)}
+                  aria-expanded={isNavHelpOpen}
+                  aria-controls="workspace-nav-help-panel"
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                    isNavHelpOpen
+                      ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50 hover:text-slate-900'
+                  }`}
+                >
+                  <HelpCircle className="w-3.5 h-3.5" />
+                  <span>{isNavHelpOpen ? 'Close Nav Help' : 'Navigation Tips & Help'}</span>
+                </button>
+              </div>
+            </div>
+
+            <nav
+              className="bg-slate-50/90 border border-slate-200 rounded-xl p-1.5 flex flex-wrap items-center gap-1.5"
+              aria-label="Primary Workspace Views"
+            >
+              {navOrder.map((view) => {
+                const meta = NAV_BUTTON_META[view];
+                const isPrimary = view === 'studio';
+                const isActive = activeView === view;
+                const isDragging = draggedView === view;
+                const isDropTarget = dragOverView === view && draggedView && draggedView !== view;
+
+                return (
+                  <button
+                    key={view}
+                    type="button"
+                    data-nav-view={view}
+                    draggable={!isPrimary}
+                    onClick={() => onSelectView(view)}
+                    onDragStart={(e) => {
+                      if (isPrimary) {
+                        e.preventDefault();
+                        return;
+                      }
+                      setDraggedView(view);
+                      e.dataTransfer.effectAllowed = 'move';
+                      e.dataTransfer.setData('text/plain', view);
+                    }}
+                    onDragOver={(e) => {
+                      if (!draggedView || draggedView === view || draggedView === 'studio') return;
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'move';
+                      if (dragOverView !== view) {
+                        setDragOverView(view);
+                      }
+                    }}
+                    onDragLeave={() => {
+                      if (dragOverView === view) {
+                        setDragOverView(null);
+                      }
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const source = (draggedView || e.dataTransfer.getData('text/plain')) as ActiveNavView;
+                      if (source && source !== 'studio' && source !== view) {
+                        commitNavOrder(reorderSecondaryNavButtons(navOrder, source, view));
+                      }
+                      setDraggedView(null);
+                      setDragOverView(null);
+                    }}
+                    onDragEnd={() => {
+                      setDraggedView(null);
+                      setDragOverView(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (isPrimary || !e.altKey) return;
+                      if (e.key === 'ArrowLeft') {
+                        e.preventDefault();
+                        commitNavOrder(shiftSecondaryNavButton(navOrder, view, 'prev'));
+                      } else if (e.key === 'ArrowRight') {
+                        e.preventDefault();
+                        commitNavOrder(shiftSecondaryNavButton(navOrder, view, 'next'));
+                      }
+                    }}
+                    title={
+                      isPrimary
+                        ? `Primary Workspace (Pinned First): ${meta.shortHint}`
+                        : `${meta.shortHint} — Drag tab or press Alt + Left/Right to reorder`
+                    }
+                    aria-label={meta.ariaLabel}
+                    aria-current={isActive ? 'page' : undefined}
+                    className={`group inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-all cursor-pointer select-none whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
+                      isPrimary
+                        ? isActive
+                          ? 'bg-indigo-600 text-white font-semibold shadow-xs border border-indigo-600'
+                          : 'bg-white text-indigo-800 font-semibold border border-indigo-300 hover:bg-indigo-50 shadow-2xs'
+                        : isActive
+                          ? 'bg-white text-slate-900 font-semibold shadow-xs border border-slate-300'
+                          : 'bg-transparent text-slate-600 font-medium border border-transparent hover:bg-white/80 hover:text-slate-900 hover:border-slate-200/80'
+                    } ${isDragging ? 'opacity-50 scale-[0.98]' : ''} ${
+                      isDropTarget ? 'ring-2 ring-indigo-500 bg-indigo-50/80 border-indigo-300' : ''
+                    }`}
+                  >
+                    {!isPrimary && (
+                      <GripVertical
+                        className={`w-3 h-3 shrink-0 cursor-grab transition-colors ${
+                          isActive ? 'text-slate-400' : 'text-slate-300 group-hover:text-slate-500'
+                        }`}
+                      />
+                    )}
+                    <span className={isPrimary ? (isActive ? 'text-white' : 'text-indigo-600') : isActive ? 'text-indigo-600' : 'text-slate-500 group-hover:text-slate-700'}>
+                      {meta.icon}
+                    </span>
+                    <span>{meta.label}</span>
+                    {isPrimary && (
+                      <span className={`text-[10px] font-medium pl-1 border-l ${isActive ? 'border-indigo-400 text-indigo-100' : 'border-indigo-200 text-indigo-600'}`}>
+                        Primary
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+
+              {isCustomNavOrder && (
+                <button
+                  type="button"
+                  onClick={() => commitNavOrder(DEFAULT_NAV_ORDER)}
+                  aria-label="Reset navigation button order"
+                  title="Reset action buttons to default sequence"
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-white border border-slate-200 transition-colors cursor-pointer whitespace-nowrap shrink-0 ml-auto"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset order</span>
+                </button>
+              )}
+            </nav>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 px-0.5">
+              <span>
+                <strong className="font-semibold text-slate-700">Tip:</strong> Drag any secondary workspace tab or press{' '}
+                <kbd className="px-1.5 py-0.5 rounded border border-slate-200 bg-slate-50 font-mono text-[10px] text-slate-700">Alt + ←/→</kbd>{' '}
+                while focused to save your preferred sequence. <span className="text-slate-400">·</span>{' '}
+                <span className="text-slate-700 font-medium">OKR &amp; Program Studio</span> stays pinned first for quick health checks and overrides.
+              </span>
+              {!isNavHelpOpen && (
+                <button
+                  type="button"
+                  onClick={() => setIsNavHelpOpen(true)}
+                  className="text-indigo-600 hover:text-indigo-800 font-medium cursor-pointer whitespace-nowrap"
+                >
+                  Browse view guide
+                </button>
+              )}
+            </div>
+
+            {isNavHelpOpen && (
+              <div
+                id="workspace-nav-help-panel"
+                className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-xs font-bold text-slate-900">
+                      Workspace Navigation Guide &amp; Customization Tips
+                    </h2>
+                    <p className="text-[11px] text-slate-600 mt-0.5">
+                      Select any workspace below to navigate directly, or reorder secondary tabs to match your executive review cadence.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsNavHelpOpen(false)}
+                    aria-label="Close navigation help"
+                    className="p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                  {navOrder.map((view, idx) => {
+                    const meta = NAV_BUTTON_META[view];
+                    const isCurrent = activeView === view;
+                    return (
+                      <button
+                        key={view}
+                        type="button"
+                        onClick={() => {
+                          onSelectView(view);
+                          setIsNavHelpOpen(false);
+                        }}
+                        className={`text-left p-2.5 rounded-lg border transition-colors cursor-pointer flex flex-col justify-between gap-1.5 ${
+                          isCurrent
+                            ? 'bg-white border-indigo-500 ring-1 ring-indigo-500/20'
+                            : 'bg-white border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-900 truncate">
+                            <span className="text-indigo-600 shrink-0">{meta.icon}</span>
+                            <span className="truncate">{meta.label}</span>
+                          </span>
+                          <span className="text-[10px] font-mono text-slate-400 tabular-nums shrink-0">
+                            {view === 'studio' ? 'Pinned #1' : `#${idx + 1}`}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-600 leading-relaxed line-clamp-2">
+                          {meta.helpSummary}
+                        </p>
+                        <div className="flex items-center justify-between text-[10px] font-medium pt-0.5">
+                          <span className={isCurrent ? 'text-indigo-700' : 'text-slate-500'}>
+                            {isCurrent ? 'Currently open' : 'Open view'}
+                          </span>
+                          <ArrowRight className="w-3 h-3 text-slate-400" />
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );

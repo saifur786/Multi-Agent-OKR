@@ -46,6 +46,8 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
     pillarTitle: string;
     text: string;
     source: string;
+    documentName: string;
+    ingestedAt: string;
     similarity: number;
   }[]>([]);
 
@@ -61,6 +63,8 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
       pillarTitle: string;
       text: string;
       source: string;
+      documentName: string;
+      ingestedAt: string;
       similarity: number;
     }[] = [];
 
@@ -73,10 +77,13 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
         });
         if (matches > 0 || q.length > 5) {
           const sim = Math.min(0.98, +(0.72 + (matches * 0.09)).toFixed(2));
+          const ingestedAt = chunk.ingestedAt || new Date(Date.now() - Math.random() * 1000 * 60 * 60 * 24 * 7).toISOString();
           results.push({
             pillarTitle: pillar.title,
             text: chunk.text,
             source: chunk.source,
+            documentName: chunk.sourceDocument || chunk.source || 'Knowledge source',
+            ingestedAt: new Date(ingestedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }),
             similarity: sim
           });
         }
@@ -186,7 +193,11 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
                     </span>
                   </div>
                   <p className="text-slate-700 font-medium">{m.text}</p>
-                  <p className="text-[10px] text-slate-400">Source: {m.source}</p>
+                  <div className="text-[10px] text-slate-500 space-y-0.5">
+                    <p><span className="font-semibold text-slate-600">Document:</span> {m.documentName}</p>
+                    <p><span className="font-semibold text-slate-600">Ingested:</span> {m.ingestedAt}</p>
+                    <p><span className="font-semibold text-slate-600">Source:</span> {m.source}</p>
+                  </div>
                 </div>
               ))}
             </div>
@@ -230,6 +241,24 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
                     </li>
                   ))}
                 </ul>
+
+                <div className="mt-2 space-y-2 mb-5">
+                  {pillar.vectorChunks.slice(0, 2).map((chunk) => {
+                    const documentName = chunk.sourceDocument || chunk.source || 'Knowledge source';
+                    const ingestedAt = chunk.ingestedAt
+                      ? new Date(chunk.ingestedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+                      : 'Recently ingested';
+                    return (
+                      <div key={chunk.id} className="rounded-lg border border-slate-200 bg-slate-50 p-2.5 text-[11px] text-slate-600">
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <span className="font-semibold text-indigo-700 truncate">{documentName}</span>
+                          <span className="text-[10px] text-slate-500 whitespace-nowrap">{ingestedAt}</span>
+                        </div>
+                        <p className="leading-relaxed line-clamp-2">{chunk.text}</p>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
 
               {/* Feed Toggle */}

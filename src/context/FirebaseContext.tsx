@@ -48,10 +48,15 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error: any) {
+      const code = error?.code;
       const message =
-        error?.code === 'auth/popup-closed-by-user'
+        code === 'auth/popup-closed-by-user'
           ? 'Google sign-in popup was closed before completion.'
-          : error?.message || 'Google sign-in failed.';
+          : code === 'auth/unauthorized-domain'
+            ? 'Firebase Auth is blocking localhost. Add localhost to Firebase Authentication > Settings > Authorized domains, and ensure the Google sign-in provider is enabled.'
+            : code === 'auth/operation-not-allowed'
+              ? 'Google sign-in is not enabled for this Firebase project. Turn on Google as a sign-in method in Firebase Authentication.'
+              : error?.message || 'Google sign-in failed.';
       setAuthError(message);
     } finally {
       setIsSigningIn(false);

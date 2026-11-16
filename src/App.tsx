@@ -4,6 +4,35 @@
  */
 
 import React, { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'react';
+import {
+  Activity,
+  AlertTriangle,
+  ChevronLeft,
+  ChevronRight,
+  Database,
+  Flame,
+  Layers,
+  LineChart as LineChartIcon,
+  ShieldCheck,
+  Sliders,
+  Target,
+  TrendingUp,
+  Users
+} from 'lucide-react';
+import { createUserWithEmailAndPassword, updateProfile } from 'firebase/auth';
+import { auth } from './lib/firebase';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  BarChart,
+  Bar,
+  Legend
+} from 'recharts';
 import { INDUSTRY_DATA } from './data/industryData';
 import {
   IndustryKey,
@@ -28,7 +57,9 @@ import {
   DEFAULT_NAV_ORDER,
   areNavOrdersEqual,
   loadPersistedUserPreferences,
+  normalizeNavOrder,
   normalizeUserPreferences,
+  reorderSecondaryNavButtons,
   savePersistedUserPreferences
 } from './utils/navOrder';
 import {
@@ -155,6 +186,90 @@ const mergeIndustryWithFallback = (
   });
 };
 
+type DemoUserRole = 'super-admin' | 'okr-creator' | 'monitor' | 'policy-manager';
+
+export interface DemoUserProfile {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  permissions: string[];
+  label: string;
+}
+
+const DEMO_USERS: DemoUserProfile[] = [
+  {
+    id: 'super-admin',
+    email: 'saifur.rahman.au@gmail',
+    name: 'Saifur Rahman',
+    role: 'super-admin',
+    label: 'Super Admin',
+    permissions: ['all']
+  },
+  {
+    id: 'okr-creator',
+    email: 'strategy.ops@demo.local',
+    name: 'Alicia Stone',
+    role: 'okr-creator',
+    label: 'OKR Creator',
+    permissions: ['create-okr', 'execute-lifecycle']
+  },
+  {
+    id: 'monitor',
+    email: 'ops.monitor@demo.local',
+    name: 'Marcus Liu',
+    role: 'monitor',
+    label: 'Operations Monitor',
+    permissions: ['monitor', 'trace', 'notify']
+  },
+  {
+    id: 'policy-manager',
+    email: 'policy.admin@demo.local',
+    name: 'Nadia Flores',
+    role: 'policy-manager',
+    label: 'Policy Manager',
+    permissions: ['manage-policy', 'view-dashboards']
+  }
+];
+
+type AdminUserRecord = {
+  id: string;
+  uid?: string;
+  name: string;
+  email: string;
+  role: string;
+  industry: string;
+  permissions: string[];
+  status: 'pending' | 'invited' | 'active';
+  firebaseEnabled: boolean;
+  invitedAt?: string;
+  createdAt: string;
+};
+
+const WORKSPACE_VIEW_ICONS: Record<ActiveNavView, React.ComponentType<{ className?: string }>> = {
+  lifecycle: Activity,
+  studio: Sliders,
+  traceability: Layers,
+  knowledge: Database,
+  trajectory: TrendingUp,
+  strategy: Target,
+  advisory: Users,
+  performance: LineChartIcon,
+  heatmap: Flame
+};
+
+const WORKSPACE_VIEWS: Array<{ id: ActiveNavView; label: string; description: string }> = [
+  { id: 'lifecycle', label: 'Lifecycle', description: '6-stage orchestration and worker status' },
+  { id: 'studio', label: 'OKR Studio', description: 'Business problem management and draft review' },
+  { id: 'traceability', label: 'Traceability', description: '7-layer dependency mapping and system health' },
+  { id: 'knowledge', label: 'Knowledge Base', description: '5-pillar AI memory and vector search' },
+  { id: 'trajectory', label: 'Trajectory', description: 'Target vs predicted execution curve' },
+  { id: 'strategy', label: 'Portfolio Planner', description: 'Funding and strategic allocation models' },
+  { id: 'advisory', label: 'Advisory', description: 'Committee outcomes and policy recommendations' },
+  { id: 'performance', label: 'Accuracy', description: 'Regression quality and benchmark analytics' },
+  { id: 'heatmap', label: 'Heatmap', description: 'Utilisation, load, and staffing hotspots' }
+];
+
 export default function App() {
   // Dynamic Industries Dictionary (includes defaults + user-created custom industries)
   const [industriesDict, setIndustriesDict] = useState<Record<string, IndustryDataBundle>>(
@@ -164,16 +279,60 @@ export default function App() {
   const industriesList = useMemo(() => Object.keys(industriesDict), [industriesDict]);
 
   const [selectedIndustry, setSelectedIndustry] = useState<string>('Telco');
-  const [activeView, setActiveView] = useState<ActiveNavView>('lifecycle');
+  const [activeView, setActiveView] = useState<ActiveNavView>('studio');
+  const [isNavCollapsed, setIsNavCollapsed] = useState<boolean>(false);
+  const [isInsightsCollapsed, setIsInsightsCollapsed] = useState<boolean>(false);
+  const [activeDemoUser, setActiveDemoUser] = useState<DemoUserProfile>(DEMO_USERS[0]);
+  const [adminUsers, setAdminUsers] = useState<AdminUserRecord[]>([]);
+  const [industryDraft, setIndustryDraft] = useState({
+    name: 'FinTech',
+    sector: 'Financial Services',
+    quarter: 'Q2 2027',
+    description: 'Digital finance operating model with policy-driven risk controls.'
+  });
+  const [policyDraft, setPolicyDraft] = useState({
+    name: 'Enterprise Risk Guardrail',
+    type: 'Governance',
+    severity: 'High',
+    description: 'Mandatory review for pricing, compliance, and operational risk before launch.'
+  });
+  const [inviteDraft, setInviteDraft] = useState({
+    name: 'Ava Clarke',
+    email: 'ava.clarke@demo.local',
+    role: 'okr-creator',
+    industry: 'Telco',
+    permissions: 'create-okr,execute-lifecycle'
+  });
+  const [registrationDraft, setRegistrationDraft] = useState({
+    name: 'Ava Clarke',
+    email: 'ava.clarke@demo.local',
+    password: 'Welcome123!',
+    confirmPassword: 'Welcome123!',
+    role: 'okr-creator',
+    industry: 'Telco'
+  });
+  const [adminMessage, setAdminMessage] = useState<string | null>(null);
+  const [isSubmittingAdmin, setIsSubmittingAdmin] = useState(false);
+  const [isRegisteringUser, setIsRegisteringUser] = useState(false);
   const [userPreferences, setUserPreferences] = useState<UserPreferences>(() => loadPersistedUserPreferences());
   const [activeStageId, setActiveStageId] = useState<number>(1);
   const [isEventBusOpen, setIsEventBusOpen] = useState<boolean>(false);
   const [isOrchestratingAll, setIsOrchestratingAll] = useState<boolean>(false);
   const { user, authReady } = useFirebase();
   const isVerifiedFirebaseUser = Boolean(authReady && user && user.emailVerified);
+  const isSuperAdmin = activeDemoUser.role === 'super-admin';
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(max-width: 1024px)');
+    const syncCollapsedState = () => setIsNavCollapsed(mediaQuery.matches);
+    syncCollapsedState();
+    mediaQuery.addEventListener('change', syncCollapsedState);
+    return () => mediaQuery.removeEventListener('change', syncCollapsedState);
+  }, []);
   const [isAddCustomIndustryOpen, setIsAddCustomIndustryOpen] = useState<boolean>(false);
   const [isGovernanceOpen, setIsGovernanceOpen] = useState<boolean>(false);
+  const [isAdminConsoleOpen, setIsAdminConsoleOpen] = useState<boolean>(false);
   const [isGeminiChatOpen, setIsGeminiChatOpen] = useState<boolean>(false);
+  const [draggedNavView, setDraggedNavView] = useState<ActiveNavView | null>(null);
   const [readNotificationIds, setReadNotificationIds] = useState<string[]>([]);
   const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>([]);
   const [lastOrchestrationSummary, setLastOrchestrationSummary] = useState<IndustryOrchestrationSummary | null>(null);
@@ -361,6 +520,20 @@ export default function App() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (activeDemoUser.role !== 'super-admin') return;
+    void fetch('/api/admin/users')
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload) => {
+        if (Array.isArray(payload?.users)) {
+          setAdminUsers(payload.users as AdminUserRecord[]);
+        }
+      })
+      .catch(() => {
+        setAdminUsers([]);
+      });
+  }, [activeDemoUser.role]);
 
   // Sync user preferences with Firestore when authenticated
   useEffect(() => {
@@ -795,6 +968,349 @@ export default function App() {
 
   const activeFedCount = Object.values(fedPillars).filter(Boolean).length;
 
+  const orchestrationInsights = useMemo(() => {
+    const stages = ['Strategy Explorer', 'OKR Quality', 'Alignment', 'Risk Radar', 'Executive Reporting', 'Retrospective'];
+    return Array.from({ length: 10 }, (_, index) => ({
+      run: `Run ${index + 1}`,
+      stage: stages[index % stages.length],
+      successRate: 92 - index * 1.3 + (index % 3) * 0.6,
+      latencyMs: 1260 + index * 180 - (index % 5) * 75,
+      activeStage: (index % 6) + 1
+    }));
+  }, []);
+
+  const [liveWorkerAgentStatuses, setLiveWorkerAgentStatuses] = useState<Array<{
+    id: string;
+    name: string;
+    status: 'active' | 'idle' | 'error';
+    label: string;
+    reason?: string;
+    action?: string;
+  }>>([]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadWorkerAgentStatus = async () => {
+      try {
+        const response = await fetch(`/api/worker-agent-status?industry=${encodeURIComponent(selectedIndustry)}`);
+        if (!response.ok) {
+          return;
+        }
+        const payload = await response.json();
+        const agentStatuses = Array.isArray(payload?.agentStatuses) ? payload.agentStatuses : [];
+        if (!isMounted || agentStatuses.length === 0) {
+          return;
+        }
+        setLiveWorkerAgentStatuses(agentStatuses.map((agent: any) => {
+          const status = agent.status === 'error' ? 'error' : agent.status === 'active' ? 'active' : 'idle';
+          return {
+            id: String(agent.id || agent.name || Math.random()),
+            name: String(agent.name || 'Worker Agent'),
+            status: status as 'active' | 'idle' | 'error',
+            label: String(agent.label || (status === 'error' ? 'Error' : status === 'active' ? 'Active' : 'Idle')),
+            reason: typeof agent.reason === 'string' ? agent.reason : undefined,
+            action: typeof agent.action === 'string' ? agent.action : undefined
+          };
+        }));
+      } catch {
+        // Fallback to the deterministic local status view below.
+      }
+    };
+
+    void loadWorkerAgentStatus();
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedIndustry, activeDisasters.length, activeStageId, isOrchestratingAll]);
+
+  const workerAgentStatuses = useMemo<Array<{ id: string; name: string; status: 'active' | 'idle' | 'error'; label: string; reason?: string; action?: string }>>(() => {
+    const workerNames = [
+      'Strategy Explorer',
+      'OKR Quality Auditor',
+      'Alignment Capacity Agent',
+      'Risk Sentinel',
+      'Executive Reporter',
+      'Retrospective Learner'
+    ];
+
+    const baseStatuses: Array<{
+      id: string;
+      name: string;
+      status: 'active' | 'idle' | 'error';
+      label: string;
+      reason: string;
+      action: string;
+    }> = workerNames.map((name, index) => {
+      const isInErrorState = activeDisasters.length > 0 && [1, 3, 5].includes(index);
+      const isActive = isOrchestratingAll && activeStageId === index + 1;
+      const status: 'active' | 'idle' | 'error' = isInErrorState ? 'error' : isActive ? 'active' : 'idle';
+
+      return {
+        id: `${index + 1}`,
+        name,
+        status,
+        label: isInErrorState ? 'Error' : isActive ? 'Active' : 'Idle',
+        reason: isInErrorState
+          ? 'Detected operational drift or a risk signal that requires human review before the next stage continues.'
+          : isActive
+            ? 'Healthy orchestration path — this agent is actively processing the current stage.'
+            : 'Idle; waiting for the next orchestration event or intervention trigger.',
+        action: isInErrorState
+          ? 'Review the risk alert, collect the current evidence, then authorize the next safe remediation step.'
+          : isActive
+            ? 'Continue the active workflow and monitor the stage completion signal.'
+            : 'Await the next stage trigger and keep the queue ready for execution.'
+      };
+    });
+
+    if (liveWorkerAgentStatuses.length === 0) {
+      return baseStatuses;
+    }
+
+    return liveWorkerAgentStatuses.map((agent): {
+      id: string;
+      name: string;
+      status: 'active' | 'idle' | 'error';
+      label: string;
+      reason?: string;
+      action?: string;
+    } => ({
+      ...agent,
+      status: agent.status === 'error' ? 'error' : agent.status === 'active' ? 'active' : 'idle',
+      label: agent.label || (agent.status === 'error' ? 'Error' : agent.status === 'active' ? 'Active' : 'Idle'),
+      reason: agent.reason || 'Live status retrieved from the active orchestration telemetry.',
+      action: agent.action || 'Monitor the current stage and continue the recommended workflow.'
+    }));
+  }, [activeDisasters.length, activeStageId, isOrchestratingAll, liveWorkerAgentStatuses]);
+
+  const orderedWorkspaceViews = useMemo(() => {
+    const order = normalizeNavOrder(userPreferences.navButtonOrder);
+    return order
+      .map((viewId) => WORKSPACE_VIEWS.find((view) => view.id === viewId))
+      .filter((view): view is (typeof WORKSPACE_VIEWS)[number] => Boolean(view));
+  }, [userPreferences.navButtonOrder]);
+
+  const handleReorderLeftNav = useCallback((source: ActiveNavView, target: ActiveNavView) => {
+    const nextOrder = reorderSecondaryNavButtons(userPreferences.navButtonOrder, source, target);
+    handleUpdateNavButtonOrder(nextOrder);
+  }, [handleUpdateNavButtonOrder, userPreferences.navButtonOrder]);
+
+  const isCustomWorkspaceOrder = !areNavOrdersEqual(userPreferences.navButtonOrder, DEFAULT_NAV_ORDER);
+
+  const canCreateOkr =
+    activeDemoUser.role === 'super-admin' ||
+    activeDemoUser.permissions.includes('create-okr') ||
+    activeDemoUser.permissions.includes('all');
+  const canExecuteLifecycle =
+    activeDemoUser.role === 'super-admin' ||
+    activeDemoUser.permissions.includes('execute-lifecycle') ||
+    activeDemoUser.permissions.includes('all');
+  const canMonitor =
+    activeDemoUser.role === 'super-admin' ||
+    activeDemoUser.permissions.includes('monitor') ||
+    activeDemoUser.permissions.includes('trace') ||
+    activeDemoUser.permissions.includes('all');
+  const canManagePolicy =
+    activeDemoUser.role === 'super-admin' ||
+    activeDemoUser.permissions.includes('manage-policy') ||
+    activeDemoUser.permissions.includes('all');
+
+  const handleCreateIndustry = async () => {
+    if (!industryDraft.name.trim()) {
+      setAdminMessage('Industry name is required.');
+      return;
+    }
+    setIsSubmittingAdmin(true);
+    setAdminMessage(null);
+    try {
+      const id = industryDraft.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const response = await fetch('/api/admin/industries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...industryDraft,
+          id,
+          policies: [policyDraft.name]
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Failed to create industry.');
+      }
+      const normalizedIndustry = normalizeIndustryBundle({
+        ...payload.industry,
+        id: payload.industry.id || id,
+        name: payload.industry.name,
+        sector: payload.industry.sector || 'Enterprise',
+        quarter: payload.industry.quarter || 'Q1 2027',
+        orgDirectory: payload.industry.orgDirectory || [],
+        policies: payload.industry.policies || [],
+        programs: payload.industry.programs || [],
+        activeDisasters: payload.industry.activeDisasters || [],
+        knowledgeBase: payload.industry.knowledgeBase || [],
+        traceability: payload.industry.traceability || {},
+        nodeMap: payload.industry.nodeMap || {}
+      });
+      setIndustriesDict((prev) => ({ ...prev, [normalizedIndustry.name]: normalizedIndustry }));
+      setSelectedIndustry(normalizedIndustry.name);
+      setIndustryDraft({
+        name: 'FinTech',
+        sector: 'Financial Services',
+        quarter: 'Q2 2027',
+        description: 'Digital finance operating model with policy-driven risk controls.'
+      });
+      setAdminMessage(`Industry “${payload.industry.name}” created and saved to MongoDB or in-memory store.`);
+    } catch (error) {
+      setAdminMessage(error instanceof Error ? error.message : 'Industry could not be created.');
+    } finally {
+      setIsSubmittingAdmin(false);
+    }
+  };
+
+  const handleCreatePolicy = async () => {
+    if (!policyDraft.name.trim() || !selectedIndustry.trim()) {
+      setAdminMessage('Policy name and an active industry are required.');
+      return;
+    }
+    setIsSubmittingAdmin(true);
+    try {
+      const response = await fetch('/api/admin/policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...policyDraft,
+          industry: selectedIndustry,
+          id: `${selectedIndustry}-${policyDraft.name}`.replace(/[^a-zA-Z0-9_-]+/g, '-').toLowerCase()
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Failed to add policy.');
+      }
+      setPolicies((prev) => [
+        ...prev,
+        {
+          id: payload.policy.id,
+          ruleName: payload.policy.name,
+          category: 'Ownership',
+          description: payload.policy.description,
+          minMeasurableScore: 70,
+          minAmbitionScore: 70,
+          maxKrsPerObjective: 3,
+          mandatoryMetadataFields: ['owner', 'targetDate', 'metrics'],
+          governanceFrequency: 'Monthly',
+          status: 'Enforced'
+        }
+      ]);
+      setAdminMessage(`Policy “${payload.policy.name}” was added to ${selectedIndustry}.`);
+    } catch (error) {
+      setAdminMessage(error instanceof Error ? error.message : 'Policy could not be saved.');
+    } finally {
+      setIsSubmittingAdmin(false);
+    }
+  };
+
+  const handleInviteUser = async () => {
+    if (!inviteDraft.name.trim() || !inviteDraft.email.trim() || !inviteDraft.industry.trim()) {
+      setAdminMessage('Invite requires name, email, and industry.');
+      return;
+    }
+    setIsSubmittingAdmin(true);
+    try {
+      const response = await fetch('/api/admin/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...inviteDraft,
+          permissions: inviteDraft.permissions.split(',').map((value) => value.trim()).filter(Boolean)
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Invite could not be sent.');
+      }
+      setRegistrationDraft((prev) => ({
+        ...prev,
+        name: inviteDraft.name,
+        email: inviteDraft.email,
+        role: inviteDraft.role,
+        industry: inviteDraft.industry
+      }));
+      setAdminUsers((prev) => [{
+        id: payload.invite.id,
+        name: payload.invite.name,
+        email: payload.invite.email,
+        role: payload.invite.role,
+        industry: payload.invite.industry,
+        permissions: payload.invite.permissions || [],
+        status: 'invited',
+        firebaseEnabled: true,
+        createdAt: payload.invite.createdAt
+      }, ...prev]);
+      setAdminMessage(`Registration invite sent to ${inviteDraft.email}. Share the registration link or complete onboarding below.`);
+    } catch (error) {
+      setAdminMessage(error instanceof Error ? error.message : 'Failed to create invitation.');
+    } finally {
+      setIsSubmittingAdmin(false);
+    }
+  };
+
+  const handleCompleteFirebaseRegistration = async () => {
+    if (!registrationDraft.email.trim() || !registrationDraft.password.trim()) {
+      setAdminMessage('Email and password are required to complete the registration flow.');
+      return;
+    }
+    if (registrationDraft.password !== registrationDraft.confirmPassword) {
+      setAdminMessage('Password and confirm password must match.');
+      return;
+    }
+    setIsRegisteringUser(true);
+    setAdminMessage(null);
+    try {
+      const credential = await createUserWithEmailAndPassword(
+        auth,
+        registrationDraft.email.trim(),
+        registrationDraft.password
+      );
+      await updateProfile(credential.user, { displayName: registrationDraft.name.trim() || registrationDraft.email.trim() });
+      const response = await fetch('/api/admin/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uid: credential.user.uid,
+          name: registrationDraft.name,
+          email: registrationDraft.email,
+          role: registrationDraft.role,
+          industry: registrationDraft.industry,
+          permissions: inviteDraft.permissions.split(',').map((value) => value.trim()).filter(Boolean)
+        })
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error || 'Firebase registration completed, but the app profile could not be saved.');
+      }
+      setAdminUsers((prev) => [{
+        id: payload.user.id,
+        uid: payload.user.uid,
+        name: payload.user.name,
+        email: payload.user.email,
+        role: payload.user.role,
+        industry: payload.user.industry,
+        permissions: payload.user.permissions || [],
+        status: 'active',
+        firebaseEnabled: true,
+        createdAt: payload.user.createdAt
+      }, ...prev]);
+      setAdminMessage(`Registration completed for ${registrationDraft.email}. Firebase auth and Mongo/local persistence are both active.`);
+      setRegistrationDraft((prev) => ({ ...prev, password: '', confirmPassword: '' }));
+    } catch (error) {
+      setAdminMessage(error instanceof Error ? error.message : 'Registration failed.');
+    } finally {
+      setIsRegisteringUser(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans flex flex-col">
       {/* Global Navigation & Brand Header */}
@@ -824,59 +1340,374 @@ export default function App() {
         onDismissNotification={handleDismissNotification}
         onOpenNotification={handleOpenNotification}
         onOpenGeminiChat={() => setIsGeminiChatOpen(true)}
+        demoUsers={DEMO_USERS}
+        currentDemoUser={activeDemoUser}
+        onSelectDemoUser={setActiveDemoUser}
+        workerAgentStatuses={workerAgentStatuses}
+        canCreateOkr={canCreateOkr}
+        canExecuteLifecycle={canExecuteLifecycle}
+        canMonitor={canMonitor}
+        canManagePolicy={canManagePolicy}
       />
 
       {/* Main Body */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full space-y-6">
-        {lastOrchestrationSummary && (
-          <section
-            data-testid="orchestration-run-summary"
-            aria-label="Latest Industry Orchestration Summary"
-            className="rounded-xl border border-indigo-200 bg-white px-4 py-3 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3"
-          >
-            <div className="space-y-1 min-w-0">
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-bold text-indigo-700 uppercase tracking-wide">
-                  Industry Orchestration Completed
-                </span>
-                <span className="text-slate-300" aria-hidden="true">·</span>
-                <span className="font-semibold text-slate-900 tabular-nums">
-                  {lastOrchestrationSummary.headline}
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-600 truncate">
-                {lastOrchestrationSummary.recommendations[0]}
-              </p>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full">
+        <div className={`grid grid-cols-1 gap-6 ${isNavCollapsed ? 'lg:grid-cols-[88px_minmax(0,1fr)] xl:grid-cols-[88px_minmax(0,1fr)]' : 'lg:grid-cols-[220px_minmax(0,1fr)] xl:grid-cols-[260px_minmax(0,1fr)]'}`}>
+          <aside className={`rounded-2xl border border-slate-200 bg-white p-3 shadow-sm h-fit sticky top-4 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 ${isNavCollapsed ? 'lg:w-[88px]' : 'lg:w-auto'}`}>
+            <div className="mb-3 flex items-center justify-between gap-2">
+              {!isNavCollapsed && (
+                <div className="min-w-0">
+                  <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-indigo-600">Primary Workspace Views</p>
+                  <h2 className="mt-2 text-base font-bold text-slate-900">Workspace Navigation</h2>
+                </div>
+              )}
               <button
                 type="button"
-                onClick={() => {
-                  setActiveView('studio');
-                  setRequestedStudioTarget({ tab: 'okrs', nonce: Date.now() });
-                }}
-                className="px-2.5 py-1 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold cursor-pointer whitespace-nowrap"
+                onClick={() => setIsNavCollapsed((prev) => !prev)}
+                aria-label={isNavCollapsed ? 'Expand workspace navigation' : 'Collapse workspace navigation'}
+                className="ml-auto inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300 hover:bg-white hover:text-slate-900 transition-colors"
               >
-                Review in OKR &amp; Program Studio
-              </button>
-              <button
-                type="button"
-                onClick={() => setLastOrchestrationSummary(null)}
-                className="px-2 py-1 rounded-lg border border-slate-200 text-slate-500 hover:text-slate-800 hover:bg-slate-50 text-xs font-medium cursor-pointer"
-              >
-                Dismiss
+                {isNavCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
               </button>
             </div>
-          </section>
-        )}
+            <nav className="grid gap-2">
+              {orderedWorkspaceViews.map((view) => {
+                const selected = activeView === view.id;
+                const Icon = WORKSPACE_VIEW_ICONS[view.id];
+                return (
+                  <button
+                    key={view.id}
+                    type="button"
+                    draggable
+                    onDragStart={(event) => {
+                      setDraggedNavView(view.id);
+                      event.dataTransfer.effectAllowed = 'move';
+                      event.dataTransfer.setData('text/plain', view.id);
+                    }}
+                    onDragOver={(event) => {
+                      if (!draggedNavView || draggedNavView === view.id) return;
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = 'move';
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const source = draggedNavView ?? (event.dataTransfer.getData('text/plain') as ActiveNavView | '');
+                      if (!source || source === view.id || source === 'studio') return;
+                      handleReorderLeftNav(source, view.id);
+                      setDraggedNavView(null);
+                    }}
+                    onDragEnd={() => setDraggedNavView(null)}
+                    onClick={() => setActiveView(view.id)}
+                    className={`group relative flex w-full items-center rounded-xl border px-2.5 py-2.5 text-left transition-all duration-200 ease-out ${isNavCollapsed ? 'justify-center' : 'gap-3'} ${
+                      selected
+                        ? 'border-indigo-200 bg-indigo-50 text-indigo-800 shadow-sm ring-1 ring-indigo-200'
+                        : 'border-slate-200 bg-slate-50 text-slate-700 hover:border-slate-300 hover:bg-white hover:shadow-sm'
+                    }`}
+                    aria-label={view.label}
+                    title={isNavCollapsed ? view.label : undefined}
+                  >
+                    {!isNavCollapsed && (
+                      <span className="absolute right-2 top-2 flex cursor-grab items-center justify-center rounded-md border border-slate-200 bg-white/80 p-1 text-slate-400 opacity-70 transition group-hover:opacity-100">
+                        <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
+                          <circle cx="8" cy="6" r="1.5" />
+                          <circle cx="8" cy="12" r="1.5" />
+                          <circle cx="8" cy="18" r="1.5" />
+                          <circle cx="16" cy="6" r="1.5" />
+                          <circle cx="16" cy="12" r="1.5" />
+                          <circle cx="16" cy="18" r="1.5" />
+                        </svg>
+                      </span>
+                    )}
+                    <span className={`flex h-10 w-10 items-center justify-center rounded-lg border transition-all ${
+                      selected
+                        ? 'border-indigo-200 bg-indigo-100 text-indigo-700 shadow-inner'
+                        : 'border-slate-200 bg-white text-slate-600 group-hover:border-slate-300 group-hover:text-slate-900'
+                    }`}>
+                      <Icon className="h-5 w-5" />
+                    </span>
+                    {!isNavCollapsed && (
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-semibold leading-none">{view.label}</span>
+                        <span className="mt-1 block text-[10px] leading-relaxed text-slate-500">{view.description}</span>
+                      </span>
+                    )}
+                    {!isNavCollapsed && selected && <span className="h-2.5 w-2.5 rounded-full bg-indigo-500 shadow-sm" />}
+                  </button>
+                );
+              })}
 
-        <Suspense
-          fallback={
-            <div className="rounded-2xl border border-slate-200 bg-white p-6 text-xs font-medium text-slate-500 shadow-xs">
-              Loading module...
-            </div>
-          }
-        >
+              {isCustomWorkspaceOrder && (
+                <button
+                  type="button"
+                  onClick={() => handleUpdateNavButtonOrder(DEFAULT_NAV_ORDER)}
+                  className="mt-1 flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-100 px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-600 transition-colors hover:bg-white hover:text-slate-900 cursor-pointer"
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                  Reset left nav order
+                </button>
+              )}
+
+              {isSuperAdmin && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveView('studio');
+                    setIsAdminConsoleOpen(true);
+                  }}
+                  className={`group relative flex w-full items-center rounded-xl border px-2.5 py-2.5 text-left transition-all duration-200 ease-out ${isNavCollapsed ? 'justify-center' : 'gap-3'} border-amber-200 bg-amber-50 text-amber-800 hover:border-amber-300 hover:bg-amber-100`}
+                  aria-label="Admin Console"
+                  title={isNavCollapsed ? 'Admin Console' : undefined}
+                >
+                  <span className="flex h-10 w-10 items-center justify-center rounded-lg border border-amber-200 bg-amber-100 text-amber-700">
+                    <ShieldCheck className="h-5 w-5" />
+                  </span>
+                  {!isNavCollapsed && (
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-semibold leading-none">Admin Console</span>
+                      <span className="mt-1 block text-[10px] leading-relaxed text-amber-700">Policies & user registration</span>
+                    </span>
+                  )}
+                </button>
+              )}
+            </nav>
+
+            {!isNavCollapsed && isSuperAdmin && (
+              <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-3 transition-all duration-200 hover:shadow-md">
+                <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-amber-700">Super Admin</p>
+                <h3 className="mt-2 text-sm font-bold text-slate-900">Industry & User Console</h3>
+                <ul className="mt-3 space-y-1.5 text-[11px] text-slate-700">
+                  <li>• Create industries and governance policies</li>
+                  <li>• Invite and register enterprise users</li>
+                  <li>• Link users to role-based permissions</li>
+                </ul>
+              </div>
+            )}
+          </aside>
+
+          <div className="space-y-6">
+            <section
+              className={`group rounded-2xl border border-slate-200 bg-white p-5 shadow-xs transition-all duration-300 hover:-translate-y-0.5 hover:shadow-lg hover:border-indigo-200 hover:bg-indigo-50/20 ${isInsightsCollapsed ? 'max-h-[92px] overflow-hidden' : ''}`}
+              onMouseEnter={() => setIsInsightsCollapsed(false)}
+              onMouseLeave={() => setIsInsightsCollapsed(true)}
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-indigo-600">Orchestration Insights</p>
+                  <h2 className="text-lg font-bold text-slate-900">6-Stage Multi-Agent Pipeline Health</h2>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-[11px] font-semibold text-indigo-700">
+                    <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
+                    Last 10 runs tracked
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsInsightsCollapsed((prev) => !prev)}
+                    className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-600 shadow-sm hover:bg-slate-50 hover:text-slate-900 cursor-pointer"
+                  >
+                    {isInsightsCollapsed ? 'Expand' : 'Collapse'}
+                  </button>
+                </div>
+              </div>
+
+              {!isInsightsCollapsed && (
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+                  <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div className="mb-2 text-xs font-semibold text-slate-700">Success Rate Trend</div>
+                    <ResponsiveContainer width="100%" height="90%">
+                      <LineChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                        <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+                        <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <YAxis domain={[70, 100]} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <Tooltip formatter={(value) => [`${Number(value ?? 0).toFixed(1)}%`, 'Success rate']} />
+                        <Legend />
+                        <Line type="monotone" dataKey="successRate" name="Success rate" stroke="#4f46e5" strokeWidth={3} dot={{ r: 3 }} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                    <div className="mb-2 text-xs font-semibold text-slate-700">Latency (ms)</div>
+                    <ResponsiveContainer width="100%" height="90%">
+                      <BarChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                        <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+                        <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <YAxis tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <Tooltip formatter={(value) => [`${Number(value ?? 0).toFixed(0)} ms`, 'Latency']} />
+                        <Legend />
+                        <Bar dataKey="latencyMs" name="Latency" fill="#14b8a6" radius={[6, 6, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+            </section>
+            {lastOrchestrationSummary && (
+              <section
+                data-testid="orchestration-run-summary"
+                aria-label="Latest Industry Orchestration Summary"
+                className="rounded-xl border border-indigo-200 bg-white px-4 py-3 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3"
+              >
+                <div className="space-y-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-bold text-indigo-700 uppercase tracking-wide">
+                      Industry Orchestration Completed
+                    </span>
+                    <span className="text-slate-300" aria-hidden="true">·</span>
+                    <span className="font-semibold text-slate-900 tabular-nums">
+                      {lastOrchestrationSummary.headline}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-600 truncate">
+                    {lastOrchestrationSummary.recommendations[0]}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveView('studio');
+                      setRequestedStudioTarget({ tab: 'okrs', nonce: Date.now() });
+                    }}
+                    className="px-2.5 py-1 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold cursor-pointer whitespace-nowrap"
+                  >
+                    Review in OKR &amp; Program Studio
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLastOrchestrationSummary(null)}
+                    className="px-2 py-1 rounded-lg border border-slate-200 text-slate-500 hover:text-slate-800 hover:bg-slate-50 text-xs font-medium cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </section>
+            )}
+
+            {isSuperAdmin && isAdminConsoleOpen && (
+              <section className="rounded-2xl border border-amber-200 bg-white p-5 shadow-xs">
+                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 pb-4 border-b border-slate-200">
+                  <div>
+                    <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-amber-700">Admin Console</p>
+                    <h3 className="text-lg font-bold text-slate-900">Industry Setup, Policies & User Registration</h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {adminMessage && (
+                      <span className="rounded-full bg-amber-100 text-amber-800 px-2.5 py-1 text-[10px] font-bold">{adminMessage}</span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setIsAdminConsoleOpen(false)}
+                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-600 hover:bg-slate-50 hover:text-slate-900 cursor-pointer"
+                    >
+                      Close Console
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-5 grid grid-cols-1 xl:grid-cols-3 gap-4">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <h4 className="text-sm font-bold text-slate-900">Create Industry</h4>
+                    <input value={industryDraft.name} onChange={(e) => setIndustryDraft((prev) => ({ ...prev, name: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Industry name" />
+                    <input value={industryDraft.sector} onChange={(e) => setIndustryDraft((prev) => ({ ...prev, sector: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Sector" />
+                    <input value={industryDraft.quarter} onChange={(e) => setIndustryDraft((prev) => ({ ...prev, quarter: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Quarter" />
+                    <textarea value={industryDraft.description} onChange={(e) => setIndustryDraft((prev) => ({ ...prev, description: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs min-h-[80px]" placeholder="Industry description" />
+                    <button type="button" onClick={handleCreateIndustry} disabled={isSubmittingAdmin} className="w-full rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-xs font-bold px-3 py-2 cursor-pointer">{isSubmittingAdmin ? 'Creating...' : 'Create Industry'}</button>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <h4 className="text-sm font-bold text-slate-900">Create Policy</h4>
+                    <input value={policyDraft.name} onChange={(e) => setPolicyDraft((prev) => ({ ...prev, name: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Policy name" />
+                    <select value={policyDraft.type} onChange={(e) => setPolicyDraft((prev) => ({ ...prev, type: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
+                      <option>Governance</option>
+                      <option>Cadence</option>
+                      <option>Ownership</option>
+                      <option>SMART Threshold</option>
+                    </select>
+                    <select value={policyDraft.severity} onChange={(e) => setPolicyDraft((prev) => ({ ...prev, severity: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
+                      <option>Low</option>
+                      <option>Medium</option>
+                      <option>High</option>
+                    </select>
+                    <textarea value={policyDraft.description} onChange={(e) => setPolicyDraft((prev) => ({ ...prev, description: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs min-h-[80px]" placeholder="Policy description" />
+                    <button type="button" onClick={handleCreatePolicy} disabled={isSubmittingAdmin} className="w-full rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-xs font-bold px-3 py-2 cursor-pointer">{isSubmittingAdmin ? 'Saving...' : 'Add Policy'}</button>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+                    <h4 className="text-sm font-bold text-slate-900">Invite & Register User</h4>
+                    <input value={inviteDraft.name} onChange={(e) => setInviteDraft((prev) => ({ ...prev, name: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Full name" />
+                    <input value={inviteDraft.email} onChange={(e) => setInviteDraft((prev) => ({ ...prev, email: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Email address" />
+                    <select value={inviteDraft.role} onChange={(e) => setInviteDraft((prev) => ({ ...prev, role: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
+                      <option value="okr-creator">OKR Creator</option>
+                      <option value="monitor">Operations Monitor</option>
+                      <option value="policy-manager">Policy Manager</option>
+                      <option value="super-admin">Super Admin</option>
+                    </select>
+                    <select value={inviteDraft.industry} onChange={(e) => setInviteDraft((prev) => ({ ...prev, industry: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs">
+                      {industriesList.map((industryName) => (
+                        <option key={industryName} value={industryName}>{industryName}</option>
+                      ))}
+                    </select>
+                    <input value={inviteDraft.permissions} onChange={(e) => setInviteDraft((prev) => ({ ...prev, permissions: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="create-okr,monitor,manage-policy" />
+                    <div className="grid grid-cols-2 gap-2">
+                      <button type="button" onClick={handleInviteUser} disabled={isSubmittingAdmin} className="rounded-lg bg-cyan-600 hover:bg-cyan-700 disabled:opacity-60 text-white text-xs font-bold px-3 py-2 cursor-pointer">{isSubmittingAdmin ? 'Sending...' : 'Send Invite'}</button>
+                      <button type="button" onClick={handleCompleteFirebaseRegistration} disabled={isRegisteringUser} className="rounded-lg bg-violet-600 hover:bg-violet-700 disabled:opacity-60 text-white text-xs font-bold px-3 py-2 cursor-pointer">{isRegisteringUser ? 'Registering...' : 'Complete Registration'}</button>
+                    </div>
+                    <div className="space-y-2 pt-1">
+                      <input value={registrationDraft.name} onChange={(e) => setRegistrationDraft((prev) => ({ ...prev, name: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Registration name" />
+                      <input value={registrationDraft.email} onChange={(e) => setRegistrationDraft((prev) => ({ ...prev, email: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Registration email" />
+                      <input type="password" value={registrationDraft.password} onChange={(e) => setRegistrationDraft((prev) => ({ ...prev, password: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Password" />
+                      <input type="password" value={registrationDraft.confirmPassword} onChange={(e) => setRegistrationDraft((prev) => ({ ...prev, confirmPassword: e.target.value }))} className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs" placeholder="Confirm password" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-5 overflow-hidden rounded-xl border border-slate-200">
+                  <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
+                    <thead className="bg-slate-100 text-slate-700">
+                      <tr>
+                        <th className="px-3 py-2 font-semibold">Name</th>
+                        <th className="px-3 py-2 font-semibold">Email</th>
+                        <th className="px-3 py-2 font-semibold">Role</th>
+                        <th className="px-3 py-2 font-semibold">Industry</th>
+                        <th className="px-3 py-2 font-semibold">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 bg-white">
+                      {adminUsers.length === 0 ? (
+                        <tr>
+                          <td className="px-3 py-4 text-slate-500" colSpan={5}>No user registrations yet.</td>
+                        </tr>
+                      ) : (
+                        adminUsers.map((user) => (
+                          <tr key={`${user.email}-${user.createdAt}`} className="align-top">
+                            <td className="px-3 py-2 font-semibold text-slate-800">{user.name}</td>
+                            <td className="px-3 py-2 text-slate-600">{user.email}</td>
+                            <td className="px-3 py-2 text-slate-600">{user.role}</td>
+                            <td className="px-3 py-2 text-slate-600">{user.industry}</td>
+                            <td className="px-3 py-2">
+                              <span className={`inline-flex rounded-full px-2.5 py-0.5 font-bold ${
+                                user.status === 'active' ? 'bg-emerald-100 text-emerald-700' : user.status === 'invited' ? 'bg-amber-100 text-amber-700' : 'bg-slate-200 text-slate-700'
+                              }`}>
+                                {user.status}
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
+
+            <Suspense
+              fallback={
+                <div className="rounded-2xl border border-slate-200 bg-white p-6 text-xs font-medium text-slate-500 shadow-xs">
+                  Loading module...
+                </div>
+              }
+            >
         {/* Toggleable Supervisor Event Bus Panel */}
         {isEventBusOpen && (
           <SupervisorEventBus
@@ -989,9 +1820,11 @@ export default function App() {
           />
         )}
         </Suspense>
-      </main>
+      </div>
+    </div>
+    </main>
 
-      <Suspense fallback={null}>
+    <Suspense fallback={null}>
         {/* Enterprise Governance, Policies & Org Data Modal */}
         {isGovernanceOpen && (
           <EnterpriseGovernanceModal

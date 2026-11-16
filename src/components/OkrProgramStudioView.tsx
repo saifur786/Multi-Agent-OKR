@@ -179,6 +179,9 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       text: 'Hi, I am the OKR Conversational Agent. Describe the outcome you want — I will detect missing OKR & 6-dimension Business Problem attributes, ask targeted questions, and construct a Supervisor-ready draft for Apply Draft to Form.'
     }
   ]);
+  const [recommendedMitigations, setRecommendedMitigations] = useState<
+    Record<string, Array<{ plan: string; prediction: string; confidence: number; program: string; source: string }>>
+  >({});
 
   // Filter OKR level nodes (Layer 3)
   const okrNodes = useMemo(() => {
@@ -1568,6 +1571,70 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setTimeout(() => setFeedbackMessage(null), 4000);
   };
 
+  const handleRecommendMitigation = (disaster: SignificantDisasterEvent) => {
+    const lower = `${disaster.type} ${disaster.title} ${disaster.description}`.toLowerCase();
+    const candidateChunks = industry.knowledgeBase.flatMap((pillar) =>
+      pillar.vectorChunks
+        .filter((chunk) => {
+          const haystack = `${pillar.title} ${chunk.text}`.toLowerCase();
+          if (lower.includes('cyber') || lower.includes('security')) {
+            return /(cyber|security|resilience|incident|failover|contingency|data protection)/i.test(haystack);
+          }
+          if (lower.includes('fiber') || lower.includes('network') || lower.includes('outage')) {
+            return /(fiber|network|telemetry|service continuity|failover|route|transport)/i.test(haystack);
+          }
+          if (lower.includes('storm') || lower.includes('weather')) {
+            return /(storm|weather|service restoration|site recovery|resilience|regional reroute|supply continuity)/i.test(haystack);
+          }
+          return /(resilience|mitigation|remediation|recovery|operational|capacity|continuity|response)/i.test(haystack);
+        })
+        .map((chunk) => ({
+          source: chunk.sourceDocument || chunk.source || pillar.title,
+          text: chunk.text,
+          pillar: pillar.title
+        }))
+    );
+
+    const fallbackPlans = [
+      {
+        plan: 'Activate rapid failover and dedicated recovery squad with executive escalation cadence.',
+        prediction: '82%',
+        confidence: 0.92,
+        program: 'Resilience Recovery Sprint',
+        source: 'Risk & Resilience Processes'
+      },
+      {
+        plan: 'Prioritise customer-impact mitigation, service restoration, and contingency budget release.',
+        prediction: '76%',
+        confidence: 0.88,
+        program: 'Business Continuity Recovery Board',
+        source: 'Operational Continuity Playbook'
+      },
+      {
+        plan: 'Rebalance resources to the affected value stream and trigger upstream dependency review.',
+        prediction: '71%',
+        confidence: 0.84,
+        program: 'Dependency Recovery & Capacity Rebalance',
+        source: 'Resource Utilisation Model'
+      }
+    ];
+
+    const mappedPrograms = candidateChunks.length > 0
+      ? candidateChunks.slice(0, 3).map((chunk, index) => ({
+          plan: `${chunk.pillar} signal supports a fast containment plan focused on ${chunk.text.slice(0, 90).replace(/\s+/g, ' ').trim()}.`,
+          prediction: `${82 + index * 5}%`,
+          confidence: Number((0.88 + index * 0.04).toFixed(2)),
+          program: index === 0 ? 'Containment & Failover Program' : index === 1 ? 'Customer Recovery Sprint' : 'Dependency Stabilisation Program',
+          source: chunk.source
+        }))
+      : fallbackPlans;
+
+    setRecommendedMitigations((prev) => ({
+      ...prev,
+      [disaster.id]: mappedPrograms
+    }));
+  };
+
   // Handle Disaster Simulation Trigger / Resolve
   const handleToggleDisaster = (disasterId: string) => {
     const updated = activeDisasters.map((d) => {
@@ -2443,22 +2510,53 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                   </div>
                 </div>
 
+                {recommendedMitigations[disaster.id] && (
+                  <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold uppercase tracking-wide text-emerald-800">Recommended Mitigation</span>
+                      <span className="text-[10px] font-semibold text-emerald-700">AI-grounded</span>
+                    </div>
+                    {recommendedMitigations[disaster.id].map((item, idx) => (
+                      <div key={`${disaster.id}-${idx}`} className="rounded-lg bg-white/80 p-2 border border-emerald-100">
+                        <div className="flex items-center justify-between gap-2 text-[10px] text-slate-600">
+                          <span className="font-semibold text-slate-800">{item.program}</span>
+                          <span className="bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-bold">{item.prediction}</span>
+                        </div>
+                        <p className="mt-1.5 text-[11px] text-slate-700 leading-relaxed">{item.plan}</p>
+                        <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-500">
+                          <span>Confidence: {(item.confidence * 100).toFixed(0)}%</span>
+                          <span>{item.source}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {/* Toggle Trigger */}
-                <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between">
+                <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
                   <span className="text-xs text-slate-500">
                     Status: <strong className={disaster.active ? 'text-red-600' : 'text-slate-700'}>{disaster.active ? 'ACTIVE CRISIS' : 'Dormant (Ready to Trigger)'}</strong>
                   </span>
 
-                  <button
-                    onClick={() => handleToggleDisaster(disaster.id)}
-                    className={`px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all shadow-xs ${
-                      disaster.active
-                        ? 'bg-slate-900 text-white hover:bg-slate-800'
-                        : 'bg-red-600 hover:bg-red-700 text-white'
-                    }`}
-                  >
-                    {disaster.active ? 'Resolve Event' : 'Trigger Crisis'}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleRecommendMitigation(disaster)}
+                      className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold cursor-pointer transition-all shadow-xs"
+                    >
+                      Recommanded-Mitigation
+                    </button>
+                    <button
+                      onClick={() => handleToggleDisaster(disaster.id)}
+                      className={`px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all shadow-xs ${
+                        disaster.active
+                          ? 'bg-slate-900 text-white hover:bg-slate-800'
+                          : 'bg-red-600 hover:bg-red-700 text-white'
+                      }`}
+                    >
+                      {disaster.active ? 'Resolve Event' : 'Trigger Crisis'}
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}

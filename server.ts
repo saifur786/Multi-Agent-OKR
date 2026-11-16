@@ -58,6 +58,40 @@ const memoryInteractions: Array<{
   createdAt: string;
   metadata: Record<string, any>;
 }> = [];
+const memoryUserAccounts: Array<{
+  id: string;
+  uid?: string;
+  name: string;
+  email: string;
+  role: string;
+  industry: string;
+  permissions: string[];
+  status: 'pending' | 'invited' | 'active';
+  firebaseEnabled: boolean;
+  invitedAt?: string;
+  createdAt: string;
+}> = [];
+const memoryPolicies: Array<{
+  id: string;
+  name: string;
+  industry: string;
+  type: string;
+  severity: 'Low' | 'Medium' | 'High';
+  description: string;
+  createdAt: string;
+}> = [];
+const memoryInvitations: Array<{
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  industry: string;
+  permissions: string[];
+  status: 'sent' | 'registered';
+  invitationToken: string;
+  inviteLink: string;
+  createdAt: string;
+}> = [];
 let memoryUserPreferences: {
   id: string;
   navButtonOrder: string[];
@@ -296,6 +330,195 @@ app.post('/api/user-preferences', async (req, res) => {
   return res.json({ preferences: normalized, source: 'mongodb' });
 });
 
+app.get('/api/admin/users', async (_req, res) => {
+  const db = await connectMongo();
+  if (!db) {
+    return res.json({ users: memoryUserAccounts, source: 'memory' });
+  }
+
+  const users = await db.collection('user_accounts').find({}).sort({ createdAt: -1 }).toArray();
+  return res.json({ users, source: 'mongodb' });
+});
+
+app.post('/api/admin/industries', async (req, res) => {
+  const db = await connectMongo();
+  const payload = req.body ?? {};
+  const name = String(payload.name || '').trim();
+  const sector = String(payload.sector || 'Enterprise').trim();
+  if (!name) {
+    return res.status(400).json({ error: 'Industry name is required.' });
+  }
+
+  const industryId = String(payload.id || name).replace(/[^a-zA-Z0-9_-]+/g, '-').toLowerCase();
+  const normalizedIndustry = {
+    id: industryId || 'industry',
+    name,
+    sector,
+    quarter: String(payload.quarter || 'Q1 2027').trim(),
+    description: String(payload.description || '').trim(),
+    policies: Array.isArray(payload.policies) ? payload.policies : [],
+    createdAt: new Date().toISOString(),
+    _lastUpdated: new Date().toISOString()
+  };
+
+  if (!db) {
+    memoryIndustries.set(normalizedIndustry.id, normalizedIndustry);
+    return res.status(201).json({ industry: normalizedIndustry, source: 'memory' });
+  }
+
+  await db.collection('industries').updateOne(
+    { id: normalizedIndustry.id },
+    { $set: normalizedIndustry },
+    { upsert: true }
+  );
+  return res.status(201).json({ industry: normalizedIndustry, source: 'mongodb' });
+});
+
+app.post('/api/admin/policies', async (req, res) => {
+  const db = await connectMongo();
+  const payload = req.body ?? {};
+  const policy = {
+    id: String(payload.id || `policy-${Date.now()}`),
+    name: String(payload.name || '').trim(),
+    industry: String(payload.industry || '').trim(),
+    type: String(payload.type || 'Governance').trim(),
+    severity: String(payload.severity || 'Medium').trim(),
+    description: String(payload.description || '').trim(),
+    createdAt: new Date().toISOString()
+  };
+
+  if (!policy.name || !policy.industry) {
+    return res.status(400).json({ error: 'Policy name and industry are required.' });
+  }
+
+  if (!db) {
+    memoryPolicies.push(policy);
+    return res.status(201).json({ policy, source: 'memory' });
+  }
+
+  await db.collection('policies').updateOne(
+    { id: policy.id },
+    { $set: policy },
+    { upsert: true }
+  );
+  return res.status(201).json({ policy, source: 'mongodb' });
+});
+
+app.post('/api/admin/invite', async (req, res) => {
+  const db = await connectMongo();
+  const payload = req.body ?? {};
+  const name = String(payload.name || '').trim();
+  const email = String(payload.email || '').trim();
+  const role = String(payload.role || 'okr-creator').trim();
+  const industry = String(payload.industry || '').trim();
+  const permissions = Array.isArray(payload.permissions) ? payload.permissions : [];
+
+  if (!name || !email || !industry) {
+    return res.status(400).json({ error: 'Name, email and industry are required.' });
+  }
+
+  const inviteToken = `invite-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const inviteLink = `http://localhost:3000/register?token=${inviteToken}`;
+  const invite = {
+    id: `invite-${Date.now()}`,
+    name,
+    email,
+    role,
+    industry,
+    permissions,
+    status: 'sent',
+    invitationToken: inviteToken,
+    inviteLink,
+    createdAt: new Date().toISOString()
+  };
+
+  if (!db) {
+    memoryInvitations.push(invite);
+    memoryUserAccounts.push({
+      id: `acct-${Date.now()}`,
+      name,
+      email,
+      role,
+      industry,
+      permissions,
+      status: 'invited',
+      firebaseEnabled: true,
+      invitedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString()
+    });
+    return res.status(201).json({ invite, source: 'memory' });
+  }
+
+  await db.collection('user_invitations').updateOne(
+    { email },
+    { $set: invite },
+    { upsert: true }
+  );
+  await db.collection('user_accounts').updateOne(
+    { email },
+    { $set: {
+        id: `acct-${Date.now()}`,
+        name,
+        email,
+        role,
+        industry,
+        permissions,
+        status: 'invited',
+        firebaseEnabled: true,
+        invitedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString()
+      } },
+    { upsert: true }
+  );
+
+  return res.status(201).json({ invite, source: 'mongodb' });
+});
+
+app.post('/api/admin/register', async (req, res) => {
+  const db = await connectMongo();
+  const payload = req.body ?? {};
+  const name = String(payload.name || '').trim();
+  const email = String(payload.email || '').trim();
+  const role = String(payload.role || 'okr-creator').trim();
+  const industry = String(payload.industry || '').trim();
+  const uid = String(payload.uid || '').trim();
+
+  if (!email || !name) {
+    return res.status(400).json({ error: 'Name and email are required.' });
+  }
+
+  const record = {
+    id: uid || `acct-${Date.now()}`,
+    uid: uid || `firebase-${Date.now()}`,
+    name,
+    email,
+    role,
+    industry,
+    permissions: Array.isArray(payload.permissions) ? payload.permissions : [],
+    status: 'active',
+    firebaseEnabled: true,
+    createdAt: new Date().toISOString(),
+    lastLoginAt: new Date().toISOString()
+  };
+
+  if (!db) {
+    const existing = memoryUserAccounts.findIndex((entry) => entry.email.toLowerCase() === email.toLowerCase());
+    if (existing >= 0) {
+      memoryUserAccounts[existing] = { ...memoryUserAccounts[existing], ...record };
+    } else {
+      memoryUserAccounts.push(record as any);
+    }
+    return res.status(201).json({ user: record, source: 'memory' });
+  }
+
+  await db.collection('user_accounts').updateOne(
+    { email },
+    { $set: record },
+    { upsert: true }
+  );
+  return res.status(201).json({ user: record, source: 'mongodb' });
+});
+
 app.get('/api/agent-interactions', async (req, res) => {
   const db = await connectMongo();
   const { agent, context, from, to, q } = req.query;
@@ -388,6 +611,154 @@ const conversationalEventTopics = [
   'INTERVENTION_APPLIED',
   'ADVISORY_COMMITTEE_EVALUATED'
 ] as const;
+
+const workerAgentBlueprint = [
+  { id: 'strategy-explorer', name: 'Strategy Explorer' },
+  { id: 'okr-quality-auditor', name: 'OKR Quality Auditor' },
+  { id: 'alignment-capacity-agent', name: 'Alignment Capacity Agent' },
+  { id: 'risk-sentinel', name: 'Risk Sentinel' },
+  { id: 'executive-reporter', name: 'Executive Reporter' },
+  { id: 'retrospective-learner', name: 'Retrospective Learner' }
+] as const;
+
+type WorkerAgentStatusRecord = {
+  id: string;
+  name: string;
+  status: 'active' | 'idle' | 'error';
+  label: string;
+  reason: string;
+  action: string;
+};
+
+function getDeterministicWorkerStatuses(industryName: string, disasterCount: number): WorkerAgentStatusRecord[] {
+  return workerAgentBlueprint.map((agent, index) => {
+    const isError = disasterCount > 0 && [1, 3, 5].includes(index);
+    const isActive = index === 0 || (index === 1 && disasterCount === 0);
+    const status: WorkerAgentStatusRecord['status'] = isError ? 'error' : isActive ? 'active' : 'idle';
+
+    const reason = isError
+      ? `${agent.name} is blocked by a live risk signal in ${industryName}; the system needs a human intervention before the next orchestration stage can continue.`
+      : isActive
+        ? `${agent.name} is processing the live pipeline successfully and is aligned to the current executive outcome.`
+        : `${agent.name} is waiting for the next event trigger or the next safe stage handoff.`;
+
+    const action = isError
+      ? `Review the ${agent.name} evidence, confirm the root cause, and approve a corrective action before re-entering the pipeline.`
+      : isActive
+        ? `Continue monitoring ${agent.name} and keep the current stage visible for the human operator.`
+        : `Stay ready and queue ${agent.name} for the next stage when orchestration resumes.`;
+
+    return {
+      id: agent.id,
+      name: agent.name,
+      status,
+      label: status === 'error' ? 'Error' : status === 'active' ? 'Active' : 'Idle',
+      reason,
+      action
+    };
+  });
+}
+
+async function logWorkerAgentStatusSnapshot(
+  snapshot: WorkerAgentStatusRecord[],
+  source: 'gemini' | 'fallback',
+  industryName: string
+) {
+  const record = {
+    id: `status-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    agent: 'WorkerAgentStatus',
+    context: `orchestration-status:${industryName}`,
+    message: `Captured worker agent status report for ${industryName}.`,
+    response: JSON.stringify(snapshot),
+    createdAt: new Date().toISOString(),
+    metadata: {
+      source,
+      industry: industryName,
+      statuses: snapshot
+    }
+  };
+
+  if (mongoDb) {
+    await mongoDb.collection('agent_interactions').insertOne(record).catch(() => {});
+    return;
+  }
+
+  memoryInteractions.unshift(record);
+  if (memoryInteractions.length > 200) {
+    memoryInteractions.length = 200;
+  }
+}
+
+app.get('/api/worker-agent-status', async (req, res) => {
+  try {
+    const industryName = String(req.query.industry || 'Enterprise').trim() || 'Enterprise';
+    const fallback = getDeterministicWorkerStatuses(industryName, Math.max(0, Number(req.query.disasterCount || 0)));
+
+    if (getGeminiClient()) {
+      try {
+        const response = await generateWithGeminiRetry((client) =>
+          client.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: `Evaluate the six orchestrator worker agents for the ${industryName} portfolio. Determine whether each agent is active, idle, or error based on a live operational review. For any error condition, provide a concise reason and a single actionable remediation step. Return JSON only as an array of objects with fields: id, name, status, label, reason, action.`,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    name: { type: Type.STRING },
+                    status: { type: Type.STRING },
+                    label: { type: Type.STRING },
+                    reason: { type: Type.STRING },
+                    action: { type: Type.STRING }
+                  },
+                  required: ['id', 'name', 'status', 'label', 'reason', 'action']
+                }
+              }
+            }
+          })
+        );
+
+        const parsed = parseGeminiJsonSafe<Array<Record<string, any>>>(response?.text);
+        if (Array.isArray(parsed) && parsed.length >= 6) {
+          const normalized = parsed.slice(0, 6).map((agent, index) => {
+            const resolvedName = String(agent.name || workerAgentBlueprint[index]?.name || `Worker ${index + 1}`);
+            const status = String(agent.status || 'idle').toLowerCase();
+            return {
+              id: String(agent.id || workerAgentBlueprint[index]?.id || `worker-${index + 1}`),
+              name: resolvedName,
+              status: status === 'error' ? 'error' : status === 'active' ? 'active' : 'idle',
+              label: String(agent.label || (status === 'error' ? 'Error' : status === 'active' ? 'Active' : 'Idle')),
+              reason: String(agent.reason || `The live health review indicates ${resolvedName} is in a ${status} state.`),
+              action: String(agent.action || 'Continue monitoring the current workflow until the next remediation step is approved.')
+            } satisfies WorkerAgentStatusRecord;
+          });
+
+          await logWorkerAgentStatusSnapshot(normalized, 'gemini', industryName);
+          return res.json({
+            agentStatuses: normalized,
+            source: 'google-agentic-api',
+            generatedAt: new Date().toISOString()
+          });
+        }
+      } catch (error) {
+        console.warn('Google agentic worker status fallback engaged:', error);
+      }
+    }
+
+    await logWorkerAgentStatusSnapshot(fallback, 'fallback', industryName);
+    return res.json({
+      agentStatuses: fallback,
+      source: 'deterministic-fallback',
+      generatedAt: new Date().toISOString()
+    });
+  } catch (error: any) {
+    console.error('Worker agent status route failed:', error);
+    return res.status(500).json({ error: error?.message || 'Unable to resolve worker agent status.' });
+  }
+});
 
 app.post('/api/okr-conversational-agent', async (req, res) => {
   try {
