@@ -19,9 +19,13 @@ import {
   ShieldCheck,
   Gauge
 } from 'lucide-react';
-import { IndustryDataBundle, AdvisoryAgentOutcome } from '../types/orchestration';
+import { IndustryDataBundle, AdvisoryAgentOutcome, AdvisoryCommitteeSummary } from '../types/orchestration';
 import { evaluateAdvisoryCommittee } from '../utils/algorithms';
 import { eventBus } from '../utils/eventBus';
+import {
+  AdvisorBusinessLens,
+  DEFAULT_ADVISOR_LENSES
+} from '../utils/agenticCommunication';
 
 interface AdvisoryCommitteeViewProps {
   industry: IndustryDataBundle;
@@ -34,6 +38,9 @@ export const AdvisoryCommitteeView: React.FC<AdvisoryCommitteeViewProps> = ({
 }) => {
   // Configurable Agent Count N (minimum 3, up to user input e.g. 16)
   const [agentCount, setAgentCount] = useState<number>(5);
+  const [businessLenses, setBusinessLenses] = useState<AdvisorBusinessLens[]>(DEFAULT_ADVISOR_LENSES);
+  const [newLensName, setNewLensName] = useState('');
+  const [newLensFocus, setNewLensFocus] = useState('');
 
   // Extract initial KR statement from current industry
   const defaultKR = useMemo(() => {
@@ -45,20 +52,106 @@ export const AdvisoryCommitteeView: React.FC<AdvisoryCommitteeViewProps> = ({
   const [customKRInput, setCustomKRInput] = useState<string>(defaultKR);
   const [activeTab, setActiveTab] = useState<'cards' | 'table' | 'regression'>('cards');
   const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
+  const [liveCommitteeSummary, setLiveCommitteeSummary] = useState<AdvisoryCommitteeSummary | null>(null);
+  const [evaluationMeta, setEvaluationMeta] = useState<{
+    source: string;
+    persistence?: string;
+    latencyMs?: number;
+  } | null>(null);
 
   // Historical points for regression
   const historicalPoints = useMemo(() => {
     return industry.regressionModel.historicalDataPoints.map((p) => p.actual);
   }, [industry]);
 
-  // Compute multi-agent committee outcomes
-  const committeeSummary = useMemo(() => {
+  // Deterministic baseline when server call hasn't overridden yet
+  const deterministicSummary = useMemo(() => {
     return evaluateAdvisoryCommittee(selectedKR, historicalPoints, agentCount);
   }, [selectedKR, historicalPoints, agentCount]);
 
-  const handleRunEvaluation = () => {
+  const committeeSummary = liveCommitteeSummary || deterministicSummary;
+
+  const handleToggleLens = (lensId: string) => {
+    setBusinessLenses((prev) => {
+      const enabledCount = prev.filter((l) => l.enabled).length;
+      return prev.map((l) => {
+        if (l.id !== lensId) return l;
+        if (l.enabled && enabledCount <= 1) return l;
+        return { ...l, enabled: !l.enabled };
+      });
+    });
+  };
+
+  const handleAddCustomLens = () => {
+    const name = newLensName.trim();
+    if (!name) return;
+    const custom: AdvisorBusinessLens = {
+      id: `lens-custom-${Date.now()}`,
+      name,
+      focus: newLensFocus.trim() || `Strategic evaluation from ${name} lens`,
+      weight: 1.1,
+      enabled: true
+    };
+    setBusinessLenses((prev) => [...prev, custom]);
+    setNewLensName('');
+    setNewLensFocus('');
+  };
+
+  const handleRunEvaluation = async () => {
     setIsEvaluating(true);
-    setSelectedKR(customKRInput);
+    const targetKr = customKRInput.trim() || selectedKR;
+    setSelectedKR(targetKr);
+
+    try {
+      const response = await fetch('/api/agents/advisory-committee', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          krStatement: targetKr,
+          industryName: industry.name,
+          sector: industry.sector,
+          agentCount,
+          historicalPoints,
+          lenses: businessLenses
+        })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data?.summary) {
+          setLiveCommitteeSummary(data.summary as AdvisoryCommitteeSummary);
+          setEvaluationMeta({
+            source: String(data.source || 'gemini-4-hydrogen'),
+            persistence: String(data.persistence || 'mongodb'),
+            latencyMs: Number(data.latencyMs || 0)
+          });
+
+          eventBus.publish({
+            topic: 'ADVISORY_COMMITTEE_EVALUATED',
+            sourceAgent: `Advisory Committee (${data.source})`,
+            targetAgent: 'Supervisor Agent',
+            summary: `Evaluated "${targetKr.slice(0, 48)}" with ${agentCount} business-lens advisors (${data.summary.consensusScore}% consensus)`,
+            payload: {
+              kr: targetKr,
+              agentsCount: agentCount,
+              lenses: businessLenses.filter((l) => l.enabled).map((l) => l.name),
+              consensusScore: data.summary.consensusScore,
+              consensusAttainment: data.summary.consensusAttainmentProbability,
+              source: data.source,
+              persistence: data.persistence
+            },
+            latencyMs: Number(data.latencyMs || 35),
+            severity: 'success'
+          });
+          setIsEvaluating(false);
+          return;
+        }
+      }
+    } catch {
+      // Fallback to deterministic computation below
+    }
+
+    setLiveCommitteeSummary(null);
+    setEvaluationMeta({ source: 'local-advisory-fallback', persistence: 'local', latencyMs: 35 });
 
     eventBus.publish({
       topic: 'ADVISORY_COMMITTEE_EVALUATED',
@@ -66,20 +159,18 @@ export const AdvisoryCommitteeView: React.FC<AdvisoryCommitteeViewProps> = ({
       targetAgent: 'Supervisor Agent',
       summary: `Evaluated OKR with ${agentCount} advisory agents across Quality, Novelty, SMART and Polynomial Regression`,
       payload: {
-        kr: customKRInput,
+        kr: targetKr,
         agentsCount: agentCount,
-        consensusScore: committeeSummary.consensusScore,
-        consensusAttainment: committeeSummary.consensusAttainmentProbability,
-        rSquared: committeeSummary.overallRSquared,
-        divergenceIndex: committeeSummary.divergenceIndex
+        consensusScore: deterministicSummary.consensusScore,
+        consensusAttainment: deterministicSummary.consensusAttainmentProbability,
+        rSquared: deterministicSummary.overallRSquared,
+        divergenceIndex: deterministicSummary.divergenceIndex
       },
       latencyMs: 35,
       severity: 'info'
     });
 
-    setTimeout(() => {
-      setIsEvaluating(false);
-    }, 400);
+    setIsEvaluating(false);
   };
 
   const getVerdictBadge = (verdict: AdvisoryAgentOutcome['verdict']) => {
@@ -221,21 +312,86 @@ export const AdvisoryCommitteeView: React.FC<AdvisoryCommitteeViewProps> = ({
               className="flex-1 px-3.5 py-2 text-xs sm:text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
             />
             <button
-              onClick={handleRunEvaluation}
+              type="button"
+              data-testid="evaluate-advisory-committee-btn"
+              onClick={() => void handleRunEvaluation()}
               disabled={isEvaluating}
-              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-xl shadow-2xs transition-all cursor-pointer shrink-0"
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-xl shadow-2xs transition-all cursor-pointer shrink-0 disabled:opacity-60"
             >
               {isEvaluating ? (
                 <>
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>Evaluating...</span>
+                  <span>Evaluating via AI...</span>
                 </>
               ) : (
                 <>
                   <Sparkles className="w-3.5 h-3.5" />
-                  <span>Evaluate with Committee</span>
+                  <span>Evaluate with {agentCount} Lens Advisors</span>
                 </>
               )}
+            </button>
+          </div>
+        </div>
+
+        {/* Configurable Business Lenses for Multi-Agent Evaluation */}
+        <div className="pt-3 border-t border-slate-100 space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <span className="text-xs font-bold text-slate-800">
+                Business Lenses Assigned to Advisor Committee ({businessLenses.filter((l) => l.enabled).length} active)
+              </span>
+              <p className="text-[11px] text-slate-500">
+                Toggle or add custom lenses to evaluate SMART compliance, attainment forecast &amp; strategic rigor from multiple stakeholder viewpoints.
+              </p>
+            </div>
+            {evaluationMeta && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-800 text-[11px] font-semibold">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                Engine: {evaluationMeta.source} · Logged to {evaluationMeta.persistence} ({evaluationMeta.latencyMs}ms)
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap gap-1.5">
+            {businessLenses.map((lens) => (
+              <button
+                key={lens.id}
+                type="button"
+                onClick={() => handleToggleLens(lens.id)}
+                title={lens.focus}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-medium cursor-pointer transition-colors ${
+                  lens.enabled
+                    ? 'bg-indigo-50 text-indigo-800 border-indigo-300 font-semibold'
+                    : 'bg-slate-50 text-slate-500 border-slate-200 hover:bg-slate-100'
+                }`}
+              >
+                {lens.enabled && <Check className="w-3 h-3 text-indigo-600 shrink-0" />}
+                <span>{lens.name}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-2 pt-1">
+            <input
+              type="text"
+              value={newLensName}
+              onChange={(e) => setNewLensName(e.target.value)}
+              placeholder="Add custom business lens (e.g. ESG Sustainability, Cyber Zero-Trust)..."
+              className="sm:w-64 px-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
+            />
+            <input
+              type="text"
+              value={newLensFocus}
+              onChange={(e) => setNewLensFocus(e.target.value)}
+              placeholder="Lens evaluation focus criteria (optional)..."
+              className="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
+            />
+            <button
+              type="button"
+              onClick={handleAddCustomLens}
+              className="px-3 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold cursor-pointer shrink-0"
+            >
+              + Add Business Lens
             </button>
           </div>
         </div>

@@ -11,7 +11,6 @@ import {
   Layers,
   Database,
   Radio,
-  Play,
   RotateCcw,
   Plus,
   Users,
@@ -34,7 +33,8 @@ import {
   Info,
   Bot,
   LogIn,
-  LogOut
+  LogOut,
+  Send
 } from 'lucide-react';
 import { useFirebase } from '../context/FirebaseContext';
 import { IndustryDataBundle, IndustryKey } from '../types/orchestration';
@@ -56,12 +56,7 @@ import {
   filterPortfolioNotifications,
   groupNotificationsByIndustryAndOrg
 } from '../utils/headerNotifications';
-import {
-  IndustryOrchestrationSummary,
-  ORCHESTRATION_ACTIONS,
-  ORCHESTRATION_PIPELINE_HELP,
-  OrchestrationMode
-} from '../utils/industryOrchestration';
+import type { SelectableAccountProfile } from '../utils/agenticCommunication';
 
 export type { ActiveNavView };
 
@@ -74,9 +69,6 @@ interface HeaderProps {
   onSelectView: (view: ActiveNavView) => void;
   userPreferences: UserPreferences;
   onUpdateNavButtonOrder: (nextOrder: ActiveNavView[]) => void;
-  isOrchestratingAll: boolean;
-  onRunFullOrchestration: (mode?: OrchestrationMode) => void;
-  lastOrchestrationSummary?: IndustryOrchestrationSummary | null;
   eventCount: number;
   isEventBusOpen: boolean;
   onToggleEventBus: () => void;
@@ -91,14 +83,26 @@ interface HeaderProps {
   onDismissNotification: (id: string) => void;
   onOpenNotification: (notification: PortfolioNotification) => void;
   onOpenGeminiChat?: () => void;
-  demoUsers?: Array<{ id: string; email: string; name: string; label: string; role: string; permissions: string[] }>;
-  currentDemoUser?: { id: string; email: string; name: string; label: string; role: string; permissions: string[] };
-  onSelectDemoUser?: React.Dispatch<React.SetStateAction<{ id: string; email: string; name: string; label: string; role: string; permissions: string[] }>>;
+  onOpenAgenticValidator?: () => void;
+  demoUsers?: SelectableAccountProfile[];
+  currentDemoUser?: SelectableAccountProfile;
+  onSelectDemoUser?: (user: SelectableAccountProfile) => void;
   workerAgentStatuses?: Array<{ id: string; name: string; status: 'active' | 'idle' | 'error' | string; label: string; reason?: string; action?: string }>;
+  onSelectWorkerAgent?: (agent: { id: string; name: string; status: 'active' | 'idle' | 'error' | string; label: string; reason?: string; action?: string }) => void;
   canCreateOkr?: boolean;
-  canExecuteLifecycle?: boolean;
   canMonitor?: boolean;
+  canEscalateNotification?: boolean;
   canManagePolicy?: boolean;
+  canManageDashboards?: boolean;
+  activeUserRoleSummary?: string;
+  assignedIndustry?: string;
+  onSendEscalation?: (payload: {
+    targetRole: string;
+    targetOwner?: string;
+    severity: 'critical' | 'high' | 'warning';
+    title: string;
+    summary: string;
+  }) => Promise<void>;
 }
 
 const DEFAULT_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -192,9 +196,6 @@ export const Header: React.FC<HeaderProps> = ({
   onSelectView,
   userPreferences,
   onUpdateNavButtonOrder,
-  isOrchestratingAll,
-  onRunFullOrchestration,
-  lastOrchestrationSummary = null,
   eventCount,
   isEventBusOpen,
   onToggleEventBus,
@@ -209,14 +210,20 @@ export const Header: React.FC<HeaderProps> = ({
   onDismissNotification,
   onOpenNotification,
   onOpenGeminiChat,
+  onOpenAgenticValidator,
   demoUsers = [],
   currentDemoUser,
   onSelectDemoUser,
   workerAgentStatuses = [],
+  onSelectWorkerAgent,
   canCreateOkr = true,
-  canExecuteLifecycle = true,
   canMonitor = true,
-  canManagePolicy = true
+  canEscalateNotification = false,
+  canManagePolicy = true,
+  canManageDashboards = true,
+  activeUserRoleSummary,
+  assignedIndustry,
+  onSendEscalation
 }) => {
   const { user, authReady, isSigningIn, authError, signInWithGoogle, signOutUser } = useFirebase();
   const navOrder = normalizeNavOrder(userPreferences.navButtonOrder);
@@ -225,17 +232,20 @@ export const Header: React.FC<HeaderProps> = ({
   const [isNavHelpOpen, setIsNavHelpOpen] = useState<boolean>(false);
   const [isCompactWorkspaceView, setIsCompactWorkspaceView] = useState<boolean>(false);
 
-  // Notification Center state
+  // Notification Center & Escalation Composer state
   const [isNotificationCenterOpen, setIsNotificationCenterOpen] = useState<boolean>(false);
   const [notifScope, setNotifScope] = useState<NotificationScope>('all');
   const [notifCategory, setNotifCategory] = useState<'all' | NotificationCategory>('all');
   const [notifIndustryFilter, setNotifIndustryFilter] = useState<string>('ALL');
-
-  // Orchestrate Pipeline Tips & Actions popover state
-  const [isPipelineMenuOpen, setIsPipelineMenuOpen] = useState<boolean>(false);
+  const [isEscalationOpen, setIsEscalationOpen] = useState<boolean>(false);
+  const [escalationTargetRole, setEscalationTargetRole] = useState<string>('okr-creator');
+  const [escalationTargetOwner, setEscalationTargetOwner] = useState<string>('');
+  const [escalationSeverity, setEscalationSeverity] = useState<'critical' | 'high' | 'warning'>('high');
+  const [escalationTitle, setEscalationTitle] = useState<string>('');
+  const [escalationSummary, setEscalationSummary] = useState<string>('');
+  const [isSendingEscalation, setIsSendingEscalation] = useState<boolean>(false);
 
   const notificationContainerRef = useRef<HTMLDivElement | null>(null);
-  const pipelineContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia('(max-width: 1024px)');
@@ -255,19 +265,11 @@ export const Header: React.FC<HeaderProps> = ({
       ) {
         setIsNotificationCenterOpen(false);
       }
-      if (
-        isPipelineMenuOpen &&
-        pipelineContainerRef.current &&
-        !pipelineContainerRef.current.contains(target)
-      ) {
-        setIsPipelineMenuOpen(false);
-      }
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setIsNotificationCenterOpen(false);
-        setIsPipelineMenuOpen(false);
       }
     };
 
@@ -277,7 +279,7 @@ export const Header: React.FC<HeaderProps> = ({
       document.removeEventListener('mousedown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isNotificationCenterOpen, isPipelineMenuOpen]);
+  }, [isNotificationCenterOpen]);
 
   const readSet = useMemo(() => new Set(readNotificationIds), [readNotificationIds]);
   const dismissedSet = useMemo(() => new Set(dismissedNotificationIds), [dismissedNotificationIds]);
@@ -299,6 +301,16 @@ export const Header: React.FC<HeaderProps> = ({
 
   const disasterTotal = useMemo(
     () => visibleAllNotifications.filter((n) => n.category === 'disaster_event').length,
+    [visibleAllNotifications]
+  );
+
+  const escalationTotal = useMemo(
+    () => visibleAllNotifications.filter((n) => n.category === 'escalation').length,
+    [visibleAllNotifications]
+  );
+
+  const ownerAlertTotal = useMemo(
+    () => visibleAllNotifications.filter((n) => n.category === 'retrospective_owner_alert').length,
     [visibleAllNotifications]
   );
 
@@ -370,7 +382,21 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           {/* Right Operational Controls Cluster */}
-          <div className="flex flex-wrap lg:flex-nowrap items-center justify-end gap-1.5 shrink-0">
+          <div className="flex flex-wrap items-center justify-start lg:justify-end gap-1.5 min-w-0">
+            {onOpenAgenticValidator && (
+              <button
+                type="button"
+                data-testid="open-agentic-validator-btn"
+                onClick={onOpenAgenticValidator}
+                aria-label="Validate Google Agentic AI & MongoDB Communication"
+                title="Probe all 8 Google Agentic AI channels & MongoDB knowledge store"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 transition-all cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                <span>AI Agents</span>
+              </button>
+            )}
+
             {onOpenGeminiChat && (
               <button
                 type="button"
@@ -385,21 +411,32 @@ export const Header: React.FC<HeaderProps> = ({
             )}
 
             {demoUsers.length > 0 && (
-              <div className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5 whitespace-nowrap shrink-0">
+              <div
+                className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-2 py-1.5 whitespace-nowrap shrink-0"
+                title={activeUserRoleSummary || currentDemoUser?.accountabilities || 'Select application role'}
+              >
                 <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">User</span>
                 <select
                   aria-label="Select demo application role"
+                  data-testid="user-role-switcher"
                   value={currentDemoUser?.id || demoUsers[0].id}
                   onChange={(event) => {
-                    const nextUser = demoUsers.find((user) => user.id === event.target.value) || demoUsers[0];
+                    const nextUser = demoUsers.find((u) => u.id === event.target.value) || demoUsers[0];
                     onSelectDemoUser?.(nextUser);
                   }}
-                  className="max-w-[170px] bg-transparent text-xs font-semibold text-slate-700 focus:outline-none"
+                  className="max-w-[145px] bg-transparent text-xs font-semibold text-slate-700 focus:outline-none cursor-pointer"
                 >
-                  {demoUsers.map((user) => (
-                    <option key={user.id} value={user.id}>{user.label} · {user.email}</option>
+                  {demoUsers.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.label} ({u.industry || 'All'}) · {u.email}
+                    </option>
                   ))}
                 </select>
+                {assignedIndustry && (
+                  <span className="hidden xl:inline-flex px-1.5 py-0.5 rounded bg-indigo-100/80 text-indigo-800 text-[9px] font-bold">
+                    {assignedIndustry}
+                  </span>
+                )}
               </div>
             )}
 
@@ -409,6 +446,7 @@ export const Header: React.FC<HeaderProps> = ({
                 onClick={canManagePolicy ? onOpenGovernance : undefined}
                 disabled={!canManagePolicy}
                 aria-label="Configure Enterprise Governance, Policies & Org Data"
+                title={canManagePolicy ? 'Manage policies, rules & org directory' : 'Requires Policy Manager or Super Admin role'}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <ShieldCheck className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
@@ -421,7 +459,6 @@ export const Header: React.FC<HeaderProps> = ({
                 type="button"
                 onClick={() => {
                   setIsNotificationCenterOpen(true);
-                  setIsPipelineMenuOpen(false);
                   setNotifCategory('disaster_event');
                 }}
                 aria-label="View Active Crisis & Disasters"
@@ -439,7 +476,6 @@ export const Header: React.FC<HeaderProps> = ({
                 data-testid="notification-center-trigger"
                 onClick={() => {
                   setIsNotificationCenterOpen((prev) => !prev);
-                  setIsPipelineMenuOpen(false);
                 }}
                 aria-label="Open Notification Center"
                 aria-expanded={isNotificationCenterOpen}
@@ -516,12 +552,113 @@ export const Header: React.FC<HeaderProps> = ({
                   </div>
 
                   {/* Purpose & Alert Criteria Hint */}
-                  <div className="px-4 py-2 bg-indigo-50/60 border-b border-slate-200 text-[11px] text-slate-600 flex items-start gap-2">
-                    <Info className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
-                    <span>
-                      Alerts trigger automatically by <strong className="text-slate-800">Industry &amp; Organisation</strong> when an OKR reaches critical status (Behind, P0 - Critical, or &lt;60% At Risk) or a new disaster event is detected.
-                    </span>
+                  <div className="px-4 py-2 bg-indigo-50/60 border-b border-slate-200 text-[11px] text-slate-600 flex items-start justify-between gap-2">
+                    <div className="flex items-start gap-2">
+                      <Info className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
+                      <span>
+                        Alerts trigger by <strong className="text-slate-800">Industry &amp; Role</strong> on critical OKRs, disasters, Retrospective owner alerts &amp; Monitor escalations.
+                      </span>
+                    </div>
+                    {canEscalateNotification && onSendEscalation && (
+                      <button
+                        type="button"
+                        data-testid="toggle-escalation-composer-btn"
+                        onClick={() => setIsEscalationOpen((prev) => !prev)}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-violet-600 hover:bg-violet-700 text-white text-[10px] font-bold shrink-0 cursor-pointer"
+                      >
+                        <Send className="w-3 h-3" />
+                        <span>{isEscalationOpen ? 'Hide' : 'Escalate'}</span>
+                      </button>
+                    )}
                   </div>
+
+                  {isEscalationOpen && canEscalateNotification && onSendEscalation && (
+                    <form
+                      onSubmit={async (e) => {
+                        e.preventDefault();
+                        if (!escalationTitle.trim() || !escalationSummary.trim() || isSendingEscalation) return;
+                        setIsSendingEscalation(true);
+                        try {
+                          await onSendEscalation({
+                            targetRole: escalationTargetRole,
+                            targetOwner: escalationTargetOwner.trim() || undefined,
+                            severity: escalationSeverity,
+                            title: escalationTitle.trim(),
+                            summary: escalationSummary.trim()
+                          });
+                          setEscalationTitle('');
+                          setEscalationSummary('');
+                          setEscalationTargetOwner('');
+                          setIsEscalationOpen(false);
+                          setNotifCategory('escalation');
+                        } finally {
+                          setIsSendingEscalation(false);
+                        }
+                      }}
+                      className="px-4 py-3 bg-violet-50/70 border-b border-violet-200 space-y-2 text-[11px]"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-violet-900">Send Role Escalation Notification ({selectedIndustry})</span>
+                        <span className="text-[10px] text-violet-700">From: {currentDemoUser?.label || 'Monitor'}</span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <select
+                          aria-label="Target Role"
+                          data-testid="escalation-target-role"
+                          value={escalationTargetRole}
+                          onChange={(e) => setEscalationTargetRole(e.target.value)}
+                          className="rounded-md border border-violet-200 bg-white px-2 py-1 text-[11px] font-medium"
+                        >
+                          <option value="okr-creator">OKR Creator</option>
+                          <option value="policy-manager">Policy Manager</option>
+                          <option value="super-admin">Super Admin</option>
+                          <option value="monitor">Operations Monitor</option>
+                        </select>
+                        <select
+                          aria-label="Escalation Severity"
+                          value={escalationSeverity}
+                          onChange={(e) => setEscalationSeverity(e.target.value as 'critical' | 'high' | 'warning')}
+                          className="rounded-md border border-violet-200 bg-white px-2 py-1 text-[11px] font-medium"
+                        >
+                          <option value="critical">Critical</option>
+                          <option value="high">High</option>
+                          <option value="warning">Warning</option>
+                        </select>
+                        <input
+                          value={escalationTargetOwner}
+                          onChange={(e) => setEscalationTargetOwner(e.target.value)}
+                          placeholder="Target owner (opt.)"
+                          className="rounded-md border border-violet-200 bg-white px-2 py-1 text-[11px]"
+                        />
+                      </div>
+                      <input
+                        data-testid="escalation-title-input"
+                        value={escalationTitle}
+                        onChange={(e) => setEscalationTitle(e.target.value)}
+                        placeholder="Escalation headline (e.g. Q2 SLA breach needs OKR reprioritisation)"
+                        className="w-full rounded-md border border-violet-200 bg-white px-2.5 py-1.5 text-[11px]"
+                        required
+                      />
+                      <div className="flex gap-1.5">
+                        <input
+                          data-testid="escalation-summary-input"
+                          value={escalationSummary}
+                          onChange={(e) => setEscalationSummary(e.target.value)}
+                          placeholder="Action requested from target role..."
+                          className="flex-1 rounded-md border border-violet-200 bg-white px-2.5 py-1.5 text-[11px]"
+                          required
+                        />
+                        <button
+                          type="submit"
+                          data-testid="send-escalation-btn"
+                          disabled={isSendingEscalation || !escalationTitle.trim() || !escalationSummary.trim()}
+                          className="px-3 py-1.5 rounded-md bg-violet-700 hover:bg-violet-800 disabled:opacity-60 text-white font-semibold text-[11px] cursor-pointer shrink-0"
+                        >
+                          {isSendingEscalation ? 'Sending...' : 'Send'}
+                        </button>
+                      </div>
+                    </form>
+                  )}
 
                   {/* Scope & Category Filters */}
                   <div className="px-4 py-2.5 border-b border-slate-200 space-y-2 bg-white">
@@ -568,19 +705,21 @@ export const Header: React.FC<HeaderProps> = ({
                       )}
                     </div>
 
-                    <div className="flex items-center gap-1.5 text-[11px]">
+                    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
                       {(
                         [
                           { id: 'all', label: `All (${visibleAllNotifications.length})` },
                           { id: 'critical_okr', label: `Critical OKRs (${criticalOkrTotal})` },
-                          { id: 'disaster_event', label: `Disasters (${disasterTotal})` }
+                          { id: 'disaster_event', label: `Disasters (${disasterTotal})` },
+                          { id: 'escalation', label: `Escalations (${escalationTotal})` },
+                          { id: 'retrospective_owner_alert', label: `Owner Alerts (${ownerAlertTotal})` }
                         ] as const
                       ).map((tab) => (
                         <button
                           key={tab.id}
                           type="button"
                           onClick={() => setNotifCategory(tab.id)}
-                          className={`px-2.5 py-1 rounded-md font-medium border cursor-pointer transition-colors tabular-nums ${
+                          className={`px-2 py-1 rounded-md font-medium border cursor-pointer transition-colors tabular-nums ${
                             notifCategory === tab.id
                               ? 'bg-slate-900 text-white border-slate-900'
                               : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
@@ -600,7 +739,7 @@ export const Header: React.FC<HeaderProps> = ({
                           No critical OKRs or active disasters in this filter
                         </p>
                         <p className="text-[11px] text-slate-500">
-                          Alerts appear here as soon as an OKR moves to Behind / P0 - Critical or a disaster event triggers.
+                          Alerts appear here as soon as an OKR moves to Behind / P0 - Critical, a disaster triggers, or a role escalation is sent.
                         </p>
                       </div>
                     ) : (
@@ -624,13 +763,23 @@ export const Header: React.FC<HeaderProps> = ({
                             {group.items.map((item) => {
                               const isRead = readSet.has(item.id);
                               const isDisaster = item.category === 'disaster_event';
+                              const isEscalation = item.category === 'escalation';
+                              const isOwnerAlert = item.category === 'retrospective_owner_alert';
                               return (
                                 <div
                                   key={item.id}
                                   data-testid="notification-item"
                                   data-notification-id={item.id}
                                   className={`px-4 py-3 transition-colors ${
-                                    isRead ? 'bg-white' : isDisaster ? 'bg-red-50/40' : 'bg-amber-50/35'
+                                    isRead
+                                      ? 'bg-white'
+                                      : isDisaster
+                                      ? 'bg-red-50/40'
+                                      : isEscalation
+                                      ? 'bg-violet-50/40'
+                                      : isOwnerAlert
+                                      ? 'bg-indigo-50/40'
+                                      : 'bg-amber-50/35'
                                   }`}
                                 >
                                   <div className="flex items-start justify-between gap-2">
@@ -639,6 +788,10 @@ export const Header: React.FC<HeaderProps> = ({
                                         className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase border ${
                                           isDisaster
                                             ? 'bg-red-100 text-red-800 border-red-200'
+                                            : isEscalation
+                                            ? 'bg-violet-100 text-violet-800 border-violet-200'
+                                            : isOwnerAlert
+                                            ? 'bg-indigo-100 text-indigo-800 border-indigo-200'
                                             : item.severity === 'critical'
                                             ? 'bg-red-50 text-red-700 border-red-200'
                                             : 'bg-amber-50 text-amber-800 border-amber-200'
@@ -646,14 +799,29 @@ export const Header: React.FC<HeaderProps> = ({
                                       >
                                         {isDisaster ? (
                                           <Flame className="w-3 h-3" />
+                                        ) : isEscalation ? (
+                                          <Send className="w-3 h-3" />
                                         ) : (
                                           <AlertTriangle className="w-3 h-3" />
                                         )}
-                                        <span>{isDisaster ? 'Disaster Event' : 'Critical OKR'}</span>
+                                        <span>
+                                          {isDisaster
+                                            ? 'Disaster Event'
+                                            : isEscalation
+                                            ? 'Role Escalation'
+                                            : isOwnerAlert
+                                            ? 'OKR Owner Alert'
+                                            : 'Critical OKR'}
+                                        </span>
                                       </span>
                                       <span className="text-[10px] font-semibold text-slate-700 tabular-nums">
                                         {item.statusLabel}
                                       </span>
+                                      {(item.targetRole || item.targetOwner) && (
+                                        <span className="text-[10px] font-semibold text-violet-700 bg-violet-50 border border-violet-200 px-1.5 py-0.5 rounded">
+                                          To: {item.targetOwner || item.targetRole}
+                                        </span>
+                                      )}
                                       {!isRead && (
                                         <span className="text-[10px] font-bold text-indigo-700">
                                           • Unread
@@ -687,7 +855,11 @@ export const Header: React.FC<HeaderProps> = ({
                                       className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold cursor-pointer transition-colors"
                                     >
                                       <span>
-                                        {isDisaster ? 'Inspect Crisis in Studio' : 'Review OKR in Studio'}
+                                        {isDisaster
+                                          ? 'Inspect Crisis in Studio'
+                                          : isOwnerAlert
+                                          ? 'Review Lesson & OKR'
+                                          : 'Review OKR in Studio'}
                                       </span>
                                       <ArrowRight className="w-3 h-3" />
                                     </button>
@@ -746,152 +918,6 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
 
             {/* Industry-Level OKR & Program Orchestrate Pipeline Cluster */}
-            <div className="relative flex items-center shrink-0" ref={pipelineContainerRef}>
-              <button
-                type="button"
-                data-testid="orchestrate-pipeline-btn"
-                onClick={() => canExecuteLifecycle && onRunFullOrchestration('full-pipeline')}
-                disabled={isOrchestratingAll || !canExecuteLifecycle}
-                aria-label={`Orchestrate ${selectedIndustry} OKR & Program Pipeline across Stages 1 through 6`}
-                title={`Run Stages 1–6 OKR & Program orchestration for ${industry.name}`}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-l-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-xs disabled:opacity-60 transition-colors cursor-pointer whitespace-nowrap shrink-0 border border-indigo-600"
-              >
-                {isOrchestratingAll ? (
-                  <>
-                    <RotateCcw className="w-3.5 h-3.5 animate-spin shrink-0" />
-                    <span>Orchestrating...</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-3.5 h-3.5 shrink-0" />
-                    <span>Orchestrate Pipeline</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                type="button"
-                data-testid="pipeline-help-trigger"
-                onClick={() => {
-                  setIsPipelineMenuOpen((prev) => !prev);
-                  setIsNotificationCenterOpen(false);
-                }}
-                aria-label="Orchestrate Pipeline Actions, Purpose & Expectations"
-                aria-expanded={isPipelineMenuOpen}
-                aria-controls="orchestrate-pipeline-panel"
-                title="View Industry Orchestration Purpose, Expectations & Aligned Actions"
-                className={`flex items-center gap-1 px-2 py-1.5 rounded-r-xl border border-l-indigo-500 text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                  isPipelineMenuOpen
-                    ? 'bg-indigo-800 text-white border-indigo-800'
-                    : 'bg-indigo-700 hover:bg-indigo-800 text-indigo-50 border-indigo-700'
-                }`}
-              >
-                <HelpCircle className="w-3.5 h-3.5 shrink-0" />
-                <ChevronDown className="w-3 h-3 shrink-0" />
-              </button>
-
-              {isPipelineMenuOpen && (
-                <div
-                  id="orchestrate-pipeline-panel"
-                  role="region"
-                  aria-label="Industry Pipeline Orchestration Guide and Actions"
-                  className="absolute right-0 top-full mt-2 w-[470px] max-w-[calc(100vw-2rem)] max-h-[82vh] overflow-y-auto rounded-xl border border-slate-200 bg-white shadow-xl z-50 p-4 space-y-3.5"
-                >
-                  <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-2.5">
-                    <div>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <h2 className="text-xs font-bold text-slate-900">
-                          {ORCHESTRATION_PIPELINE_HELP.title}
-                        </h2>
-                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
-                          {selectedIndustry} · {industry.name}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-600 mt-1 leading-relaxed">
-                        <strong className="text-slate-800">Purpose:</strong> {ORCHESTRATION_PIPELINE_HELP.purpose}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setIsPipelineMenuOpen(false)}
-                      aria-label="Close Pipeline Guide"
-                      className="p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer shrink-0"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  {/* What to Expect */}
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-1.5">
-                    <h3 className="text-[11px] font-bold text-slate-800 uppercase tracking-wide">
-                      Expected Outcomes per Run
-                    </h3>
-                    <ul className="space-y-1 text-[11px] text-slate-600">
-                      {ORCHESTRATION_PIPELINE_HELP.expectations.map((item, idx) => (
-                        <li key={idx} className="flex items-start gap-1.5">
-                          <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
-                          <span>{item}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-
-                  {/* Aligned Trigger Actions */}
-                  <div className="space-y-2">
-                    <h3 className="text-[11px] font-bold text-slate-800 uppercase tracking-wide">
-                      Aligned Industry OKR &amp; Program Actions
-                    </h3>
-                    {ORCHESTRATION_ACTIONS.map((action) => (
-                      <button
-                        key={action.mode}
-                        type="button"
-                        data-testid={`orchestrate-action-${action.mode}`}
-                        disabled={isOrchestratingAll}
-                        onClick={() => {
-                          setIsPipelineMenuOpen(false);
-                          onRunFullOrchestration(action.mode);
-                        }}
-                        className="w-full text-left p-2.5 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/40 transition-colors cursor-pointer disabled:opacity-60 space-y-1"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
-                            <Play className="w-3 h-3 text-indigo-600 shrink-0" />
-                            <span>{action.label}</span>
-                          </span>
-                          <ArrowRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                        </div>
-                        <p className="text-[11px] text-slate-600 leading-relaxed">
-                          {action.description}
-                        </p>
-                        <p className="text-[10px] font-medium text-indigo-700">
-                          Expectation: {action.expectedOutcome}
-                        </p>
-                      </button>
-                    ))}
-                  </div>
-
-                  {/* Operational Tips */}
-                  <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-2.5 space-y-1">
-                    <h3 className="text-[11px] font-bold text-amber-900">Tips &amp; Guidance</h3>
-                    <ul className="space-y-1 text-[11px] text-amber-900/80">
-                      {ORCHESTRATION_PIPELINE_HELP.tips.map((tip, idx) => (
-                        <li key={idx}>• {tip}</li>
-                      ))}
-                    </ul>
-                  </div>
-
-                  {/* Most Recent Orchestration Run Telemetry */}
-                  {lastOrchestrationSummary && (
-                    <div className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-2.5 text-[11px] text-emerald-900 space-y-1">
-                      <div className="font-bold">
-                        Last Run ({lastOrchestrationSummary.industryName})
-                      </div>
-                      <p className="tabular-nums">{lastOrchestrationSummary.headline}</p>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
 
             {/* Google Firebase Authentication Control */}
             {authReady && (
@@ -970,9 +996,10 @@ export const Header: React.FC<HeaderProps> = ({
 
         {workerAgentStatuses.length > 0 && (
           <div className="mt-2.5 pt-2.5 border-t border-slate-100">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500 whitespace-nowrap shrink-0">
                 <span>Worker Agent Status</span>
+                <span className="font-normal normal-case tracking-normal text-slate-400">(Click for logs)</span>
               </div>
               <div className="flex flex-wrap items-center gap-1.5">
                 {workerAgentStatuses.map((agent) => {
@@ -980,25 +1007,29 @@ export const Header: React.FC<HeaderProps> = ({
                   const reasonText = agent.reason || 'Live status is healthy and ready for the next stage.';
                   return (
                     <div key={agent.id} className="group relative inline-flex">
-                      <div
-                        className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-semibold ${
+                      <button
+                        type="button"
+                        data-testid={`worker-agent-btn-${agent.id}`}
+                        onClick={() => onSelectWorkerAgent?.(agent)}
+                        aria-label={`Inspect last 5 logs for ${agent.name} (${agent.label})`}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-semibold transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
                           agent.status === 'active'
-                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80'
                             : agent.status === 'error'
-                            ? 'border-red-200 bg-red-50 text-red-700'
-                            : 'border-slate-200 bg-slate-50 text-slate-600'
+                            ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100/80'
+                            : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 hover:border-slate-300'
                         }`}
-                        title={`${agent.name}: ${reasonText}`}
+                        title={`${agent.name}: ${reasonText} (Click for last 5 KB logs)`}
                       >
                         <span className={`inline-block h-2 w-2 rounded-full ${
                           agent.status === 'active' ? 'bg-emerald-500' : agent.status === 'error' ? 'bg-red-500' : 'bg-slate-400'
                         }`} />
                         <span>{agent.name}</span>
                         <span className="text-[9px] uppercase">{agent.label}</span>
-                      </div>
+                      </button>
 
                       <div className="pointer-events-none absolute left-1/2 top-full z-40 mt-2 w-64 -translate-x-1/2 rounded-xl border border-slate-200 bg-white p-2.5 shadow-lg opacity-0 translate-y-[-4px] group-hover:opacity-100 group-hover:translate-y-0 transition-all duration-200">
-                        <div className="text-[9px] font-bold uppercase tracking-[0.12em] text-slate-500">Agent Status</div>
+                        <div className="text-[9px] font-bold uppercase tracking-[0.12em] text-slate-500">Agent Status · Click for Last 5 Logs</div>
                         <p className="mt-1 text-[11px] font-semibold text-slate-800">{reasonText}</p>
                         <p className="mt-1 text-[10px] text-slate-600">Action: {actionText}</p>
                       </div>

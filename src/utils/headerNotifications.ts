@@ -5,7 +5,11 @@ import {
   TraceabilityNode
 } from '../types/orchestration';
 
-export type NotificationCategory = 'critical_okr' | 'disaster_event';
+export type NotificationCategory =
+  | 'critical_okr'
+  | 'disaster_event'
+  | 'escalation'
+  | 'retrospective_owner_alert';
 export type NotificationSeverity = 'critical' | 'high' | 'warning';
 export type NotificationScope = 'all' | 'current';
 
@@ -19,13 +23,16 @@ export interface PortfolioNotification {
   title: string;
   summary: string;
   detail: string;
-  targetTab: 'okrs' | 'disasters';
+  targetTab: 'okrs' | 'disasters' | 'health' | 'supervisor';
   targetOkrId?: string;
   disasterId?: string;
   statusLabel: string;
   impactMetric?: string;
   detectedAt: string;
   isNew?: boolean;
+  targetRole?: string;
+  targetOwner?: string;
+  senderRole?: string;
 }
 
 export interface NotificationFilterOptions {

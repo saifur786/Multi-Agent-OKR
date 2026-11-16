@@ -19,19 +19,23 @@ import {
   TrendingUp,
   Users
 } from 'lucide-react';
-import { createUserWithEmailAndPassword, updateProfile } from 'firebase/auth';
+import { getApps, initializeApp } from 'firebase/app';
+import { createUserWithEmailAndPassword, getAuth, signOut, updateProfile } from 'firebase/auth';
 import { auth } from './lib/firebase';
 import {
   ResponsiveContainer,
   LineChart,
   Line,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
   BarChart,
   Bar,
-  Legend
+  Legend,
+  ReferenceLine
 } from 'recharts';
 import { INDUSTRY_DATA } from './data/industryData';
 import {
@@ -51,6 +55,12 @@ import {
 } from './services/firestorePersistence';
 import type { ParsedDocumentPreview } from './utils/ragIngestion';
 import { Header, ActiveNavView } from './components/Header';
+import { WorkerAgentLogsModal } from './components/WorkerAgentLogsModal';
+import {
+  computeAnomalyTelemetryStats,
+  isSignificantAnomalyDeviation,
+  type WorkerAgentStatusSummary
+} from './utils/workerAgentTelemetry';
 import { LifecycleView } from './components/LifecycleView';
 import {
   UserPreferences,
@@ -71,6 +81,16 @@ import {
   OrchestrationMode,
   runIndustryOkrProgramOrchestration
 } from './utils/industryOrchestration';
+import {
+  OrchestrationRunRecord,
+  PersistedNotificationRecord,
+  SelectableAccountProfile,
+  isSuperAdminIdentity,
+  mergeSelectableAccounts,
+  normalizeOrchestrationRuns,
+  resolveUserCapabilities
+} from './utils/agenticCommunication';
+import type { ConversationalRoutedAgent } from './utils/conversationalOkrParser';
 
 function lazyWithRetry<T extends React.ComponentType<any>>(
   loader: () => Promise<{ default: T }>,
@@ -129,6 +149,9 @@ const EnterpriseGovernanceModal = lazyWithRetry(() =>
 const GeminiChatbotDrawer = lazyWithRetry(() =>
   import('./components/GeminiChatbotDrawer').then((m) => ({ default: m.GeminiChatbotDrawer }))
 );
+const AgenticValidationModal = lazyWithRetry(() =>
+  import('./components/AgenticValidationModal').then((m) => ({ default: m.AgenticValidationModal }))
+);
 import {
   OrgDirectoryMember,
   OkrEnterprisePolicy,
@@ -186,49 +209,48 @@ const mergeIndustryWithFallback = (
   });
 };
 
-type DemoUserRole = 'super-admin' | 'okr-creator' | 'monitor' | 'policy-manager';
+export type DemoUserProfile = SelectableAccountProfile;
 
-export interface DemoUserProfile {
-  id: string;
-  email: string;
-  name: string;
-  role: string;
-  permissions: string[];
-  label: string;
-}
-
-const DEMO_USERS: DemoUserProfile[] = [
+const DEMO_USERS: SelectableAccountProfile[] = [
   {
     id: 'super-admin',
     email: 'saifur.rahman.au@gmail',
     name: 'Saifur Rahman',
     role: 'super-admin',
+    industry: 'All',
     label: 'Super Admin',
-    permissions: ['all']
+    permissions: ['all'],
+    accountabilities: 'Create industries, policies, Firebase user onboarding, OKRs & full multi-agent governance'
   },
   {
     id: 'okr-creator',
     email: 'strategy.ops@demo.local',
     name: 'Alicia Stone',
     role: 'okr-creator',
+    industry: 'Telco',
     label: 'OKR Creator',
-    permissions: ['create-okr', 'execute-lifecycle']
+    permissions: ['create-okr', 'execute-lifecycle'],
+    accountabilities: 'Author OKRs, run Conversational OKR Agent & execute 6-stage Multi-Agent Lifecycle'
   },
   {
     id: 'monitor',
     email: 'ops.monitor@demo.local',
     name: 'Marcus Liu',
     role: 'monitor',
+    industry: 'Banking',
     label: 'Operations Monitor',
-    permissions: ['monitor', 'trace', 'notify']
+    permissions: ['monitor', 'trace', 'notify', 'escalate'],
+    accountabilities: 'Monitor pipeline health, inspect 7-layer lineage & send escalation alerts to other roles'
   },
   {
     id: 'policy-manager',
     email: 'policy.admin@demo.local',
     name: 'Nadia Flores',
     role: 'policy-manager',
+    industry: 'Retail',
     label: 'Policy Manager',
-    permissions: ['manage-policy', 'view-dashboards']
+    permissions: ['manage-policy', 'view-dashboards', 'manage-dashboards'],
+    accountabilities: 'Manage organisation policies, compliance guardrails & executive reporting dashboards'
   }
 ];
 
@@ -320,7 +342,13 @@ export default function App() {
   const [isOrchestratingAll, setIsOrchestratingAll] = useState<boolean>(false);
   const { user, authReady } = useFirebase();
   const isVerifiedFirebaseUser = Boolean(authReady && user && user.emailVerified);
-  const isSuperAdmin = activeDemoUser.role === 'super-admin';
+  const capabilities = useMemo(
+    () => resolveUserCapabilities(activeDemoUser, selectedIndustry),
+    [activeDemoUser, selectedIndustry]
+  );
+  const isSuperAdmin =
+    capabilities.isSuperAdmin ||
+    (activeDemoUser.id === 'super-admin' && isSuperAdminIdentity({ email: user?.email ?? undefined }));
   useEffect(() => {
     const mediaQuery = window.matchMedia('(max-width: 1024px)');
     const syncCollapsedState = () => setIsNavCollapsed(mediaQuery.matches);
@@ -332,9 +360,11 @@ export default function App() {
   const [isGovernanceOpen, setIsGovernanceOpen] = useState<boolean>(false);
   const [isAdminConsoleOpen, setIsAdminConsoleOpen] = useState<boolean>(false);
   const [isGeminiChatOpen, setIsGeminiChatOpen] = useState<boolean>(false);
+  const [isAgenticValidatorOpen, setIsAgenticValidatorOpen] = useState<boolean>(false);
   const [draggedNavView, setDraggedNavView] = useState<ActiveNavView | null>(null);
   const [readNotificationIds, setReadNotificationIds] = useState<string[]>([]);
   const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>([]);
+  const [persistedNotifications, setPersistedNotifications] = useState<PortfolioNotification[]>([]);
   const [lastOrchestrationSummary, setLastOrchestrationSummary] = useState<IndustryOrchestrationSummary | null>(null);
   const [requestedStudioTarget, setRequestedStudioTarget] = useState<{
     tab: 'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor';
@@ -522,9 +552,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (activeDemoUser.role !== 'super-admin') return;
     void fetch('/api/admin/users')
-      .then((response) => response.ok ? response.json() : null)
+      .then((response) => (response.ok ? response.json() : null))
       .then((payload) => {
         if (Array.isArray(payload?.users)) {
           setAdminUsers(payload.users as AdminUserRecord[]);
@@ -534,6 +563,44 @@ export default function App() {
         setAdminUsers([]);
       });
   }, [activeDemoUser.role]);
+
+  const selectableDemoUsers = useMemo(
+    () => mergeSelectableAccounts(DEMO_USERS, adminUsers),
+    [adminUsers]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch('/api/notifications')
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((data) => {
+        if (cancelled || !Array.isArray(data?.notifications)) return;
+        const mapped: PortfolioNotification[] = (data.notifications as PersistedNotificationRecord[]).map((item) => ({
+          id: item.id,
+          category: item.category,
+          severity: item.severity,
+          industryKey: item.industryKey || selectedIndustry,
+          organisationName: item.organisationName || item.industryKey || 'Enterprise',
+          sector: item.sector || 'Enterprise',
+          title: item.title,
+          summary: item.summary,
+          detail: item.detail,
+          targetTab: item.targetTab || 'okrs',
+          targetOkrId: item.targetOkrId,
+          statusLabel: item.statusLabel,
+          detectedAt: item.detectedAt ? new Date(item.detectedAt).toLocaleTimeString() : 'Live',
+          targetRole: item.targetRole,
+          targetOwner: item.targetOwner,
+          senderRole: item.senderRole,
+          isNew: true
+        }));
+        setPersistedNotifications(mapped);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedIndustry]);
 
   // Sync user preferences with Firestore when authenticated
   useEffect(() => {
@@ -787,11 +854,12 @@ export default function App() {
     [currentIndustryBundle, selectedIndustry, persistIndustry, isVerifiedFirebaseUser, user]
   );
 
-  // Cross-industry live Notification Center collector (Critical OKRs + New Disaster Events)
-  const portfolioNotifications = useMemo(
-    () => collectPortfolioNotifications(industriesDict, selectedIndustry, currentIndustryBundle, events),
-    [industriesDict, selectedIndustry, currentIndustryBundle, events]
-  );
+  // Cross-industry live Notification Center collector (Critical OKRs + New Disaster Events + Escalations & Retrospective Owner Alerts)
+  const portfolioNotifications = useMemo(() => {
+    const derived = collectPortfolioNotifications(industriesDict, selectedIndustry, currentIndustryBundle, events);
+    const seen = new Set(persistedNotifications.map((n) => n.id));
+    return [...persistedNotifications, ...derived.filter((item) => !seen.has(item.id))];
+  }, [persistedNotifications, industriesDict, selectedIndustry, currentIndustryBundle, events]);
 
   const handleMarkNotificationRead = useCallback((id: string) => {
     setReadNotificationIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
@@ -812,7 +880,7 @@ export default function App() {
   const handleOpenNotification = useCallback(
     (notification: PortfolioNotification) => {
       handleMarkNotificationRead(notification.id);
-      if (notification.industryKey && notification.industryKey !== selectedIndustry) {
+      if (notification.industryKey && notification.industryKey !== selectedIndustry && industriesDict[notification.industryKey]) {
         handleSelectIndustry(notification.industryKey);
       }
       setActiveView('studio');
@@ -822,8 +890,140 @@ export default function App() {
         nonce: Date.now()
       });
     },
-    [handleMarkNotificationRead, handleSelectIndustry, selectedIndustry]
+    [handleMarkNotificationRead, handleSelectIndustry, selectedIndustry, industriesDict]
   );
+
+  const handleSendEscalation = useCallback(
+    async (payload: {
+      targetRole: string;
+      targetOwner?: string;
+      severity: 'critical' | 'high' | 'warning';
+      title: string;
+      summary: string;
+    }) => {
+      try {
+        const resp = await fetch('/api/notifications/escalate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            industryKey: selectedIndustry,
+            organisationName: currentIndustryBundle.name,
+            sector: currentIndustryBundle.sector,
+            senderRole: activeDemoUser.role,
+            senderEmail: activeDemoUser.email,
+            ...payload
+          })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          const rec = data?.notification as PersistedNotificationRecord | undefined;
+          if (rec) {
+            setPersistedNotifications((prev) => [
+              {
+                id: rec.id,
+                category: rec.category,
+                severity: rec.severity,
+                industryKey: rec.industryKey,
+                organisationName: rec.organisationName,
+                sector: rec.sector,
+                title: rec.title,
+                summary: rec.summary,
+                detail: rec.detail,
+                targetTab: rec.targetTab || 'okrs',
+                statusLabel: rec.statusLabel,
+                detectedAt: new Date(rec.detectedAt).toLocaleTimeString(),
+                targetRole: rec.targetRole,
+                targetOwner: rec.targetOwner,
+                senderRole: rec.senderRole,
+                isNew: true
+              },
+              ...prev
+            ]);
+          }
+          eventBus.publish({
+            topic: 'RISK_SENTINEL_ALERT',
+            sourceAgent: `${activeDemoUser.label} (${activeDemoUser.email})`,
+            targetAgent: `Role: ${payload.targetRole}`,
+            summary: `Escalation sent to ${payload.targetRole}: ${payload.title}`,
+            payload,
+            latencyMs: 18,
+            severity: payload.severity === 'critical' ? 'danger' : 'warning'
+          });
+        }
+      } catch {
+        // Non-fatal
+      }
+    },
+    [selectedIndustry, currentIndustryBundle.name, currentIndustryBundle.sector, activeDemoUser]
+  );
+
+  const handleRetrospectiveCompleted = useCallback(
+    (payload: {
+      actionableLesson: string;
+      vectorChunk: { id: string; text: string; source: string; sourceDocument?: string; ingestedAt?: string };
+      ownerNotification?: PersistedNotificationRecord;
+    }) => {
+      setIndustriesDict((prev) => {
+        const current = prev[selectedIndustry];
+        if (!current) return prev;
+        const updatedKb = (current.knowledgeBase || []).map((pillar, idx) =>
+          pillar.id === 'kb4' || idx === 3
+            ? {
+                ...pillar,
+                vectorChunks: [payload.vectorChunk, ...(pillar.vectorChunks || [])].slice(0, 14)
+              }
+            : pillar
+        );
+        return {
+          ...prev,
+          [selectedIndustry]: normalizeIndustryBundle({
+            ...current,
+            knowledgeBase: updatedKb
+          })
+        };
+      });
+
+      if (payload.ownerNotification) {
+        const rec = payload.ownerNotification;
+        setPersistedNotifications((prev) => [
+          {
+            id: rec.id,
+            category: rec.category,
+            severity: rec.severity,
+            industryKey: rec.industryKey || selectedIndustry,
+            organisationName: rec.organisationName || currentIndustryBundle.name,
+            sector: rec.sector || currentIndustryBundle.sector,
+            title: rec.title,
+            summary: rec.summary,
+            detail: rec.detail,
+            targetTab: rec.targetTab || 'okrs',
+            targetOkrId: rec.targetOkrId,
+            statusLabel: rec.statusLabel,
+            detectedAt: rec.detectedAt ? new Date(rec.detectedAt).toLocaleTimeString() : 'Live',
+            targetRole: rec.targetRole,
+            targetOwner: rec.targetOwner,
+            senderRole: rec.senderRole,
+            isNew: true
+          },
+          ...prev.filter((n) => n.id !== rec.id)
+        ]);
+      }
+    },
+    [selectedIndustry, currentIndustryBundle.name, currentIndustryBundle.sector]
+  );
+
+  const handleNavigateFromConversationalRoute = useCallback((route: ConversationalRoutedAgent) => {
+    setActiveView(route.suggestedView);
+    if (route.suggestedView === 'studio' && route.suggestedTab) {
+      setRequestedStudioTarget({ tab: route.suggestedTab, nonce: Date.now() });
+    } else if (route.agentKey === 'reporting') {
+      setActiveStageId(5);
+    } else if (route.agentKey === 'risk') {
+      setActiveStageId(4);
+    } else if (route.agentKey === 'retrospective') {
+      setActiveStageId(6);
+    }
+  }, []);
 
   // Industry-Level OKR & Program Orchestration Pipeline
   const handleRunFullOrchestration = (mode: OrchestrationMode = 'full-pipeline') => {
@@ -847,6 +1047,40 @@ export default function App() {
       [selectedIndustry]: updatedBundle
     }));
     setLastOrchestrationSummary(result.summary);
+
+    void fetch('/api/agents/supervisor-orchestrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        industry: selectedIndustry,
+        industryName: currentIndustryBundle.name,
+        mode,
+        totalOkrs: result.summary.totalOkrs,
+        criticalOkrCount: result.summary.criticalOkrCount,
+        activeProgramCount: result.summary.activeProgramCount,
+        activeDisasterCount: result.summary.activeDisasterCount,
+        summaryHeadline: result.summary.headline
+      })
+    })
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((data) => {
+        if (Array.isArray(data?.runs) && data.runs.length > 0) {
+          setOrchestrationRuns(
+            normalizeOrchestrationRuns(data.runs).slice(-10).map((r, i) => ({
+              ...r,
+              run: `Run ${i + 1}`
+            }))
+          );
+        } else if (data?.run) {
+          setOrchestrationRuns((prev) =>
+            normalizeOrchestrationRuns([...prev, data.run]).slice(-10).map((r, i) => ({
+              ...r,
+              run: `Run ${i + 1}`
+            }))
+          );
+        }
+      })
+      .catch(() => {});
 
     eventBus.publish({
       topic: 'ORCHESTRATION_STARTED',
@@ -968,16 +1202,56 @@ export default function App() {
 
   const activeFedCount = Object.values(fedPillars).filter(Boolean).length;
 
-  const orchestrationInsights = useMemo(() => {
-    const stages = ['Strategy Explorer', 'OKR Quality', 'Alignment', 'Risk Radar', 'Executive Reporting', 'Retrospective'];
-    return Array.from({ length: 10 }, (_, index) => ({
-      run: `Run ${index + 1}`,
-      stage: stages[index % stages.length],
-      successRate: 92 - index * 1.3 + (index % 3) * 0.6,
-      latencyMs: 1260 + index * 180 - (index % 5) * 75,
-      activeStage: (index % 6) + 1
-    }));
-  }, []);
+  const [orchestrationRuns, setOrchestrationRuns] = useState<OrchestrationRunRecord[]>(() =>
+    normalizeOrchestrationRuns([
+      { run: 'Run 1', stage: 'Strategy Explorer', successRate: 89.4, latencyMs: 1480, anomalyCount: 3, activeStage: 1, source: 'baseline' },
+      { run: 'Run 2', stage: 'OKR Quality', successRate: 91.2, latencyMs: 1390, anomalyCount: 2, activeStage: 2, source: 'baseline' },
+      { run: 'Run 3', stage: 'Alignment', successRate: 88.6, latencyMs: 1520, anomalyCount: 4, activeStage: 3, source: 'baseline' },
+      { run: 'Run 4', stage: 'Risk Radar', successRate: 93.1, latencyMs: 1290, anomalyCount: 2, activeStage: 4, source: 'baseline' },
+      { run: 'Run 5', stage: 'Executive Reporting', successRate: 90.8, latencyMs: 1340, anomalyCount: 3, activeStage: 5, source: 'baseline' },
+      { run: 'Run 6', stage: 'Retrospective', successRate: 92.4, latencyMs: 1210, anomalyCount: 1, activeStage: 6, source: 'baseline' },
+      { run: 'Run 7', stage: 'Strategy Explorer', successRate: 94.0, latencyMs: 1180, anomalyCount: 1, activeStage: 1, source: 'baseline' },
+      { run: 'Run 8', stage: 'OKR Quality', successRate: 91.5, latencyMs: 1260, anomalyCount: 2, activeStage: 2, source: 'baseline' },
+      { run: 'Run 9', stage: 'Alignment', successRate: 95.2, latencyMs: 1120, anomalyCount: 1, activeStage: 3, source: 'baseline' },
+      { run: 'Run 10', stage: 'Risk Radar', successRate: 96.1, latencyMs: 1085, anomalyCount: 0, activeStage: 4, source: 'baseline' }
+    ])
+  );
+  const [selectedWorkerAgent, setSelectedWorkerAgent] = useState<WorkerAgentStatusSummary | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`/api/orchestration-runs?industry=${encodeURIComponent(selectedIndustry)}`)
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((data) => {
+        if (!cancelled && Array.isArray(data?.runs) && data.runs.length > 0) {
+          setOrchestrationRuns(normalizeOrchestrationRuns(data.runs));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedIndustry]);
+
+  const orchestrationInsights = useMemo(() => orchestrationRuns.slice(-10), [orchestrationRuns]);
+
+  const anomalyStats = useMemo(
+    () => computeAnomalyTelemetryStats(orchestrationInsights),
+    [orchestrationInsights]
+  );
+
+  const anomalyChartData = useMemo(
+    () =>
+      orchestrationInsights.map((item) => {
+        const count = Number(item.anomalyCount || 0);
+        return {
+          ...item,
+          anomalyCount: count,
+          isAnomalySpike: isSignificantAnomalyDeviation(count, anomalyStats)
+        };
+      }),
+    [orchestrationInsights, anomalyStats]
+  );
 
   const [liveWorkerAgentStatuses, setLiveWorkerAgentStatuses] = useState<Array<{
     id: string;
@@ -990,10 +1264,13 @@ export default function App() {
 
   useEffect(() => {
     let isMounted = true;
+    const activeCrisisCount = activeDisasters.filter((d) => d.active).length;
 
     const loadWorkerAgentStatus = async () => {
       try {
-        const response = await fetch(`/api/worker-agent-status?industry=${encodeURIComponent(selectedIndustry)}`);
+        const response = await fetch(
+          `/api/worker-agent-status?industry=${encodeURIComponent(selectedIndustry)}&disasterCount=${activeCrisisCount}`
+        );
         if (!response.ok) {
           return;
         }
@@ -1022,7 +1299,7 @@ export default function App() {
     return () => {
       isMounted = false;
     };
-  }, [selectedIndustry, activeDisasters.length, activeStageId, isOrchestratingAll]);
+  }, [selectedIndustry, activeDisasters, activeStageId, isOrchestratingAll]);
 
   const workerAgentStatuses = useMemo<Array<{ id: string; name: string; status: 'active' | 'idle' | 'error'; label: string; reason?: string; action?: string }>>(() => {
     const workerNames = [
@@ -1033,6 +1310,7 @@ export default function App() {
       'Executive Reporter',
       'Retrospective Learner'
     ];
+    const activeCrisisCount = activeDisasters.filter((d) => d.active).length;
 
     const baseStatuses: Array<{
       id: string;
@@ -1042,7 +1320,7 @@ export default function App() {
       reason: string;
       action: string;
     }> = workerNames.map((name, index) => {
-      const isInErrorState = activeDisasters.length > 0 && [1, 3, 5].includes(index);
+      const isInErrorState = activeCrisisCount > 0 && [1, 3, 5].includes(index);
       const isActive = isOrchestratingAll && activeStageId === index + 1;
       const status: 'active' | 'idle' | 'error' = isInErrorState ? 'error' : isActive ? 'active' : 'idle';
 
@@ -1082,7 +1360,7 @@ export default function App() {
       reason: agent.reason || 'Live status retrieved from the active orchestration telemetry.',
       action: agent.action || 'Monitor the current stage and continue the recommended workflow.'
     }));
-  }, [activeDisasters.length, activeStageId, isOrchestratingAll, liveWorkerAgentStatuses]);
+  }, [activeDisasters, activeStageId, isOrchestratingAll, liveWorkerAgentStatuses]);
 
   const orderedWorkspaceViews = useMemo(() => {
     const order = normalizeNavOrder(userPreferences.navButtonOrder);
@@ -1098,23 +1376,12 @@ export default function App() {
 
   const isCustomWorkspaceOrder = !areNavOrdersEqual(userPreferences.navButtonOrder, DEFAULT_NAV_ORDER);
 
-  const canCreateOkr =
-    activeDemoUser.role === 'super-admin' ||
-    activeDemoUser.permissions.includes('create-okr') ||
-    activeDemoUser.permissions.includes('all');
-  const canExecuteLifecycle =
-    activeDemoUser.role === 'super-admin' ||
-    activeDemoUser.permissions.includes('execute-lifecycle') ||
-    activeDemoUser.permissions.includes('all');
-  const canMonitor =
-    activeDemoUser.role === 'super-admin' ||
-    activeDemoUser.permissions.includes('monitor') ||
-    activeDemoUser.permissions.includes('trace') ||
-    activeDemoUser.permissions.includes('all');
-  const canManagePolicy =
-    activeDemoUser.role === 'super-admin' ||
-    activeDemoUser.permissions.includes('manage-policy') ||
-    activeDemoUser.permissions.includes('all');
+  const canCreateOkr = capabilities.canCreateOkr;
+  const canExecuteLifecycle = capabilities.canExecuteLifecycle;
+  const canMonitor = capabilities.canMonitor;
+  const canEscalateNotification = capabilities.canEscalateNotification;
+  const canManagePolicy = capabilities.canManagePolicy;
+  const canManageDashboards = capabilities.canManageDashboards;
 
   const handleCreateIndustry = async () => {
     if (!industryDraft.name.trim()) {
@@ -1268,27 +1535,58 @@ export default function App() {
     setIsRegisteringUser(true);
     setAdminMessage(null);
     try {
-      const credential = await createUserWithEmailAndPassword(
-        auth,
-        registrationDraft.email.trim(),
-        registrationDraft.password
-      );
-      await updateProfile(credential.user, { displayName: registrationDraft.name.trim() || registrationDraft.email.trim() });
+      let createdUid = `local-${Date.now()}`;
+      let firebaseCreated = false;
+      try {
+        // Use a dedicated secondary Firebase app so registering another user does not overwrite Super Admin's session
+        const registrarApp =
+          getApps().find((a) => a.name === 'admin-registrar') ||
+          initializeApp(auth.app.options, 'admin-registrar');
+        const registrarAuth = getAuth(registrarApp);
+        const credential = await createUserWithEmailAndPassword(
+          registrarAuth,
+          registrationDraft.email.trim(),
+          registrationDraft.password
+        );
+        await updateProfile(credential.user, {
+          displayName: registrationDraft.name.trim() || registrationDraft.email.trim()
+        });
+        createdUid = credential.user.uid;
+        firebaseCreated = true;
+        await signOut(registrarAuth).catch(() => {});
+      } catch (fbError: any) {
+        const code = String(fbError?.code || '');
+        if (code === 'auth/email-already-in-use' || code === 'auth/operation-not-allowed') {
+          createdUid = `profile-${Date.now()}`;
+        } else {
+          throw fbError;
+        }
+      }
+
+      const defaultPermissions =
+        registrationDraft.role === 'super-admin'
+          ? ['all']
+          : registrationDraft.role === 'monitor'
+            ? ['monitor', 'trace', 'notify', 'escalate']
+            : registrationDraft.role === 'policy-manager'
+              ? ['manage-policy', 'view-dashboards', 'manage-dashboards']
+              : ['create-okr', 'execute-lifecycle'];
+
       const response = await fetch('/api/admin/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          uid: credential.user.uid,
+          uid: createdUid,
           name: registrationDraft.name,
           email: registrationDraft.email,
           role: registrationDraft.role,
           industry: registrationDraft.industry,
-          permissions: inviteDraft.permissions.split(',').map((value) => value.trim()).filter(Boolean)
+          permissions: defaultPermissions
         })
       });
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(payload?.error || 'Firebase registration completed, but the app profile could not be saved.');
+        throw new Error(payload?.error || 'User profile could not be saved.');
       }
       setAdminUsers((prev) => [{
         id: payload.user.id,
@@ -1297,12 +1595,16 @@ export default function App() {
         email: payload.user.email,
         role: payload.user.role,
         industry: payload.user.industry,
-        permissions: payload.user.permissions || [],
+        permissions: payload.user.permissions || defaultPermissions,
         status: 'active',
-        firebaseEnabled: true,
+        firebaseEnabled: firebaseCreated,
         createdAt: payload.user.createdAt
-      }, ...prev]);
-      setAdminMessage(`Registration completed for ${registrationDraft.email}. Firebase auth and Mongo/local persistence are both active.`);
+      }, ...prev.filter((u) => u.email.toLowerCase() !== payload.user.email.toLowerCase())]);
+      setAdminMessage(
+        firebaseCreated
+          ? `Registered ${registrationDraft.email} in Firebase Auth & MongoDB — now selectable in the User Switcher.`
+          : `Registered ${registrationDraft.email} in MongoDB/App Role Directory (selectable in the User Switcher).`
+      );
       setRegistrationDraft((prev) => ({ ...prev, password: '', confirmPassword: '' }));
     } catch (error) {
       setAdminMessage(error instanceof Error ? error.message : 'Registration failed.');
@@ -1323,9 +1625,6 @@ export default function App() {
         onSelectView={setActiveView}
         userPreferences={userPreferences}
         onUpdateNavButtonOrder={handleUpdateNavButtonOrder}
-        isOrchestratingAll={isOrchestratingAll}
-        onRunFullOrchestration={handleRunFullOrchestration}
-        lastOrchestrationSummary={lastOrchestrationSummary}
         eventCount={events.length}
         isEventBusOpen={isEventBusOpen}
         onToggleEventBus={() => setIsEventBusOpen((prev) => !prev)}
@@ -1340,14 +1639,20 @@ export default function App() {
         onDismissNotification={handleDismissNotification}
         onOpenNotification={handleOpenNotification}
         onOpenGeminiChat={() => setIsGeminiChatOpen(true)}
-        demoUsers={DEMO_USERS}
+        onOpenAgenticValidator={() => setIsAgenticValidatorOpen(true)}
+        demoUsers={selectableDemoUsers}
         currentDemoUser={activeDemoUser}
         onSelectDemoUser={setActiveDemoUser}
         workerAgentStatuses={workerAgentStatuses}
+        onSelectWorkerAgent={setSelectedWorkerAgent}
         canCreateOkr={canCreateOkr}
-        canExecuteLifecycle={canExecuteLifecycle}
         canMonitor={canMonitor}
+        canEscalateNotification={canEscalateNotification}
         canManagePolicy={canManagePolicy}
+        canManageDashboards={canManageDashboards}
+        activeUserRoleSummary={capabilities.roleSummary}
+        assignedIndustry={capabilities.assignedIndustry}
+        onSendEscalation={handleSendEscalation}
       />
 
       {/* Main Body */}
@@ -1489,10 +1794,51 @@ export default function App() {
           </aside>
 
           <div className="space-y-6">
+            {!capabilities.industryAccessAllowed && (
+              <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-900">
+                <span>
+                  <strong className="font-bold">Industry Scope Notice:</strong> {activeDemoUser.name} ({activeDemoUser.label}) is assigned to{' '}
+                  <strong>{capabilities.assignedIndustry}</strong> while viewing {selectedIndustry}.
+                </span>
+                {industriesDict[capabilities.assignedIndustry] && (
+                  <button
+                    type="button"
+                    onClick={() => handleSelectIndustry(capabilities.assignedIndustry)}
+                    className="px-2.5 py-1 rounded-lg bg-amber-700 hover:bg-amber-800 text-white text-[11px] font-semibold cursor-pointer"
+                  >
+                    Switch to {capabilities.assignedIndustry}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {!canCreateOkr && canManageDashboards && (
+              <div className="rounded-xl border border-indigo-200 bg-indigo-50/70 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-indigo-900">
+                <span>
+                  <strong className="font-bold">Policy &amp; Reporting Manager Scope:</strong> {capabilities.roleSummary}
+                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsGovernanceOpen(true)}
+                    className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold cursor-pointer"
+                  >
+                    Manage Org Policies
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveView('performance')}
+                    className="px-2.5 py-1 rounded-lg border border-indigo-300 bg-white hover:bg-indigo-100 text-indigo-800 text-[11px] font-semibold cursor-pointer"
+                  >
+                    Reporting Dashboards
+                  </button>
+                </div>
+              </div>
+            )}
+
             <section
-              className={`group rounded-2xl border border-slate-200 bg-white p-5 shadow-xs transition-all duration-300 hover:-translate-y-0.5 hover:shadow-lg hover:border-indigo-200 hover:bg-indigo-50/20 ${isInsightsCollapsed ? 'max-h-[92px] overflow-hidden' : ''}`}
-              onMouseEnter={() => setIsInsightsCollapsed(false)}
-              onMouseLeave={() => setIsInsightsCollapsed(true)}
+              data-testid="orchestration-insights-card"
+              className="group rounded-2xl border border-slate-200 bg-white p-5 shadow-xs transition-all duration-300"
             >
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
                 <div>
@@ -1500,9 +1846,9 @@ export default function App() {
                   <h2 className="text-lg font-bold text-slate-900">6-Stage Multi-Agent Pipeline Health</h2>
                 </div>
                 <div className="flex items-center gap-2">
-                  <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-[11px] font-semibold text-indigo-700">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-[11px] font-semibold text-indigo-700 tabular-nums">
                     <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
-                    Last 10 runs tracked
+                    Last {orchestrationInsights.length} runs tracked
                   </div>
                   <button
                     type="button"
@@ -1515,17 +1861,17 @@ export default function App() {
               </div>
 
               {!isInsightsCollapsed && (
-                <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                   <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
                     <div className="mb-2 text-xs font-semibold text-slate-700">Success Rate Trend</div>
                     <ResponsiveContainer width="100%" height="90%">
-                      <LineChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                      <LineChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
                         <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                         <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
                         <YAxis domain={[70, 100]} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
                         <Tooltip formatter={(value) => [`${Number(value ?? 0).toFixed(1)}%`, 'Success rate']} />
                         <Legend />
-                        <Line type="monotone" dataKey="successRate" name="Success rate" stroke="#4f46e5" strokeWidth={3} dot={{ r: 3 }} />
+                        <Line type="monotone" dataKey="successRate" name="Success rate" stroke="#4f46e5" strokeWidth={2.5} dot={{ r: 3 }} />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
@@ -1533,7 +1879,7 @@ export default function App() {
                   <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
                     <div className="mb-2 text-xs font-semibold text-slate-700">Latency (ms)</div>
                     <ResponsiveContainer width="100%" height="90%">
-                      <BarChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                      <BarChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
                         <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                         <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
                         <YAxis tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
@@ -1541,6 +1887,120 @@ export default function App() {
                         <Legend />
                         <Bar dataKey="latencyMs" name="Latency" fill="#14b8a6" radius={[6, 6, 0, 0]} />
                       </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  <div
+                    data-testid="historical-anomaly-chart"
+                    className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3"
+                  >
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-700 truncate">Historical Anomaly Frequency</span>
+                      <span
+                        data-testid="anomaly-mean-summary"
+                        className={`text-[11px] font-semibold tabular-nums whitespace-nowrap shrink-0 ${
+                          anomalyStats.spikeRunCount > 0 ? 'text-red-700' : 'text-slate-600'
+                        }`}
+                      >
+                        Mean {anomalyStats.mean.toFixed(1)} · {anomalyStats.spikeRunCount} spike{anomalyStats.spikeRunCount === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <ResponsiveContainer width="100%" height="90%">
+                      <AreaChart data={anomalyChartData} margin={{ top: 14, right: 12, left: -12, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id="anomalyFrequencyFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#dc2626" stopOpacity={0.22} />
+                            <stop offset="95%" stopColor="#64748b" stopOpacity={0.04} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+                        <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <YAxis allowDecimals={false} domain={[0, 'dataMax + 1']} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <Tooltip
+                          formatter={(value, _name, item) => {
+                            const count = Number(value ?? 0);
+                            const isSpike = Boolean(item?.payload?.isAnomalySpike);
+                            return [
+                              `${count} anomalies${isSpike ? ` (Significantly above mean ${anomalyStats.mean.toFixed(1)})` : ` (Mean ${anomalyStats.mean.toFixed(1)})`}`,
+                              isSpike ? 'Alert Spike' : 'Risk Sentinel'
+                            ];
+                          }}
+                        />
+                        <Legend />
+                        <ReferenceLine
+                          y={anomalyStats.mean}
+                          stroke="#475569"
+                          strokeDasharray="4 4"
+                          strokeWidth={1.5}
+                          ifOverflow="extendDomain"
+                          label={{
+                            value: `Mean (${anomalyStats.mean.toFixed(1)})`,
+                            position: 'insideTopRight',
+                            dy: -14,
+                            fill: '#334155',
+                            fontSize: 10,
+                            fontWeight: 700
+                          }}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="anomalyCount"
+                          name="Anomalies (Red = Spike)"
+                          stroke="#64748b"
+                          strokeWidth={2}
+                          fill="url(#anomalyFrequencyFill)"
+                          dot={(dotProps: any) => {
+                            const { cx, cy, payload, index } = dotProps;
+                            if (typeof cx !== 'number' || typeof cy !== 'number') {
+                              return <g key={`empty-dot-${index}`} />;
+                            }
+                            if (payload?.isAnomalySpike) {
+                              return (
+                                <circle
+                                  key={`anomaly-spike-dot-${index}`}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={5.5}
+                                  fill="#dc2626"
+                                  stroke="#fecaca"
+                                  strokeWidth={2.5}
+                                  data-anomaly-spike="true"
+                                />
+                              );
+                            }
+                            return (
+                              <circle
+                                key={`anomaly-normal-dot-${index}`}
+                                cx={cx}
+                                cy={cy}
+                                r={3}
+                                fill="#475569"
+                                stroke="#ffffff"
+                                strokeWidth={1.5}
+                                data-anomaly-spike="false"
+                              />
+                            );
+                          }}
+                          activeDot={(dotProps: any) => {
+                            const { cx, cy, payload, index } = dotProps;
+                            if (typeof cx !== 'number' || typeof cy !== 'number') {
+                              return <g key={`empty-active-${index}`} />;
+                            }
+                            const isSpike = Boolean(payload?.isAnomalySpike);
+                            return (
+                              <circle
+                                key={`anomaly-active-dot-${index}`}
+                                cx={cx}
+                                cy={cy}
+                                r={isSpike ? 7 : 5}
+                                fill={isSpike ? '#dc2626' : '#334155'}
+                                stroke={isSpike ? '#fee2e2' : '#e2e8f0'}
+                                strokeWidth={2.5}
+                              />
+                            );
+                          }}
+                        />
+                      </AreaChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
@@ -1738,6 +2198,11 @@ export default function App() {
             nodesMap={nodesMap}
             onUpdateNodesMap={setNodesMap}
             activeFedCount={activeFedCount}
+            canExecuteLifecycle={canExecuteLifecycle}
+            isOrchestratingAll={isOrchestratingAll}
+            onRunFullOrchestration={handleRunFullOrchestration}
+            lastOrchestrationSummary={lastOrchestrationSummary}
+            onRetrospectiveCompleted={handleRetrospectiveCompleted}
           />
         )}
 
@@ -1821,6 +2286,9 @@ export default function App() {
             policies={policies}
             onNavigateToTrajectory={() => setActiveView('trajectory')}
             requestedTarget={requestedStudioTarget}
+            canCreateOkr={canCreateOkr}
+            canExecuteLifecycle={canExecuteLifecycle}
+            onNavigateFromConversationalRoute={handleNavigateFromConversationalRoute}
           />
         )}
         </Suspense>
@@ -1857,6 +2325,23 @@ export default function App() {
             industry={industry}
             nodesMap={nodesMap}
             fedPillars={fedPillars}
+          />
+        )}
+
+        {/* 8-Agent Google Agentic AI & MongoDB Communication Validator */}
+        {isAgenticValidatorOpen && (
+          <AgenticValidationModal
+            industryName={industry.name}
+            onClose={() => setIsAgenticValidatorOpen(false)}
+          />
+        )}
+
+        {/* Interactive Worker Agent Last-5 KB Logs Modal */}
+        {selectedWorkerAgent && (
+          <WorkerAgentLogsModal
+            agent={selectedWorkerAgent}
+            industryName={selectedIndustry}
+            onClose={() => setSelectedWorkerAgent(null)}
           />
         )}
       </Suspense>

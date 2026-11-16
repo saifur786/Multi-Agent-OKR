@@ -40,6 +40,11 @@ interface AgentDeepDiveModalProps {
   industry: IndustryDataBundle;
   nodesMap: Record<string, TraceabilityNode>;
   onUpdateNodesMap: (updated: Record<string, TraceabilityNode>) => void;
+  onRetrospectiveCompleted?: (payload: {
+    actionableLesson: string;
+    vectorChunk: { id: string; text: string; source: string; sourceDocument?: string; ingestedAt?: string };
+    ownerNotification?: any;
+  }) => void;
   onClose: () => void;
 }
 
@@ -48,6 +53,7 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
   industry,
   nodesMap,
   onUpdateNodesMap,
+  onRetrospectiveCompleted,
   onClose
 }) => {
   // STAGE 1 (Strategy RAG) state
@@ -71,10 +77,18 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
   // STAGE 3 (Graph & Capacity) state
   const [remediatedIds, setRemediatedIds] = useState<Set<string>>(new Set());
   const [rebalancedSquads, setRebalancedSquads] = useState<Set<string>>(new Set());
+  const [alignmentAiPlan, setAlignmentAiPlan] = useState<{ summaryPlan: string; recommendations: string[]; source: string } | null>(null);
+  const [isLoadingAlignmentAi, setIsLoadingAlignmentAi] = useState(false);
 
-  // STAGE 4 (Cron & Webhooks) state
+  // STAGE 4 (Cron, Webhooks & ServiceNow / Jira Connectors) state
   const [simulatedWebhookFiring, setSimulatedWebhookFiring] = useState(false);
   const [webhookLogs, setWebhookLogs] = useState(industry.recentWebhooks);
+  const [connectorProvider, setConnectorProvider] = useState<'ServiceNow' | 'Jira'>('ServiceNow');
+  const [connectorUrl, setConnectorUrl] = useState('https://enterprise.service-now.com/api/now/table/incident');
+  const [connectorAuthMode, setConnectorAuthMode] = useState<'simulator' | 'bearer' | 'api-key'>('simulator');
+  const [connectorToken, setConnectorToken] = useState('');
+  const [connectorStatusMsg, setConnectorStatusMsg] = useState<string | null>(null);
+  const [riskAiResult, setRiskAiResult] = useState<{ anomalySummary: string; source: string; persistence?: string } | null>(null);
 
   // STAGE 5 (Executive JSON & Document Exports) state
   const [copiedJson, setCopiedJson] = useState(false);
@@ -82,16 +96,24 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
   const [downloadedBrd, setDownloadedBrd] = useState(false);
   const [downloadedRtm, setDownloadedRtm] = useState(false);
   const [activeDocPreview, setActiveDocPreview] = useState<'none' | 'brd' | 'rtm'>('none');
+  const [executiveAiBrief, setExecutiveAiBrief] = useState<{ executiveNarrative: string; highlights: string[]; source: string } | null>(null);
+  const [isGeneratingExecBrief, setIsGeneratingExecBrief] = useState(false);
 
   // STAGE 6 (Retro & Vector Ingestion) state
   const [vectorIngested, setVectorIngested] = useState(industry.retrospective.ingestedIntoKnowledgeBase);
+  const [isRunningRetro, setIsRunningRetro] = useState(false);
+  const [retroResult, setRetroResult] = useState<{
+    fiveWhys: string[];
+    actionableLesson: string;
+    kbPersistMode: string;
+    source: string;
+    ownerNotification?: any;
+  } | null>(null);
 
   // STAGE 1 Handler: Run RAG Search
   const handleRunRAG = () => {
-    // Generate simulated query embeddings and compute cosine similarity against KB chunks
     const allChunks = industry.knowledgeBase.flatMap(k => k.vectorChunks);
     const scored = allChunks.map(chunk => {
-      // Mock vector similarity based on query keyword overlap
       const queryWords = ragQuery.toLowerCase().split(/\s+/).filter(w => w.length > 3);
       const chunkWords = chunk.text.toLowerCase().split(/\s+/);
       const matches = queryWords.filter(w => chunkWords.some(cw => cw.includes(w))).length;
@@ -113,8 +135,8 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
     });
   };
 
-  // STAGE 3 Handler: Remediate Orphan
-  const handleRemediateOrphan = (orphanId: string, parentId: string) => {
+  // STAGE 3 Handler: Remediate Orphan & AI Alignment Analysis
+  const handleRemediateOrphan = async (orphanId: string, parentId: string) => {
     const updated = remediateOrphanNode(nodesMap, orphanId, parentId);
     onUpdateNodesMap(updated);
     setRemediatedIds(prev => new Set([...prev, orphanId]));
@@ -130,7 +152,6 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
     });
   };
 
-  // STAGE 3 Handler: Rebalance Squad
   const handleRebalanceSquad = (squadName: string) => {
     setRebalancedSquads(prev => new Set([...prev, squadName]));
 
@@ -145,8 +166,118 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
     });
   };
 
-  // STAGE 4 Handler: Trigger Simulated Webhook
-  const handleTriggerWebhook = () => {
+  const handleRunAlignmentAi = async () => {
+    setIsLoadingAlignmentAi(true);
+    try {
+      const resp = await fetch('/api/agents/alignment-capacity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          industryName: industry.name,
+          orphanEpics: industry.graphDiagnostics.orphanEpics,
+          overAllocatedSquads: industry.graphDiagnostics.overAllocatedSquads,
+          action: 'synthesize-remediation'
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        setAlignmentAiPlan({
+          summaryPlan: data.summaryPlan,
+          recommendations: data.recommendations || [],
+          source: data.source || 'gemini-4-hydrogen'
+        });
+      }
+    } finally {
+      setIsLoadingAlignmentAi(false);
+    }
+  };
+
+  // STAGE 4 Handler: Save/Test ServiceNow or Jira Connector + Evaluate with Risk Agent
+  const handleTestConnectorAndRisk = async () => {
+    setSimulatedWebhookFiring(true);
+    setConnectorStatusMsg(null);
+    try {
+      // 1. Save endpoint configuration
+      await fetch('/api/integrations/risk-endpoints', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: connectorProvider,
+          name: `${connectorProvider} (${industry.name})`,
+          endpointUrl: connectorUrl,
+          authMode: connectorAuthMode,
+          industry: industry.name,
+          enabled: true
+        })
+      }).catch(() => {});
+
+      // 2. Test / pull signal from ServiceNow or Jira
+      const testResp = await fetch('/api/integrations/risk-endpoints/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: connectorProvider,
+          endpointUrl: connectorUrl,
+          authMode: connectorAuthMode,
+          authToken: connectorToken,
+          industryName: industry.name
+        })
+      });
+
+      if (testResp.ok) {
+        const testData = await testResp.json();
+        const signal = testData.normalizedSignal;
+        setConnectorStatusMsg(
+          `${connectorProvider} (${testData.connectionMode}) ingested: ${signal.title}`
+        );
+
+        const newWebhook = {
+          source: (connectorProvider === 'ServiceNow' ? 'ServiceNow GRC' : 'Jira Software') as 'ServiceNow GRC' | 'Jira Software',
+          event: signal.title,
+          triggerTime: 'Just now',
+          payload: testData.rawPayload
+        };
+        setWebhookLogs(prev => [newWebhook, ...prev]);
+
+        // 3. Pass ingested signal through Google Agentic Risk Detection
+        const riskResp = await fetch('/api/agents/risk-detect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            industryName: industry.name,
+            provider: connectorProvider,
+            signalTitle: signal.title,
+            signalType: signal.severity,
+            description: signal.summary,
+            knowledgeChunks: industry.knowledgeBase.flatMap(k => k.vectorChunks).slice(0, 4)
+          })
+        });
+        if (riskResp.ok) {
+          const riskData = await riskResp.json();
+          setRiskAiResult({
+            anomalySummary: riskData.anomalySummary,
+            source: riskData.source,
+            persistence: riskData.persistence
+          });
+        }
+
+        eventBus.publish({
+          topic: signal.topic || 'WEBHOOK_PAYLOAD_RECEIVED',
+          sourceAgent: `${connectorProvider} Connector`,
+          targetAgent: 'Risk Detection Agent',
+          summary: signal.summary,
+          payload: testData.rawPayload,
+          latencyMs: 24,
+          severity: 'danger'
+        });
+      }
+    } finally {
+      setSimulatedWebhookFiring(false);
+    }
+  };
+
+  // STAGE 4 Handler: Quick Trigger Simulated Jira Webhook
+  const handleTriggerWebhook = async () => {
     setSimulatedWebhookFiring(true);
     const newWebhook = {
       source: 'Jira Software' as const,
@@ -162,6 +293,30 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
 
     setWebhookLogs(prev => [newWebhook, ...prev]);
 
+    try {
+      const riskResp = await fetch('/api/agents/risk-detect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          industryName: industry.name,
+          provider: 'Jira Webhook',
+          signalTitle: 'Sprint velocity dip -11.4% (PAY-892)',
+          signalType: 'sprint_velocity_anomaly',
+          description: JSON.stringify(newWebhook.payload)
+        })
+      });
+      if (riskResp.ok) {
+        const riskData = await riskResp.json();
+        setRiskAiResult({
+          anomalySummary: riskData.anomalySummary,
+          source: riskData.source,
+          persistence: riskData.persistence
+        });
+      }
+    } catch {
+      // Non-fatal
+    }
+
     eventBus.publish({
       topic: 'WEBHOOK_PAYLOAD_RECEIVED',
       sourceAgent: 'Jira Webhook Listener',
@@ -172,9 +327,7 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
       severity: 'danger'
     });
 
-    setTimeout(() => {
-      setSimulatedWebhookFiring(false);
-    }, 400);
+    setSimulatedWebhookFiring(false);
   };
 
   // STAGE 5 Handler: Copy JSON
@@ -241,8 +394,100 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
     });
   };
 
-  // STAGE 6 Handler: Ingest Vectors
-  const handleIngestVector = () => {
+  // STAGE 5 Handler: AI Executive Synthesis
+  const handleGenerateExecutiveBrief = async () => {
+    setIsGeneratingExecBrief(true);
+    try {
+      const resp = await fetch('/api/agents/executive-report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          industryName: industry.name,
+          quarter: industry.quarter,
+          attainment: industry.attainment,
+          totalBudget: industry.totalBudget,
+          criticalCount: Object.values(nodesMap).filter((n) => n.status !== 'On Track').length,
+          nodeSummary: { totalNodes: Object.keys(nodesMap).length }
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        setExecutiveAiBrief({
+          executiveNarrative: data.executiveNarrative,
+          highlights: data.highlights || [],
+          source: data.source || 'gemini-4-hydrogen'
+        });
+        eventBus.publish({
+          topic: 'EXECUTIVE_PAYLOAD_COMPILED',
+          sourceAgent: `Executive Reporting Agent (${data.source})`,
+          targetAgent: 'Executive Portfolio',
+          summary: data.executiveNarrative,
+          payload: { source: data.source, persistence: data.persistence },
+          latencyMs: Number(data.latencyMs || 35),
+          severity: 'success'
+        });
+      }
+    } finally {
+      setIsGeneratingExecBrief(false);
+    }
+  };
+
+  // STAGE 6 Handler: Closed-Loop Retrospective -> Persist KB to MongoDB + Alert OKR Owner
+  const handleIngestVector = async () => {
+    setIsRunningRetro(true);
+    try {
+      const sampleOkr = Object.values(nodesMap).find((n) => n.status !== 'On Track') || Object.values(nodesMap)[0];
+      const resp = await fetch('/api/agents/retrospective-learn', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          industryId: industry.id,
+          industryName: industry.name,
+          sector: industry.sector,
+          okrId: sampleOkr?.id || industry.retrospective.incidentId,
+          okrTitle: sampleOkr?.title || industry.retrospective.krOrEpicName,
+          okrOwner: sampleOkr?.owner || 'OKR Owner',
+          symptom: industry.retrospective.symptom
+        })
+      });
+
+      if (resp.ok) {
+        const data = await resp.json();
+        setVectorIngested(true);
+        setRetroResult({
+          fiveWhys: data.fiveWhys || industry.retrospective.fiveWhys,
+          actionableLesson: data.actionableLesson || industry.retrospective.actionableLesson,
+          kbPersistMode: data.kbPersistMode || 'mongodb',
+          source: data.source || 'gemini-4-hydrogen',
+          ownerNotification: data.ownerNotification
+        });
+        onRetrospectiveCompleted?.({
+          actionableLesson: data.actionableLesson,
+          vectorChunk: data.vectorChunk,
+          ownerNotification: data.ownerNotification
+        });
+        eventBus.publish({
+          topic: 'KNOWLEDGE_BASE_UPDATED',
+          sourceAgent: `Retrospective & Learning Agent (${data.source})`,
+          targetAgent: 'Vector Knowledge Base & OKR Owner',
+          summary: `Closed-loop lesson persisted to ${data.kbPersistMode} KB & notified ${sampleOkr?.owner || 'OKR Owner'}`,
+          payload: {
+            incidentId: industry.retrospective.incidentId,
+            kbPersistMode: data.kbPersistMode,
+            ownerNotificationId: data.ownerNotification?.id,
+            source: data.source
+          },
+          latencyMs: Number(data.latencyMs || 42),
+          severity: 'success'
+        });
+        return;
+      }
+    } catch {
+      // Fallback local completion below
+    } finally {
+      setIsRunningRetro(false);
+    }
+
     setVectorIngested(true);
     eventBus.publish({
       topic: 'KNOWLEDGE_BASE_UPDATED',
@@ -478,15 +723,37 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
           {stage.id === 3 && (
             <div className="space-y-4">
               <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-2xs space-y-4">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                     <Layers className="w-4 h-4 text-indigo-600" />
                     7-Layer Graph Traversal Diagnostics
                   </h3>
-                  <span className="text-xs font-medium text-slate-500">
-                    Traversed: {industry.graphDiagnostics.totalNodesTraversed} Nodes across 7 Layers
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-slate-500">
+                      Traversed: {industry.graphDiagnostics.totalNodesTraversed} Nodes across 7 Layers
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void handleRunAlignmentAi()}
+                      disabled={isLoadingAlignmentAi}
+                      className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold cursor-pointer disabled:opacity-60"
+                    >
+                      {isLoadingAlignmentAi ? 'Analyzing...' : 'Run Alignment AI Diagnosis'}
+                    </button>
+                  </div>
                 </div>
+                {alignmentAiPlan && (
+                  <div className="p-3 bg-indigo-50 border border-indigo-200 rounded-xl text-xs space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-indigo-900">Alignment &amp; Capacity AI Plan</span>
+                      <span className="text-[10px] font-mono text-indigo-700">{alignmentAiPlan.source}</span>
+                    </div>
+                    <p className="text-indigo-950">{alignmentAiPlan.summaryPlan}</p>
+                    <ul className="list-disc pl-4 text-[11px] text-indigo-900 space-y-0.5">
+                      {alignmentAiPlan.recommendations.map((rec, i) => <li key={i}>{rec}</li>)}
+                    </ul>
+                  </div>
+                )}
 
                 {/* Orphan Epics Detection */}
                 <div className="p-4 bg-amber-50/70 rounded-xl border border-amber-200 text-xs space-y-2">
@@ -604,6 +871,91 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
                   </button>
                 </div>
 
+                {/* ServiceNow & Jira Live Endpoint Connector + Simulator */}
+                <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-bold text-slate-900">ServiceNow &amp; Jira Telemetry Connector</p>
+                      <p className="text-[11px] text-slate-500">
+                        Connect external REST endpoints or simulate inbound P1 incidents &amp; sprint velocity dips into the Risk Detection Agent.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      data-testid="test-risk-connector-btn"
+                      onClick={() => void handleTestConnectorAndRisk()}
+                      disabled={simulatedWebhookFiring}
+                      className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold cursor-pointer disabled:opacity-60 shrink-0"
+                    >
+                      {simulatedWebhookFiring ? 'Connecting...' : `Test & Pull ${connectorProvider} Signal`}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 text-xs">
+                    <select
+                      aria-label="Risk Connector Provider"
+                      value={connectorProvider}
+                      onChange={(e) => {
+                        const next = e.target.value === 'ServiceNow' ? 'ServiceNow' : 'Jira';
+                        setConnectorProvider(next);
+                        setConnectorUrl(
+                          next === 'ServiceNow'
+                            ? 'https://enterprise.service-now.com/api/now/table/incident'
+                            : 'https://enterprise.atlassian.net/rest/api/3/search'
+                        );
+                      }}
+                      className="px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white font-semibold"
+                    >
+                      <option value="ServiceNow">ServiceNow ITSM/GRC</option>
+                      <option value="Jira">Jira Software</option>
+                    </select>
+                    <input
+                      type="text"
+                      aria-label="Connector Endpoint URL"
+                      value={connectorUrl}
+                      onChange={(e) => setConnectorUrl(e.target.value)}
+                      placeholder="https://..."
+                      className="sm:col-span-2 px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white font-mono text-[11px]"
+                    />
+                    <select
+                      aria-label="Connector Mode"
+                      value={connectorAuthMode}
+                      onChange={(e) => setConnectorAuthMode(e.target.value as 'simulator' | 'bearer' | 'api-key')}
+                      className="px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white"
+                    >
+                      <option value="simulator">Local Simulator</option>
+                      <option value="bearer">Live REST (Bearer)</option>
+                      <option value="api-key">Live REST (API Key)</option>
+                    </select>
+                  </div>
+
+                  {connectorAuthMode !== 'simulator' && (
+                    <input
+                      type="password"
+                      value={connectorToken}
+                      onChange={(e) => setConnectorToken(e.target.value)}
+                      placeholder="Optional Bearer token / API credential for live probe"
+                      className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg bg-white text-xs"
+                    />
+                  )}
+
+                  {connectorStatusMsg && (
+                    <div className="p-2.5 rounded-lg border border-emerald-200 bg-emerald-50 text-[11px] text-emerald-900 font-medium">
+                      {connectorStatusMsg}
+                    </div>
+                  )}
+
+                  {riskAiResult && (
+                    <div className="p-3 rounded-lg border border-amber-200 bg-amber-50 text-xs space-y-1">
+                      <div className="flex items-center justify-between text-[10px] font-bold uppercase text-amber-800">
+                        <span>Risk Detection AI Synthesis</span>
+                        <span>Engine: {riskAiResult.source} · {riskAiResult.persistence}</span>
+                      </div>
+                      <p className="text-amber-950 font-medium">{riskAiResult.anomalySummary}</p>
+                    </div>
+                  )}
+                </div>
+
                 {/* Scheduled Cron Jobs Table */}
                 <div className="space-y-2">
                   <p className="text-xs font-bold text-slate-500 uppercase">Configured Autonomous Cron Jobs</p>
@@ -662,6 +1014,15 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => void handleGenerateExecutiveBrief()}
+                      disabled={isGeneratingExecBrief}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg shadow-2xs transition-all cursor-pointer disabled:opacity-60"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>{isGeneratingExecBrief ? 'Synthesizing...' : 'Generate AI Portfolio Brief'}</span>
+                    </button>
                     {/* Export to CSV Button */}
                     <button
                       onClick={handleExportCSV}
@@ -704,6 +1065,21 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
                     </button>
                   </div>
                 </div>
+
+                {executiveAiBrief && (
+                  <div className="p-4 rounded-xl bg-indigo-50 border border-indigo-200 text-xs space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-indigo-900 uppercase text-[10px]">
+                        AI Executive Portfolio Synthesis
+                      </span>
+                      <span className="font-mono text-[10px] text-indigo-700">{executiveAiBrief.source}</span>
+                    </div>
+                    <p className="text-indigo-950 font-medium">{executiveAiBrief.executiveNarrative}</p>
+                    <ul className="list-disc pl-4 text-[11px] text-indigo-900 space-y-0.5">
+                      {executiveAiBrief.highlights.map((h, i) => <li key={i}>{h}</li>)}
+                    </ul>
+                  </div>
+                )}
 
                 {/* Executive Summary Cards */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
@@ -881,18 +1257,41 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
                     </p>
                   </div>
                   <button
-                    onClick={handleIngestVector}
-                    disabled={vectorIngested}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                    type="button"
+                    data-testid="retro-close-loop-btn"
+                    onClick={() => void handleIngestVector()}
+                    disabled={isRunningRetro}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer disabled:opacity-60 ${
                       vectorIngested
                         ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
                         : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-2xs'
                     }`}
                   >
                     <Database className="w-3.5 h-3.5" />
-                    <span>{vectorIngested ? '✓ Ingested to Knowledge Base' : 'Ingest Lessons to Vector DB'}</span>
+                    <span>
+                      {isRunningRetro
+                        ? 'Persisting Lesson & Notifying Owner...'
+                        : vectorIngested
+                          ? '✓ Persisted to KB & Owner Notified (Re-Run)'
+                          : 'Close Loop: Persist Lesson to KB & Notify OKR Owner'}
+                    </span>
                   </button>
                 </div>
+
+                {retroResult && (
+                  <div className="p-3 bg-indigo-50 border border-indigo-200 rounded-xl text-xs space-y-1">
+                    <div className="flex items-center justify-between text-[10px] font-bold uppercase text-indigo-800">
+                      <span>Closed-Loop Knowledge Base &amp; Owner Alert Dispatched</span>
+                      <span>Engine: {retroResult.source} · Store: {retroResult.kbPersistMode}</span>
+                    </div>
+                    <p className="text-indigo-950 font-medium">{retroResult.actionableLesson}</p>
+                    {retroResult.ownerNotification && (
+                      <p className="text-[11px] text-emerald-800 font-semibold">
+                        Alert sent to {retroResult.ownerNotification.targetOwner}: &ldquo;{retroResult.ownerNotification.summary}&rdquo;
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {/* Incident Statement */}
                 <div className="p-3.5 bg-slate-50 rounded-lg border border-slate-200 text-xs">
@@ -908,7 +1307,7 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
                 <div className="space-y-1.5">
                   <p className="text-xs font-bold text-slate-500 uppercase">5 Whys Root-Cause Chain</p>
                   <div className="space-y-1.5">
-                    {industry.retrospective.fiveWhys.map((why, idx) => (
+                    {(retroResult?.fiveWhys || industry.retrospective.fiveWhys).map((why, idx) => (
                       <div key={idx} className="p-2.5 bg-indigo-50/60 rounded-lg border border-indigo-100 text-xs text-indigo-950 flex items-center gap-2">
                         <span className="w-5 h-5 rounded-full bg-indigo-600 text-white text-[10px] font-bold flex items-center justify-center shrink-0">
                           {idx + 1}
@@ -925,7 +1324,7 @@ export const AgentDeepDiveModal: React.FC<AgentDeepDiveModalProps> = ({
                     Actionable Lesson for Next Cycle (Q1 2027)
                   </span>
                   <p className="text-emerald-950 font-medium">
-                    {industry.retrospective.actionableLesson}
+                    {retroResult?.actionableLesson || industry.retrospective.actionableLesson}
                   </p>
                 </div>
               </div>

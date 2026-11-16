@@ -54,6 +54,7 @@ import {
   ConversationIntent,
   ConversationalOkrDraft,
   ConversationalParseResult,
+  ConversationalRoutedAgent,
   mergeConversationalDrafts,
   MissingAttributeDetail,
   MissingAttributeKey,
@@ -87,6 +88,9 @@ interface OkrProgramStudioViewProps {
   policies: OkrEnterprisePolicy[];
   onNavigateToTrajectory?: () => void;
   requestedTarget?: StudioRequestedTarget | null;
+  canCreateOkr?: boolean;
+  canExecuteLifecycle?: boolean;
+  onNavigateFromConversationalRoute?: (route: ConversationalRoutedAgent) => void;
 }
 
 type ConversationalResponse = ConversationalParseResult;
@@ -100,6 +104,8 @@ interface ConversationTurn {
   actionPlan?: string[];
   questions?: string[];
   nextExpectedField?: MissingAttributeKey | null;
+  routedAgents?: ConversationalRoutedAgent[];
+  routingSummary?: string;
 }
 
 export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
@@ -114,7 +120,10 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   orgDirectory,
   policies,
   onNavigateToTrajectory,
-  requestedTarget
+  requestedTarget,
+  canCreateOkr = true,
+  canExecuteLifecycle = true,
+  onNavigateFromConversationalRoute
 }) => {
   // Tabs: 'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor'
   const [activeTab, setActiveTab] = useState<'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor'>('okrs');
@@ -182,6 +191,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
   const [recommendedMitigations, setRecommendedMitigations] = useState<
     Record<string, Array<{ plan: string; prediction: string; confidence: number; program: string; source: string }>>
   >({});
+  const [mitigationLoadingId, setMitigationLoadingId] = useState<string | null>(null);
 
   // Filter OKR level nodes (Layer 3)
   const okrNodes = useMemo(() => {
@@ -1134,7 +1144,9 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         confidence: payload.confidence,
         actionPlan: payload.actionPlan,
         questions: payload.questions,
-        nextExpectedField
+        nextExpectedField,
+        routedAgents: Array.isArray(payload.routedAgents) ? payload.routedAgents : undefined,
+        routingSummary: payload.routingSummary
       };
       setConversationTurns((prev) => [...prev, assistantTurn]);
       setConversationDraft(mergedDraft ? { ...mergedDraft, lastAskedField: nextExpectedField } : null);
@@ -1163,6 +1175,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
           parentOptions: potentialParents.slice(0, 20).map((parent) => ({ id: parent.id, title: parent.title })),
           existingOkrTitles: okrNodes.slice(0, 20).map((node) => node.title),
           priorityOptions: ['P0 - Critical', 'P1 - High', 'P2 - Medium', 'AI_RECOMMENDED'],
+          activeDisasterCount: activeDisasters.filter((d) => d.active).length,
           autoCompleteRemaining
         }
       };
@@ -1571,7 +1584,8 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
     setTimeout(() => setFeedbackMessage(null), 4000);
   };
 
-  const handleRecommendMitigation = (disaster: SignificantDisasterEvent) => {
+  const handleRecommendMitigation = async (disaster: SignificantDisasterEvent) => {
+    setMitigationLoadingId(disaster.id);
     const lower = `${disaster.type} ${disaster.title} ${disaster.description}`.toLowerCase();
     const candidateChunks = industry.knowledgeBase.flatMap((pillar) =>
       pillar.vectorChunks
@@ -1619,7 +1633,7 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
       }
     ];
 
-    const mappedPrograms = candidateChunks.length > 0
+    const deterministicPlans = candidateChunks.length > 0
       ? candidateChunks.slice(0, 3).map((chunk, index) => ({
           plan: `${chunk.pillar} signal supports a fast containment plan focused on ${chunk.text.slice(0, 90).replace(/\s+/g, ' ').trim()}.`,
           prediction: `${82 + index * 5}%`,
@@ -1629,10 +1643,64 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         }))
       : fallbackPlans;
 
-    setRecommendedMitigations((prev) => ({
-      ...prev,
-      [disaster.id]: mappedPrograms
-    }));
+    try {
+      const response = await fetch('/api/agents/risk-detect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          industryName: industry.name,
+          provider: 'Internal Disaster Feed',
+          signalPayload: {
+            disasterId: disaster.id,
+            title: disaster.title,
+            type: disaster.type,
+            severity: disaster.severity,
+            description: disaster.description,
+            attainmentDropPct: disaster.impacts.attainmentDropPct,
+            mitigationAction: disaster.impacts.mitigationAction
+          },
+          activeDisasters: [disaster]
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (Array.isArray(data?.rankedMitigations) && data.rankedMitigations.length > 0) {
+          const aiPlans = data.rankedMitigations.map((item: any) => ({
+            plan: String(item.plan || disaster.impacts.mitigationAction),
+            prediction: String(item.prediction || '84%'),
+            confidence: Number(item.confidence || 0.9),
+            program: String(item.program || 'AI Recovery Sprint'),
+            source: `${String(item.source || 'Risk Detection Agent')} (${data.source || 'gemini'})`
+          }));
+          setRecommendedMitigations((prev) => ({
+            ...prev,
+            [disaster.id]: aiPlans
+          }));
+          eventBus.publish({
+            topic: 'RISK_SENTINEL_ALERT',
+            sourceAgent: 'Risk Detection Agent',
+            targetAgent: 'OKR & Program Studio',
+            summary: `Generated ${aiPlans.length} AI-grounded mitigation plans for "${disaster.title}"`,
+            payload: { disasterId: disaster.id, engine: data.source },
+            latencyMs: 28,
+            severity: 'info'
+          });
+          return;
+        }
+      }
+      setRecommendedMitigations((prev) => ({
+        ...prev,
+        [disaster.id]: deterministicPlans
+      }));
+    } catch {
+      setRecommendedMitigations((prev) => ({
+        ...prev,
+        [disaster.id]: deterministicPlans
+      }));
+    } finally {
+      setMitigationLoadingId(null);
+    }
   };
 
   // Handle Disaster Simulation Trigger / Resolve
@@ -1793,22 +1861,30 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Left Column (5 cols): OKR List with Human-in-the-Loop Priority Selectors */}
           <div className="lg:col-span-5 bg-white rounded-2xl border border-slate-200/80 p-5 shadow-xs space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <div>
                 <h3 className="text-base font-bold text-slate-900">Active Enterprise OKRs</h3>
-                <p className="text-xs text-slate-500">Override AI priority with manual Human-in-the-Loop authority.</p>
+                <p className="text-xs text-slate-500">
+                  {canCreateOkr
+                    ? 'Override AI priority with manual Human-in-the-Loop authority.'
+                    : 'Read-only monitoring scope: view OKR traceability, health & telemetry.'}
+                </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 shrink-0">
                 <button
-                  onClick={() => setIsConversationalAgentOpen(true)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-violet-200 bg-violet-50 hover:bg-violet-100 text-violet-700 text-xs font-semibold shadow-xs cursor-pointer transition-all"
+                  onClick={() => canCreateOkr && setIsConversationalAgentOpen(true)}
+                  disabled={!canCreateOkr}
+                  title={!canCreateOkr ? 'Only OKR Creator or Super Admin can draft OKRs' : undefined}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-violet-200 bg-violet-50 hover:bg-violet-100 text-violet-700 text-xs font-semibold shadow-xs cursor-pointer transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <MessageSquare className="w-3.5 h-3.5" />
                   <span>Conversational Agent</span>
                 </button>
                 <button
-                  onClick={handleOpenAddOkrModal}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-xs cursor-pointer transition-all"
+                  onClick={() => canCreateOkr && handleOpenAddOkrModal()}
+                  disabled={!canCreateOkr}
+                  title={!canCreateOkr ? 'Only OKR Creator or Super Admin can create OKRs' : undefined}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-xs cursor-pointer transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   <span>Add OKR</span>
@@ -1895,8 +1971,9 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                       {(['P0 - Critical', 'P1 - High', 'P2 - Medium', 'AI_RECOMMENDED'] as PriorityLevel[]).map((lvl) => (
                         <button
                           key={lvl}
-                          onClick={() => handleSetManualPriority(okr.id, lvl)}
-                          className={`px-2 py-0.5 rounded text-[10px] font-bold transition-all cursor-pointer ${
+                          disabled={!canCreateOkr}
+                          onClick={() => canCreateOkr && handleSetManualPriority(okr.id, lvl)}
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
                             manualPriority === lvl
                               ? 'bg-slate-900 text-white shadow-xs'
                               : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -2541,14 +2618,17 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => handleRecommendMitigation(disaster)}
-                      className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold cursor-pointer transition-all shadow-xs"
+                      data-testid={`recommend-mitigation-${disaster.id}`}
+                      disabled={mitigationLoadingId === disaster.id}
+                      onClick={() => void handleRecommendMitigation(disaster)}
+                      className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-[10px] font-bold cursor-pointer transition-all shadow-xs"
                     >
-                      Recommanded-Mitigation
+                      {mitigationLoadingId === disaster.id ? 'Synthesizing AI Plan...' : 'Recommend Mitigation'}
                     </button>
                     <button
-                      onClick={() => handleToggleDisaster(disaster.id)}
-                      className={`px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all shadow-xs ${
+                      onClick={() => canExecuteLifecycle && handleToggleDisaster(disaster.id)}
+                      disabled={!canExecuteLifecycle}
+                      className={`px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all shadow-xs disabled:opacity-50 disabled:cursor-not-allowed ${
                         disaster.active
                           ? 'bg-slate-900 text-white hover:bg-slate-800'
                           : 'bg-red-600 hover:bg-red-700 text-white'
@@ -2819,6 +2899,34 @@ export const OkrProgramStudioView: React.FC<OkrProgramStudioViewProps> = ({
                             <ul className="list-disc pl-4 space-y-0.5">
                               {turn.questions.slice(0, 3).map((item) => <li key={item}>{item}</li>)}
                             </ul>
+                          </div>
+                        )}
+                        {Array.isArray(turn.routedAgents) && turn.routedAgents.length > 0 && (
+                          <div className="pt-1.5 border-t border-slate-200/80 space-y-1">
+                            <p className="font-bold text-indigo-800">
+                              Proactive Agentic Routing{turn.routingSummary ? ` — ${turn.routingSummary}` : ''}
+                            </p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {turn.routedAgents.map((route) => (
+                                <button
+                                  key={`${turn.id}-${route.agentKey}`}
+                                  type="button"
+                                  title={route.reason}
+                                  onClick={() => {
+                                    if (route.suggestedView === 'studio' && route.suggestedTab) {
+                                      setActiveTab(route.suggestedTab);
+                                      setIsConversationalAgentOpen(false);
+                                    } else if (onNavigateFromConversationalRoute) {
+                                      setIsConversationalAgentOpen(false);
+                                      onNavigateFromConversationalRoute(route);
+                                    }
+                                  }}
+                                  className="px-2 py-1 rounded-md border border-indigo-200 bg-white hover:bg-indigo-50 text-indigo-700 font-semibold text-[10px] cursor-pointer transition-colors"
+                                >
+                                  {route.agentName}: {route.actionLabel}
+                                </button>
+                              ))}
+                            </div>
                           </div>
                         )}
                       </div>

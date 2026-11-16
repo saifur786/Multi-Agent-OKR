@@ -80,6 +80,15 @@ export interface ConversationalOrchestrationEvent {
   severity: 'info' | 'success' | 'warning' | 'danger';
 }
 
+export interface ConversationalRoutedAgent {
+  agentKey: string;
+  agentName: string;
+  reason: string;
+  suggestedView: 'studio' | 'lifecycle' | 'advisory' | 'traceability' | 'knowledge' | 'strategy';
+  suggestedTab?: 'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor';
+  actionLabel: string;
+}
+
 export interface ConversationalParseResult {
   assistantMessage: string;
   intent: ConversationIntent;
@@ -94,6 +103,8 @@ export interface ConversationalParseResult {
   readinessPct: number;
   isDraftComplete: boolean;
   nextExpectedField: MissingAttributeKey | null;
+  routedAgents?: ConversationalRoutedAgent[];
+  routingSummary?: string;
 }
 
 const KNOWN_SECTION_KEYS = new Set([
