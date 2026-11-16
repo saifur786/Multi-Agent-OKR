@@ -61,6 +61,10 @@ import {
   isSignificantAnomalyDeviation,
   type WorkerAgentStatusSummary
 } from './utils/workerAgentTelemetry';
+import {
+  computeAllStagesOverview,
+  filterInsightsByStage
+} from './utils/orchestrationDrilldown';
 import { LifecycleView } from './components/LifecycleView';
 import {
   UserPreferences,
@@ -1065,19 +1069,27 @@ export default function App() {
       .then((resp) => (resp.ok ? resp.json() : null))
       .then((data) => {
         if (Array.isArray(data?.runs) && data.runs.length > 0) {
-          setOrchestrationRuns(
-            normalizeOrchestrationRuns(data.runs).slice(-10).map((r, i) => ({
-              ...r,
-              run: `Run ${i + 1}`
-            }))
-          );
+          const normalized = normalizeOrchestrationRuns(data.runs).slice(-10).map((r, i) => ({
+            ...r,
+            run: `Run ${i + 1}`
+          }));
+          setOrchestrationRuns(normalized);
+          setInsightsPersistenceInfo({
+            source: String(data?.persistence || data?.run?.source || '').includes('mongodb') ? 'mongodb' : 'memory',
+            savedCount: normalized.length * 6
+          });
         } else if (data?.run) {
-          setOrchestrationRuns((prev) =>
-            normalizeOrchestrationRuns([...prev, data.run]).slice(-10).map((r, i) => ({
+          setOrchestrationRuns((prev) => {
+            const next = normalizeOrchestrationRuns([...prev, data.run]).slice(-10).map((r, i) => ({
               ...r,
               run: `Run ${i + 1}`
-            }))
-          );
+            }));
+            setInsightsPersistenceInfo({
+              source: String(data?.persistence || data?.run?.source || '').includes('mongodb') ? 'mongodb' : 'memory',
+              savedCount: next.length * 6
+            });
+            return next;
+          });
         }
       })
       .catch(() => {});
@@ -1217,14 +1229,26 @@ export default function App() {
     ])
   );
   const [selectedWorkerAgent, setSelectedWorkerAgent] = useState<WorkerAgentStatusSummary | null>(null);
+  const [selectedInsightStageId, setSelectedInsightStageId] = useState<number | null>(null);
+  const [insightsPersistenceInfo, setInsightsPersistenceInfo] = useState<{
+    source: 'mongodb' | 'memory';
+    savedCount: number;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    setSelectedInsightStageId(null);
     void fetch(`/api/orchestration-runs?industry=${encodeURIComponent(selectedIndustry)}`)
       .then((resp) => (resp.ok ? resp.json() : null))
       .then((data) => {
         if (!cancelled && Array.isArray(data?.runs) && data.runs.length > 0) {
-          setOrchestrationRuns(normalizeOrchestrationRuns(data.runs));
+          const normalized = normalizeOrchestrationRuns(data.runs);
+          setOrchestrationRuns(normalized);
+          const isMongo = String(data.source || '').startsWith('mongodb');
+          setInsightsPersistenceInfo({
+            source: isMongo ? 'mongodb' : 'memory',
+            savedCount: normalized.length * 6
+          });
         }
       })
       .catch(() => {});
@@ -1251,6 +1275,76 @@ export default function App() {
         };
       }),
     [orchestrationInsights, anomalyStats]
+  );
+
+  const stageOverviewCards = useMemo(
+    () => computeAllStagesOverview(orchestrationInsights),
+    [orchestrationInsights]
+  );
+
+  const stageDrilldown = useMemo(
+    () => (selectedInsightStageId !== null ? filterInsightsByStage(orchestrationInsights, selectedInsightStageId) : null),
+    [orchestrationInsights, selectedInsightStageId]
+  );
+
+  const displayedInsightsRuns: OrchestrationRunRecord[] = stageDrilldown
+    ? stageDrilldown.filteredRuns
+    : orchestrationInsights;
+  const activeAnomalyStats = stageDrilldown ? stageDrilldown.anomalyStats : anomalyStats;
+  const activeAnomalyChartData = stageDrilldown ? stageDrilldown.filteredRuns : anomalyChartData;
+
+  const successYAxisMin = useMemo(() => {
+    if (displayedInsightsRuns.length === 0) return 70;
+    const minRate = Math.min(...displayedInsightsRuns.map((r) => Number(r.successRate || 70)));
+    return Math.max(40, Math.min(70, Math.floor(minRate / 5) * 5 - 5));
+  }, [displayedInsightsRuns]);
+
+  const handleSelectInsightStage = useCallback(
+    async (stageId: number | null) => {
+      if (stageId === null) {
+        setSelectedInsightStageId(null);
+        return;
+      }
+
+      const nextStage = selectedInsightStageId === stageId ? null : stageId;
+      setSelectedInsightStageId(nextStage);
+
+      if (nextStage !== null) {
+        try {
+          const resp = await fetch('/api/orchestration-stage-metrics', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              industry: selectedIndustry,
+              stageId: nextStage,
+              runs: orchestrationInsights
+            })
+          });
+          if (resp.ok) {
+            const payload = await resp.json();
+            setInsightsPersistenceInfo({
+              source: payload.persistence === 'mongodb' ? 'mongodb' : 'memory',
+              savedCount: Number(payload.savedCount || orchestrationInsights.length * 6)
+            });
+          }
+        } catch {
+          // Non-fatal fallback
+        }
+      }
+    },
+    [orchestrationInsights, selectedIndustry, selectedInsightStageId]
+  );
+
+  const handleChartDrilldownClick = useCallback(
+    (chartState: any) => {
+      const payload = chartState?.activePayload?.[0]?.payload;
+      if (!payload) return;
+      const targetStage = Number(payload.activeStage || 1);
+      if (targetStage >= 1 && targetStage <= 6) {
+        void handleSelectInsightStage(targetStage);
+      }
+    },
+    [handleSelectInsightStage]
   );
 
   const [liveWorkerAgentStatuses, setLiveWorkerAgentStatuses] = useState<Array<{
@@ -1842,13 +1936,52 @@ export default function App() {
             >
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
                 <div>
-                  <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-indigo-600">Orchestration Insights</p>
-                  <h2 className="text-lg font-bold text-slate-900">6-Stage Multi-Agent Pipeline Health</h2>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-indigo-600">
+                      Orchestration Insights
+                    </p>
+                    {stageDrilldown && (
+                      <span
+                        data-testid="drilldown-stage-badge"
+                        className="rounded-md bg-indigo-50 border border-indigo-200 px-2 py-0.5 text-[10px] font-bold text-indigo-700"
+                      >
+                        Drilldown · Stage {stageDrilldown.stageId}
+                      </span>
+                    )}
+                    {insightsPersistenceInfo && (
+                      <span
+                        data-testid="insights-persistence-badge"
+                        className="rounded-md bg-slate-100 border border-slate-200 px-2 py-0.5 text-[10px] font-semibold text-slate-600 tabular-nums"
+                      >
+                        {insightsPersistenceInfo.source === 'mongodb' ? 'MongoDB Saved' : 'Synced'} ({insightsPersistenceInfo.savedCount} stage snapshots)
+                      </span>
+                    )}
+                  </div>
+                  <h2 className="text-lg font-bold text-slate-900 mt-0.5">
+                    {stageDrilldown
+                      ? `Stage ${stageDrilldown.stageId}: ${stageDrilldown.stageName} — Constituent Agents`
+                      : '6-Stage Multi-Agent Pipeline Health'}
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {stageDrilldown
+                      ? `${stageDrilldown.processFlowAgent} · Showing metrics filtered for ${stageDrilldown.stageName} across the last ${stageDrilldown.runCount} runs.`
+                      : 'Click any stage below or any point on a chart to filter metrics for that stage and inspect its constituent agents.'}
+                  </p>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {stageDrilldown && (
+                    <button
+                      type="button"
+                      data-testid="exit-drilldown-btn"
+                      onClick={() => void handleSelectInsightStage(null)}
+                      className="inline-flex items-center gap-1 rounded-full border border-indigo-300 bg-indigo-600 hover:bg-indigo-700 px-3 py-1 text-[11px] font-semibold text-white cursor-pointer"
+                    >
+                      All 6 Stages
+                    </button>
+                  )}
                   <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-[11px] font-semibold text-indigo-700 tabular-nums">
                     <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
-                    Last {orchestrationInsights.length} runs tracked
+                    Last {displayedInsightsRuns.length} runs tracked
                   </div>
                   <button
                     type="button"
@@ -1861,148 +1994,340 @@ export default function App() {
               </div>
 
               {!isInsightsCollapsed && (
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                  <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                    <div className="mb-2 text-xs font-semibold text-slate-700">Success Rate Trend</div>
-                    <ResponsiveContainer width="100%" height="90%">
-                      <LineChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
-                        <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
-                        <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <YAxis domain={[70, 100]} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <Tooltip formatter={(value) => [`${Number(value ?? 0).toFixed(1)}%`, 'Success rate']} />
-                        <Legend />
-                        <Line type="monotone" dataKey="successRate" name="Success rate" stroke="#4f46e5" strokeWidth={2.5} dot={{ r: 3 }} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  </div>
-
-                  <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                    <div className="mb-2 text-xs font-semibold text-slate-700">Latency (ms)</div>
-                    <ResponsiveContainer width="100%" height="90%">
-                      <BarChart data={orchestrationInsights} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
-                        <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
-                        <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <Tooltip formatter={(value) => [`${Number(value ?? 0).toFixed(0)} ms`, 'Latency']} />
-                        <Legend />
-                        <Bar dataKey="latencyMs" name="Latency" fill="#14b8a6" radius={[6, 6, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-
+                <div className="space-y-4">
+                  {/* Interactive 6-Stage Drilldown Selector */}
                   <div
-                    data-testid="historical-anomaly-chart"
-                    className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3"
+                    data-testid="insights-stage-selector"
+                    className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2"
                   >
-                    <div className="mb-2 flex items-center justify-between gap-2">
-                      <span className="text-xs font-semibold text-slate-700 truncate">Historical Anomaly Frequency</span>
-                      <span
-                        data-testid="anomaly-mean-summary"
-                        className={`text-[11px] font-semibold tabular-nums whitespace-nowrap shrink-0 ${
-                          anomalyStats.spikeRunCount > 0 ? 'text-red-700' : 'text-slate-600'
-                        }`}
-                      >
-                        Mean {anomalyStats.mean.toFixed(1)} · {anomalyStats.spikeRunCount} spike{anomalyStats.spikeRunCount === 1 ? '' : 's'}
-                      </span>
+                    {stageOverviewCards.map((stageCard) => {
+                      const isSelected = selectedInsightStageId === stageCard.stageId;
+                      return (
+                        <button
+                          key={stageCard.stageId}
+                          type="button"
+                          data-testid={`insight-stage-card-${stageCard.stageId}`}
+                          aria-pressed={isSelected}
+                          onClick={() => void handleSelectInsightStage(stageCard.stageId)}
+                          className={`text-left rounded-xl border p-2.5 transition-all cursor-pointer ${
+                            isSelected
+                              ? 'border-indigo-500 bg-indigo-50/90 ring-1 ring-indigo-500 shadow-xs'
+                              : 'border-slate-200 bg-slate-50/80 hover:bg-white hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1">
+                            <span
+                              className={`text-[10px] font-bold uppercase tracking-wider ${
+                                isSelected ? 'text-indigo-700' : 'text-slate-500'
+                              }`}
+                            >
+                              Stage {stageCard.stageId}
+                            </span>
+                            <span
+                              className={`text-[10px] font-bold tabular-nums ${
+                                stageCard.totalAnomalies > 0 ? 'text-red-700' : 'text-emerald-700'
+                              }`}
+                            >
+                              {stageCard.totalAnomalies} anom
+                            </span>
+                          </div>
+                          <p className="mt-1 text-xs font-bold text-slate-900 truncate">
+                            {stageCard.stageName}
+                          </p>
+                          <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-600 tabular-nums">
+                            <span>{stageCard.avgSuccessRate.toFixed(1)}%</span>
+                            <span>{stageCard.avgLatencyMs}ms</span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* 3 Filtered Metric Charts */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-700 truncate">
+                          {stageDrilldown ? `${stageDrilldown.stageName} Success Rate` : 'Success Rate Trend'}
+                        </span>
+                        {stageDrilldown && (
+                          <span className="text-[11px] font-semibold text-indigo-700 tabular-nums whitespace-nowrap">
+                            Avg {stageDrilldown.avgSuccessRate.toFixed(1)}%
+                          </span>
+                        )}
+                      </div>
+                      <ResponsiveContainer width="100%" height="90%">
+                        <LineChart
+                          data={displayedInsightsRuns}
+                          onClick={handleChartDrilldownClick}
+                          margin={{ top: 8, right: 12, left: -8, bottom: 0 }}
+                          className="cursor-pointer"
+                        >
+                          <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+                          <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                          <YAxis domain={[successYAxisMin, 100]} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                          <Tooltip
+                            formatter={(value, _name, item) => [
+                              `${Number(value ?? 0).toFixed(1)}% (${item?.payload?.stage || 'Pipeline'})`,
+                              'Success rate'
+                            ]}
+                          />
+                          <Legend />
+                          <Line
+                            type="monotone"
+                            dataKey="successRate"
+                            name={stageDrilldown ? `${stageDrilldown.stageName} Success` : 'Success rate'}
+                            stroke="#4f46e5"
+                            strokeWidth={2.5}
+                            dot={{ r: 3.5, cursor: 'pointer' }}
+                            activeDot={{ r: 6, cursor: 'pointer' }}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
                     </div>
-                    <ResponsiveContainer width="100%" height="90%">
-                      <AreaChart data={anomalyChartData} margin={{ top: 14, right: 12, left: -12, bottom: 0 }}>
-                        <defs>
-                          <linearGradient id="anomalyFrequencyFill" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="#dc2626" stopOpacity={0.22} />
-                            <stop offset="95%" stopColor="#64748b" stopOpacity={0.04} />
-                          </linearGradient>
-                        </defs>
-                        <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
-                        <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <YAxis allowDecimals={false} domain={[0, 'dataMax + 1']} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
-                        <Tooltip
-                          formatter={(value, _name, item) => {
-                            const count = Number(value ?? 0);
-                            const isSpike = Boolean(item?.payload?.isAnomalySpike);
-                            return [
-                              `${count} anomalies${isSpike ? ` (Significantly above mean ${anomalyStats.mean.toFixed(1)})` : ` (Mean ${anomalyStats.mean.toFixed(1)})`}`,
-                              isSpike ? 'Alert Spike' : 'Risk Sentinel'
-                            ];
-                          }}
-                        />
-                        <Legend />
-                        <ReferenceLine
-                          y={anomalyStats.mean}
-                          stroke="#475569"
-                          strokeDasharray="4 4"
-                          strokeWidth={1.5}
-                          ifOverflow="extendDomain"
-                          label={{
-                            value: `Mean (${anomalyStats.mean.toFixed(1)})`,
-                            position: 'insideTopRight',
-                            dy: -14,
-                            fill: '#334155',
-                            fontSize: 10,
-                            fontWeight: 700
-                          }}
-                        />
-                        <Area
-                          type="monotone"
-                          dataKey="anomalyCount"
-                          name="Anomalies (Red = Spike)"
-                          stroke="#64748b"
-                          strokeWidth={2}
-                          fill="url(#anomalyFrequencyFill)"
-                          dot={(dotProps: any) => {
-                            const { cx, cy, payload, index } = dotProps;
-                            if (typeof cx !== 'number' || typeof cy !== 'number') {
-                              return <g key={`empty-dot-${index}`} />;
-                            }
-                            if (payload?.isAnomalySpike) {
+
+                    <div className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-700 truncate">
+                          {stageDrilldown ? `${stageDrilldown.stageName} Latency (ms)` : 'Latency (ms)'}
+                        </span>
+                        {stageDrilldown && (
+                          <span className="text-[11px] font-semibold text-teal-700 tabular-nums whitespace-nowrap">
+                            Avg {stageDrilldown.avgLatencyMs} ms
+                          </span>
+                        )}
+                      </div>
+                      <ResponsiveContainer width="100%" height="90%">
+                        <BarChart
+                          data={displayedInsightsRuns}
+                          onClick={handleChartDrilldownClick}
+                          margin={{ top: 8, right: 12, left: -8, bottom: 0 }}
+                          className="cursor-pointer"
+                        >
+                          <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+                          <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                          <YAxis tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                          <Tooltip
+                            formatter={(value, _name, item) => [
+                              `${Number(value ?? 0).toFixed(0)} ms (${item?.payload?.stage || 'Pipeline'})`,
+                              'Latency'
+                            ]}
+                          />
+                          <Legend />
+                          <Bar
+                            dataKey="latencyMs"
+                            name={stageDrilldown ? `${stageDrilldown.stageName} Latency` : 'Latency'}
+                            fill="#14b8a6"
+                            radius={[6, 6, 0, 0]}
+                            cursor="pointer"
+                          />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+
+                    <div
+                      data-testid="historical-anomaly-chart"
+                      className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3"
+                    >
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-700 truncate">
+                          {stageDrilldown ? `${stageDrilldown.stageName} Anomalies` : 'Historical Anomaly Frequency'}
+                        </span>
+                        <span
+                          data-testid="anomaly-mean-summary"
+                          className={`text-[11px] font-semibold tabular-nums whitespace-nowrap shrink-0 ${
+                            activeAnomalyStats.spikeRunCount > 0 ? 'text-red-700' : 'text-slate-600'
+                          }`}
+                        >
+                          Mean {activeAnomalyStats.mean.toFixed(1)} · {activeAnomalyStats.spikeRunCount} spike{activeAnomalyStats.spikeRunCount === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                      <ResponsiveContainer width="100%" height="90%">
+                        <AreaChart
+                          data={activeAnomalyChartData}
+                          onClick={handleChartDrilldownClick}
+                          margin={{ top: 14, right: 12, left: -12, bottom: 0 }}
+                          className="cursor-pointer"
+                        >
+                          <defs>
+                            <linearGradient id="anomalyFrequencyFill" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#dc2626" stopOpacity={0.22} />
+                              <stop offset="95%" stopColor="#64748b" stopOpacity={0.04} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
+                          <XAxis dataKey="run" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                          <YAxis allowDecimals={false} domain={[0, 'dataMax + 1']} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                          <Tooltip
+                            formatter={(value, _name, item) => {
+                              const count = Number(value ?? 0);
+                              const isSpike = Boolean(item?.payload?.isAnomalySpike);
+                              return [
+                                `${count} anomalies${isSpike ? ` (Significantly above mean ${activeAnomalyStats.mean.toFixed(1)})` : ` (Mean ${activeAnomalyStats.mean.toFixed(1)})`}`,
+                                isSpike ? 'Alert Spike' : stageDrilldown ? stageDrilldown.stageName : 'Risk Sentinel'
+                              ];
+                            }}
+                          />
+                          <Legend />
+                          <ReferenceLine
+                            y={activeAnomalyStats.mean}
+                            stroke="#475569"
+                            strokeDasharray="4 4"
+                            strokeWidth={1.5}
+                            ifOverflow="extendDomain"
+                            label={{
+                              value: `Mean (${activeAnomalyStats.mean.toFixed(1)})`,
+                              position: 'insideTopRight',
+                              dy: -14,
+                              fill: '#334155',
+                              fontSize: 10,
+                              fontWeight: 700
+                            }}
+                          />
+                          <Area
+                            type="monotone"
+                            dataKey="anomalyCount"
+                            name="Anomalies (Red = Spike)"
+                            stroke="#64748b"
+                            strokeWidth={2}
+                            fill="url(#anomalyFrequencyFill)"
+                            dot={(dotProps: any) => {
+                              const { cx, cy, payload, index } = dotProps;
+                              if (typeof cx !== 'number' || typeof cy !== 'number') {
+                                return <g key={`empty-dot-${index}`} />;
+                              }
+                              if (payload?.isAnomalySpike) {
+                                return (
+                                  <circle
+                                    key={`anomaly-spike-dot-${index}`}
+                                    cx={cx}
+                                    cy={cy}
+                                    r={5.5}
+                                    fill="#dc2626"
+                                    stroke="#fecaca"
+                                    strokeWidth={2.5}
+                                    data-anomaly-spike="true"
+                                  />
+                                );
+                              }
                               return (
                                 <circle
-                                  key={`anomaly-spike-dot-${index}`}
+                                  key={`anomaly-normal-dot-${index}`}
                                   cx={cx}
                                   cy={cy}
-                                  r={5.5}
-                                  fill="#dc2626"
-                                  stroke="#fecaca"
-                                  strokeWidth={2.5}
-                                  data-anomaly-spike="true"
+                                  r={3}
+                                  fill="#475569"
+                                  stroke="#ffffff"
+                                  strokeWidth={1.5}
+                                  data-anomaly-spike="false"
                                 />
                               );
-                            }
-                            return (
-                              <circle
-                                key={`anomaly-normal-dot-${index}`}
-                                cx={cx}
-                                cy={cy}
-                                r={3}
-                                fill="#475569"
-                                stroke="#ffffff"
-                                strokeWidth={1.5}
-                                data-anomaly-spike="false"
-                              />
-                            );
-                          }}
-                          activeDot={(dotProps: any) => {
-                            const { cx, cy, payload, index } = dotProps;
-                            if (typeof cx !== 'number' || typeof cy !== 'number') {
-                              return <g key={`empty-active-${index}`} />;
-                            }
-                            const isSpike = Boolean(payload?.isAnomalySpike);
-                            return (
-                              <circle
-                                key={`anomaly-active-dot-${index}`}
-                                cx={cx}
-                                cy={cy}
-                                r={isSpike ? 7 : 5}
-                                fill={isSpike ? '#dc2626' : '#334155'}
-                                stroke={isSpike ? '#fee2e2' : '#e2e8f0'}
-                                strokeWidth={2.5}
-                              />
-                            );
-                          }}
-                        />
-                      </AreaChart>
-                    </ResponsiveContainer>
+                            }}
+                            activeDot={(dotProps: any) => {
+                              const { cx, cy, payload, index } = dotProps;
+                              if (typeof cx !== 'number' || typeof cy !== 'number') {
+                                return <g key={`empty-active-${index}`} />;
+                              }
+                              const isSpike = Boolean(payload?.isAnomalySpike);
+                              return (
+                                <circle
+                                  key={`anomaly-active-dot-${index}`}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={isSpike ? 7 : 5}
+                                  fill={isSpike ? '#dc2626' : '#334155'}
+                                  stroke={isSpike ? '#fee2e2' : '#e2e8f0'}
+                                  strokeWidth={2.5}
+                                />
+                              );
+                            }}
+                          />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
                   </div>
+
+                  {/* Constituent Agents Drilldown Table */}
+                  {stageDrilldown && (
+                    <div
+                      data-testid="stage-constituent-agents-panel"
+                      className="rounded-xl border border-indigo-200 bg-slate-50/70 p-4 space-y-3"
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                        <div>
+                          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-indigo-600">
+                            Stage {stageDrilldown.stageId} Constituent Agents
+                          </p>
+                          <h3 className="text-sm font-bold text-slate-900">
+                            {stageDrilldown.stageName} ({stageDrilldown.processFlowAgent})
+                          </h3>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const matchedWorker = workerAgentStatuses.find(
+                              (w) =>
+                                w.id === stageDrilldown.primaryWorkerId ||
+                                w.name.toLowerCase() === stageDrilldown.primaryWorkerName.toLowerCase()
+                            );
+                            if (matchedWorker) {
+                              setSelectedWorkerAgent(matchedWorker);
+                            }
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-white hover:bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 cursor-pointer shrink-0"
+                        >
+                          Inspect {stageDrilldown.primaryWorkerName} Logs
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        {stageDrilldown.constituentAgents.map((agent) => (
+                          <div
+                            key={agent.agentId}
+                            data-testid={`constituent-agent-card-${agent.agentId}`}
+                            className="rounded-xl border border-slate-200 bg-white p-3.5 space-y-2"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <h4 className="text-xs font-bold text-slate-900 truncate">{agent.agentName}</h4>
+                                <p className="text-[11px] text-slate-500 mt-0.5 leading-snug">
+                                  {agent.processFlowRole}
+                                </p>
+                              </div>
+                              <span
+                                className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase shrink-0 border ${
+                                  agent.status === 'critical'
+                                    ? 'bg-red-50 text-red-700 border-red-200'
+                                    : agent.status === 'warning'
+                                      ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                      : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                }`}
+                              >
+                                {agent.status}
+                              </span>
+                            </div>
+
+                            <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-100 text-xs tabular-nums">
+                              <div>
+                                <p className="text-[10px] text-slate-500">Success</p>
+                                <p className="font-bold text-slate-900">{agent.avgSuccessRate.toFixed(1)}%</p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] text-slate-500">Latency</p>
+                                <p className="font-bold text-slate-900">{agent.avgLatencyMs}ms</p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] text-slate-500">Anomalies</p>
+                                <p className={`font-bold ${agent.totalAnomalies > 0 ? 'text-red-700' : 'text-slate-900'}`}>
+                                  {agent.totalAnomalies}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </section>

@@ -5,6 +5,10 @@ import {
   SignificantDisasterEvent,
   TraceabilityNode
 } from '../types/orchestration';
+import {
+  ensureRunStageMetrics,
+  type StageMetricBreakdown
+} from './orchestrationDrilldown';
 
 export type AgenticCapabilityKey =
   | 'conversational'
@@ -43,6 +47,7 @@ export interface OrchestrationRunRecord {
   successRate: number;
   latencyMs: number;
   anomalyCount?: number;
+  stageMetrics?: StageMetricBreakdown[];
   source: string;
   supervisorSummary?: string;
   createdAt: string;
@@ -437,16 +442,11 @@ export function normalizeOrchestrationRuns(runs: Partial<OrchestrationRunRecord>
   const valid = (Array.isArray(runs) ? runs : [])
     .filter(Boolean)
     .slice(-10)
-    .map((item, idx) => ({
-      id: String(item.id || `run-${idx + 1}`),
-      run: String(item.run || `Run ${idx + 1}`),
-      industry: String(item.industry || 'Enterprise'),
-      mode: String(item.mode || 'full-pipeline'),
-      stage: String(item.stage || stages[idx % stages.length]),
-      activeStage: Math.max(1, Math.min(6, Number(item.activeStage || (idx % 6) + 1))),
-      successRate: Math.max(40, Math.min(100, Number(Number(item.successRate ?? 92).toFixed(1)))),
-      latencyMs: Math.max(120, Math.round(Number(item.latencyMs ?? 1250))),
-      anomalyCount: Math.max(
+    .map((item, idx) => {
+      const activeStage = Math.max(1, Math.min(6, Number(item.activeStage || (idx % 6) + 1)));
+      const successRate = Math.max(40, Math.min(100, Number(Number(item.successRate ?? 92).toFixed(1))));
+      const latencyMs = Math.max(120, Math.round(Number(item.latencyMs ?? 1250)));
+      const anomalyCount = Math.max(
         0,
         Math.round(
           Number(
@@ -455,11 +455,32 @@ export function normalizeOrchestrationRuns(runs: Partial<OrchestrationRunRecord>
               : baselineAnomalies[idx % baselineAnomalies.length]
           )
         )
-      ),
-      source: String(item.source || 'supervisor-engine'),
-      supervisorSummary: item.supervisorSummary ? String(item.supervisorSummary) : undefined,
-      createdAt: String(item.createdAt || new Date().toISOString())
-    }));
+      );
+      return {
+        id: String(item.id || `run-${idx + 1}`),
+        run: String(item.run || `Run ${idx + 1}`),
+        industry: String(item.industry || 'Enterprise'),
+        mode: String(item.mode || 'full-pipeline'),
+        stage: String(item.stage || stages[idx % stages.length]),
+        activeStage,
+        successRate,
+        latencyMs,
+        anomalyCount,
+        stageMetrics: ensureRunStageMetrics(
+          {
+            activeStage,
+            successRate,
+            latencyMs,
+            anomalyCount,
+            stageMetrics: item.stageMetrics
+          },
+          idx
+        ),
+        source: String(item.source || 'supervisor-engine'),
+        supervisorSummary: item.supervisorSummary ? String(item.supervisorSummary) : undefined,
+        createdAt: String(item.createdAt || new Date().toISOString())
+      };
+    });
 
   return valid;
 }

@@ -44,6 +44,13 @@ import {
   extractWorkerAgentLogs,
   resolveWorkerCatalogEntry
 } from './src/utils/workerAgentTelemetry';
+import {
+  ensureRunStageMetrics,
+  flattenStageMetricsForPersistence,
+  generateStageMetricsForRun,
+  resolveStageDefinition,
+  type PersistedStageMetricRecord
+} from './src/utils/orchestrationDrilldown';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -118,6 +125,7 @@ let memoryUserPreferences: {
   ...DEFAULT_USER_PREFERENCES
 };
 const memoryOrchestrationRuns: OrchestrationRunRecord[] = [];
+const memoryStageMetrics: PersistedStageMetricRecord[] = [];
 const memoryRiskConnectors: RiskConnectorConfig[] = [
   {
     id: 'conn-servicenow-default',
@@ -186,20 +194,72 @@ function buildDefaultRunsForIndustry(industryName: string): OrchestrationRunReco
   const baseAnomalies = [3, 2, 4, 2, 3, 1, 1, 2, 1, 0];
   const industryShift = industryName.length % 2;
   const now = Date.now();
-  return Array.from({ length: 10 }, (_, idx) => ({
-    id: `seed-run-${industryName.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${idx + 1}`,
-    run: `Run ${idx + 1}`,
-    industry: industryName,
-    mode: 'full-pipeline',
-    stage: stages[idx % stages.length],
-    activeStage: (idx % 6) + 1,
-    successRate: baseSuccess[idx],
-    latencyMs: baseLatency[idx],
-    anomalyCount: Math.max(0, baseAnomalies[idx] + (idx % 3 === 0 ? industryShift : 0)),
-    source: 'baseline-telemetry',
-    supervisorSummary: `Baseline pipeline verification across ${stages[idx % stages.length]} for ${industryName}.`,
-    createdAt: new Date(now - (10 - idx) * 3600_000).toISOString()
-  }));
+  return Array.from({ length: 10 }, (_, idx) => {
+    const activeStage = (idx % 6) + 1;
+    const successRate = baseSuccess[idx];
+    const latencyMs = baseLatency[idx];
+    const anomalyCount = Math.max(0, baseAnomalies[idx] + (idx % 3 === 0 ? industryShift : 0));
+    return {
+      id: `seed-run-${industryName.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${idx + 1}`,
+      run: `Run ${idx + 1}`,
+      industry: industryName,
+      mode: 'full-pipeline',
+      stage: stages[idx % stages.length],
+      activeStage,
+      successRate,
+      latencyMs,
+      anomalyCount,
+      stageMetrics: generateStageMetricsForRun({
+        baseSuccessRate: successRate,
+        baseLatencyMs: latencyMs,
+        baseAnomalyCount: anomalyCount,
+        runIndex: idx,
+        activeStage
+      }),
+      source: 'baseline-telemetry',
+      supervisorSummary: `Baseline pipeline verification across ${stages[idx % stages.length]} for ${industryName}.`,
+      createdAt: new Date(now - (10 - idx) * 3600_000).toISOString()
+    };
+  });
+}
+
+async function persistStageMetricsToMongoOrMemory(runs: OrchestrationRunRecord[]): Promise<{
+  savedCount: number;
+  source: 'mongodb' | 'memory';
+}> {
+  const docs = runs.flatMap((run) => flattenStageMetricsForPersistence(run));
+  if (docs.length === 0) {
+    return { savedCount: 0, source: mongoDb ? 'mongodb' : 'memory' };
+  }
+
+  for (const doc of docs) {
+    const existingIdx = memoryStageMetrics.findIndex((item) => item.id === doc.id);
+    if (existingIdx >= 0) {
+      memoryStageMetrics[existingIdx] = doc;
+    } else {
+      memoryStageMetrics.push(doc);
+    }
+  }
+  if (memoryStageMetrics.length > 600) {
+    memoryStageMetrics.splice(0, memoryStageMetrics.length - 600);
+  }
+
+  const db = await connectMongo();
+  if (db) {
+    await db.collection('orchestration_stage_metrics').bulkWrite(
+      docs.map((doc) => ({
+        updateOne: {
+          filter: { id: doc.id },
+          update: { $set: doc },
+          upsert: true
+        }
+      })),
+      { ordered: false }
+    ).catch(() => {});
+    return { savedCount: docs.length, source: 'mongodb' };
+  }
+
+  return { savedCount: docs.length, source: 'memory' };
 }
 
 async function recordOrchestrationRun(runInput: Omit<OrchestrationRunRecord, 'id' | 'run' | 'createdAt'>): Promise<{
@@ -214,21 +274,23 @@ async function recordOrchestrationRun(runInput: Omit<OrchestrationRunRecord, 'id
   } else {
     runCount = memoryOrchestrationRuns.filter((r) => r.industry === runInput.industry).length + 1;
   }
+  const stageMetrics = ensureRunStageMetrics(runInput, runCount - 1);
   const runRecord: OrchestrationRunRecord = {
     id: `run-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
     run: `Run ${runCount}`,
     ...runInput,
+    stageMetrics,
     createdAt
   };
   if (db) {
     await db.collection('orchestration_runs').insertOne(runRecord).catch(() => {});
-    return { run: runRecord, source: 'mongodb' };
   }
   memoryOrchestrationRuns.push(runRecord);
   if (memoryOrchestrationRuns.length > 100) {
     memoryOrchestrationRuns.splice(0, memoryOrchestrationRuns.length - 100);
   }
-  return { run: runRecord, source: 'memory' };
+  const stageSave = await persistStageMetricsToMongoOrMemory([runRecord]);
+  return { run: runRecord, source: db || stageSave.source === 'mongodb' ? 'mongodb' : 'memory' };
 }
 
 async function connectMongo(): Promise<Db | null> {
@@ -248,6 +310,9 @@ async function connectMongo(): Promise<Db | null> {
     await mongoDb.collection('industries').createIndex({ name: 1 });
     await mongoDb.collection('agent_interactions').createIndex({ createdAt: -1 });
     await mongoDb.collection('agent_interactions').createIndex({ agent: 1, context: 1 });
+    await mongoDb.collection('orchestration_runs').createIndex({ industry: 1, createdAt: 1 });
+    await mongoDb.collection('orchestration_stage_metrics').createIndex({ industry: 1, stageId: 1, createdAt: -1 });
+    await mongoDb.collection('orchestration_stage_metrics').createIndex({ id: 1 }, { unique: true });
     console.log(`Connected to MongoDB (${DATABASE_NAME}).`);
     return mongoDb;
   } catch (error) {
@@ -1534,10 +1599,12 @@ app.get('/api/orchestration-runs', async (req, res) => {
           ...r,
           run: `Run ${i + 1}`
         }));
+        await persistStageMetricsToMongoOrMemory(runs);
         return res.json({ runs, source: 'mongodb' });
       }
       const seeded = buildDefaultRunsForIndustry(industry);
       await db.collection('orchestration_runs').insertMany(seeded).catch(() => {});
+      await persistStageMetricsToMongoOrMemory(seeded);
       return res.json({ runs: seeded, source: 'mongodb-seeded' });
     }
 
@@ -1547,13 +1614,101 @@ app.get('/api/orchestration-runs', async (req, res) => {
         ...r,
         run: `Run ${i + 1}`
       }));
+      await persistStageMetricsToMongoOrMemory(runs);
       return res.json({ runs, source: 'memory' });
     }
     const seeded = buildDefaultRunsForIndustry(industry);
     memoryOrchestrationRuns.push(...seeded);
+    await persistStageMetricsToMongoOrMemory(seeded);
     return res.json({ runs: seeded, source: 'memory-seeded' });
   } catch (error: any) {
     return res.status(500).json({ error: error?.message || 'Failed to load orchestration runs' });
+  }
+});
+
+app.get('/api/orchestration-stage-metrics', async (req, res) => {
+  try {
+    const industry = String(req.query.industry || 'Telco').trim() || 'Telco';
+    const stageIdParam = req.query.stageId ? Number(req.query.stageId) : null;
+    const db = await connectMongo();
+
+    if (db) {
+      const filter: Record<string, any> = { industry };
+      if (stageIdParam && stageIdParam >= 1 && stageIdParam <= 6) {
+        filter.stageId = stageIdParam;
+      }
+      let docs = await db.collection('orchestration_stage_metrics')
+        .find(filter)
+        .sort({ createdAt: 1 })
+        .limit(120)
+        .toArray();
+
+      if (docs.length === 0) {
+        const seeded = buildDefaultRunsForIndustry(industry);
+        await db.collection('orchestration_runs').insertMany(seeded).catch(() => {});
+        await persistStageMetricsToMongoOrMemory(seeded);
+        docs = await db.collection('orchestration_stage_metrics')
+          .find(filter)
+          .sort({ createdAt: 1 })
+          .limit(120)
+          .toArray();
+      }
+      return res.json({ metrics: docs, total: docs.length, source: 'mongodb' });
+    }
+
+    let memFiltered = memoryStageMetrics.filter((m) => m.industry === industry);
+    if (memFiltered.length === 0) {
+      const seeded = buildDefaultRunsForIndustry(industry);
+      memoryOrchestrationRuns.push(...seeded);
+      await persistStageMetricsToMongoOrMemory(seeded);
+      memFiltered = memoryStageMetrics.filter((m) => m.industry === industry);
+    }
+    const metrics = stageIdParam && stageIdParam >= 1 && stageIdParam <= 6
+      ? memFiltered.filter((m) => m.stageId === stageIdParam)
+      : memFiltered;
+    return res.json({ metrics, total: metrics.length, source: 'memory' });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Failed to load stage metrics' });
+  }
+});
+
+app.post('/api/orchestration-stage-metrics', async (req, res) => {
+  try {
+    const industry = String(req.body?.industry || 'Telco').trim() || 'Telco';
+    const selectedStageId = req.body?.stageId ? Number(req.body.stageId) : null;
+    const rawRuns = Array.isArray(req.body?.runs) ? req.body.runs : [];
+    const normalizedRuns = rawRuns.length > 0
+      ? normalizeOrchestrationRuns(rawRuns.map((r: any) => ({ ...r, industry })))
+      : buildDefaultRunsForIndustry(industry);
+
+    const persistResult = await persistStageMetricsToMongoOrMemory(normalizedRuns);
+    const stageDef = selectedStageId ? resolveStageDefinition(selectedStageId) : null;
+
+    if (stageDef) {
+      await persistAgentInteraction({
+        agent: stageDef.primaryWorkerName.replace(/\s+/g, ''),
+        context: `stage-drilldown:${industry}:stage-${stageDef.stageId}`,
+        message: `Persisted drilldown metrics for Stage ${stageDef.stageId} (${stageDef.stageName}) and ${stageDef.constituentAgents.length} constituent agents`,
+        response: `Saved ${persistResult.savedCount} stage metric snapshots to ${persistResult.source} (orchestration_stage_metrics).`,
+        metadata: {
+          stageId: stageDef.stageId,
+          stageName: stageDef.stageName,
+          constituentAgents: stageDef.constituentAgents.map((a) => a.agentName),
+          savedCount: persistResult.savedCount,
+          persistence: persistResult.source
+        }
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      industry,
+      stageId: selectedStageId,
+      savedCount: persistResult.savedCount,
+      persistence: persistResult.source
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Failed to save stage metrics to MongoDB' });
   }
 });
 
@@ -1660,6 +1815,27 @@ Provide a crisp supervisorSummary, 3 prioritized cross-agent recommendations, an
       memoryOrchestrationRuns.push(...buildDefaultRunsForIndustry(runIndustryKey));
     }
 
+    const existingStageMetricsCount = db
+      ? await db.collection('orchestration_stage_metrics').countDocuments({ industry: runIndustryKey })
+      : memoryStageMetrics.filter((m) => m.industry === runIndustryKey).length;
+
+    if (existingStageMetricsCount === 0) {
+      const baselineRuns = db
+        ? normalizeOrchestrationRuns(await db.collection('orchestration_runs').find({ industry: runIndustryKey }).toArray() as any[])
+        : normalizeOrchestrationRuns(memoryOrchestrationRuns.filter((r) => r.industry === runIndustryKey));
+      await persistStageMetricsToMongoOrMemory(baselineRuns);
+    }
+
+    const generatedStageMetrics = generateStageMetricsForRun({
+      baseSuccessRate: Number(computedSuccess.toFixed(1)),
+      baseLatencyMs: latencyMs,
+      baseAnomalyCount: anomalyCount,
+      runIndex: existingStageMetricsCount,
+      activeStage: Number(activeStage || 1),
+      criticalOkrCount: Number(criticalOkrCount || 0),
+      activeDisasterCount: Number(activeDisasterCount || 0)
+    });
+
     const { run, source: persistSource } = await recordOrchestrationRun({
       industry: runIndustryKey,
       mode: String(mode),
@@ -1668,6 +1844,7 @@ Provide a crisp supervisorSummary, 3 prioritized cross-agent recommendations, an
       successRate: Number(computedSuccess.toFixed(1)),
       latencyMs,
       anomalyCount,
+      stageMetrics: generatedStageMetrics,
       source,
       supervisorSummary
     });
