@@ -13,6 +13,7 @@ import {
   Flame,
   Layers,
   LineChart as LineChartIcon,
+  Scale,
   ShieldCheck,
   Sliders,
   Target,
@@ -164,6 +165,9 @@ const OkrTrajectoryView = lazyWithRetry(() =>
 const OkrProgramStudioView = lazyWithRetry(() =>
   import('./components/OkrProgramStudioView').then((m) => ({ default: m.OkrProgramStudioView }))
 );
+const DecisionMakingEngineView = lazyWithRetry(() =>
+  import('./components/DecisionMakingEngineView').then((m) => ({ default: m.DecisionMakingEngineView }))
+);
 const EnterpriseGovernanceModal = lazyWithRetry(() =>
   import('./components/EnterpriseGovernanceModal').then((m) => ({ default: m.EnterpriseGovernanceModal }))
 );
@@ -296,6 +300,7 @@ const WORKSPACE_VIEW_ICONS: Record<ActiveNavView, React.ComponentType<{ classNam
   lifecycle: Activity,
   studio: Sliders,
   traceability: Layers,
+  decisions: Scale,
   knowledge: Database,
   trajectory: TrendingUp,
   strategy: Target,
@@ -308,6 +313,7 @@ const WORKSPACE_VIEWS: Array<{ id: ActiveNavView; label: string; description: st
   { id: 'lifecycle', label: 'Lifecycle', description: '6-stage orchestration and worker status' },
   { id: 'studio', label: 'OKR Studio', description: 'Business problem management and draft review' },
   { id: 'traceability', label: 'Traceability', description: '7-layer dependency mapping and system health' },
+  { id: 'decisions', label: 'Decision Engine', description: 'Stop-funding, quantified ROI, drift drill-down & reallocation' },
   { id: 'knowledge', label: 'Knowledge Base', description: '5-pillar AI memory and vector search' },
   { id: 'trajectory', label: 'Trajectory', description: 'Target vs predicted execution curve' },
   { id: 'strategy', label: 'Portfolio Planner', description: 'Funding and strategic allocation models' },
@@ -2962,6 +2968,27 @@ export default function App() {
             onUpdateNodesMap={setNodesMap}
             selectedNodeId={selectedNodeId}
             onSelectNodeId={setSelectedNodeId}
+          />
+        )}
+
+        {/* Executive Decision Making Engine */}
+        {activeView === 'decisions' && (
+          <DecisionMakingEngineView
+            industry={industry}
+            nodesMap={nodesMap}
+            onUpdateNodesMap={setNodesMap}
+            onCommitNodesMap={handleCommitNodesMap}
+            managedPrograms={managedPrograms}
+            onUpdateManagedPrograms={setManagedPrograms}
+            activeDisasters={activeDisasters}
+            prerequisites={industry.organisationalPrerequisites}
+            canExecuteDecisions={canCreateOkr || isSuperAdmin || capabilities.isSuperAdmin}
+            activeUserRoleSummary={capabilities.roleSummary}
+            onNavigateToTraceability={(nodeId) => {
+              setSelectedNodeId(nodeId);
+              setActiveView('traceability');
+            }}
+            onNavigateToStudio={() => setActiveView('studio')}
           />
         )}
 

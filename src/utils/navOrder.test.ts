@@ -23,8 +23,10 @@ test('normalizeNavOrder always places studio primary first and restores missing 
   assert.equal(normalized[0], PRIMARY_NAV_VIEW);
   assert.equal(normalized[1], 'knowledge');
   assert.equal(normalized[2], 'traceability');
+  assert.equal(DEFAULT_NAV_ORDER.includes('decisions'), true);
   assert.equal(new Set(normalized).size, DEFAULT_NAV_ORDER.length);
   assert.equal(normalized.length, DEFAULT_NAV_ORDER.length);
+  assert.equal(normalized.includes('decisions'), true);
 });
 
 test('reorderSecondaryNavButtons moves target buttons while keeping studio pinned at index 0', () => {

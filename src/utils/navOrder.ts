@@ -2,6 +2,7 @@ export type ActiveNavView =
   | 'studio'
   | 'lifecycle'
   | 'traceability'
+  | 'decisions'
   | 'knowledge'
   | 'advisory'
   | 'performance'
@@ -14,6 +15,7 @@ export const PRIMARY_NAV_VIEW: ActiveNavView = 'studio';
 export const DEFAULT_SECONDARY_NAV_ORDER: ActiveNavView[] = [
   'lifecycle',
   'traceability',
+  'decisions',
   'advisory',
   'performance',
   'trajectory',

@@ -15,6 +15,43 @@ export interface WorkerAgentStatusSummary {
   action?: string;
 }
 
+export interface WorkerAgentStatusPresentation {
+  normalizedStatus: 'active' | 'idle' | 'error';
+  shouldPulse: boolean;
+  buttonClassName: string;
+  dotClassName: string;
+  pulseRingClassName: string;
+}
+
+export function getWorkerAgentStatusPresentation(status?: string): WorkerAgentStatusPresentation {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'active') {
+    return {
+      normalizedStatus: 'active',
+      shouldPulse: true,
+      buttonClassName: 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80',
+      dotClassName: 'bg-emerald-500 worker-agent-active-dot',
+      pulseRingClassName: 'worker-agent-active-pulse-ring'
+    };
+  }
+  if (normalized === 'error') {
+    return {
+      normalizedStatus: 'error',
+      shouldPulse: false,
+      buttonClassName: 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100/80',
+      dotClassName: 'bg-red-500',
+      pulseRingClassName: ''
+    };
+  }
+  return {
+    normalizedStatus: 'idle',
+    shouldPulse: false,
+    buttonClassName: 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 hover:border-slate-300',
+    dotClassName: 'bg-slate-400',
+    pulseRingClassName: ''
+  };
+}
+
 export interface RawAgentInteractionRecord {
   id?: string;
   agent: string;

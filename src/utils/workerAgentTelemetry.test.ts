@@ -5,6 +5,7 @@ import {
   computeAnomalyCountForRun,
   computeAnomalyTelemetryStats,
   extractWorkerAgentLogs,
+  getWorkerAgentStatusPresentation,
   isSignificantAnomalyDeviation,
   matchesWorkerAgentInteraction,
   resolveWorkerCatalogEntry
@@ -129,5 +130,31 @@ test('computeAnomalyTelemetryStats computes mean threshold and flags significant
   assert.equal(flatStats.mean, 2);
   assert.equal(flatStats.spikeRunCount, 0);
   assert.equal(isSignificantAnomalyDeviation(2, flatStats), false);
+});
+
+test('getWorkerAgentStatusPresentation enables subtle pulse only for active worker status', () => {
+  const activeLower = getWorkerAgentStatusPresentation('active');
+  assert.equal(activeLower.normalizedStatus, 'active');
+  assert.equal(activeLower.shouldPulse, true);
+  assert.ok(activeLower.pulseRingClassName.includes('worker-agent-active-pulse-ring'));
+  assert.ok(activeLower.dotClassName.includes('worker-agent-active-dot'));
+
+  const activeUpper = getWorkerAgentStatusPresentation(' ACTIVE ');
+  assert.equal(activeUpper.normalizedStatus, 'active');
+  assert.equal(activeUpper.shouldPulse, true);
+
+  const idleState = getWorkerAgentStatusPresentation('idle');
+  assert.equal(idleState.normalizedStatus, 'idle');
+  assert.equal(idleState.shouldPulse, false);
+  assert.equal(idleState.pulseRingClassName, '');
+
+  const errorState = getWorkerAgentStatusPresentation('error');
+  assert.equal(errorState.normalizedStatus, 'error');
+  assert.equal(errorState.shouldPulse, false);
+  assert.equal(errorState.pulseRingClassName, '');
+
+  const fallbackIdle = getWorkerAgentStatusPresentation(undefined);
+  assert.equal(fallbackIdle.normalizedStatus, 'idle');
+  assert.equal(fallbackIdle.shouldPulse, false);
 });
 

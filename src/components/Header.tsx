@@ -34,7 +34,8 @@ import {
   Bot,
   LogIn,
   LogOut,
-  Send
+  Send,
+  Scale
 } from 'lucide-react';
 import { useFirebase } from '../context/FirebaseContext';
 import { IndustryDataBundle, IndustryKey } from '../types/orchestration';
@@ -57,6 +58,7 @@ import {
   groupNotificationsByIndustryAndOrg
 } from '../utils/headerNotifications';
 import type { SelectableAccountProfile } from '../utils/agenticCommunication';
+import { getWorkerAgentStatusPresentation } from '../utils/workerAgentTelemetry';
 
 export type { ActiveNavView };
 
@@ -142,6 +144,13 @@ const NAV_BUTTON_META: Record<ActiveNavView, NavButtonMeta> = {
     icon: <Layers className="w-3.5 h-3.5" />,
     shortHint: 'Strategic Themes to Value Outcomes dependency lineage',
     helpSummary: 'Inspect parent-child linkage across all 7 Planview layers and remediate unlinked orphan epics.'
+  },
+  decisions: {
+    label: 'Decision Engine',
+    ariaLabel: 'Switch to Executive Decision Making Engine',
+    icon: <Scale className="w-3.5 h-3.5" />,
+    shortHint: 'Executive stop-funding, quantified ROI, drift drill-down & agile reallocation',
+    helpSummary: 'Halt low-value work, prioritize quantified business problems, drill down into program drift & external influences, and rapidly reallocate capital.'
   },
   advisory: {
     label: 'Advisory Committee Outcomes',
@@ -1005,25 +1014,34 @@ export const Header: React.FC<HeaderProps> = ({
                 {workerAgentStatuses.map((agent) => {
                   const actionText = agent.action || 'Continue monitoring the current workflow.';
                   const reasonText = agent.reason || 'Live status is healthy and ready for the next stage.';
+                  const presentation = getWorkerAgentStatusPresentation(agent.status);
                   return (
                     <div key={agent.id} className="group relative inline-flex">
                       <button
                         type="button"
                         data-testid={`worker-agent-btn-${agent.id}`}
+                        data-agent-status={presentation.normalizedStatus}
+                        data-pulsing={presentation.shouldPulse ? 'true' : 'false'}
                         onClick={() => onSelectWorkerAgent?.(agent)}
                         aria-label={`Inspect last 5 logs for ${agent.name} (${agent.label})`}
-                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-semibold transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
-                          agent.status === 'active'
-                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100/80'
-                            : agent.status === 'error'
-                            ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100/80'
-                            : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 hover:border-slate-300'
-                        }`}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-semibold transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${presentation.buttonClassName}`}
                         title={`${agent.name}: ${reasonText} (Click for last 5 KB logs)`}
                       >
-                        <span className={`inline-block h-2 w-2 rounded-full ${
-                          agent.status === 'active' ? 'bg-emerald-500' : agent.status === 'error' ? 'bg-red-500' : 'bg-slate-400'
-                        }`} />
+                        <span
+                          data-testid={`worker-agent-icon-${agent.id}`}
+                          className="relative inline-flex h-2.5 w-2.5 items-center justify-center shrink-0"
+                          aria-hidden="true"
+                        >
+                          {presentation.shouldPulse && (
+                            <span
+                              data-testid={`worker-agent-pulse-${agent.id}`}
+                              className={`${presentation.pulseRingClassName} absolute inset-0 rounded-full bg-emerald-400/75`}
+                            />
+                          )}
+                          <span
+                            className={`relative inline-block h-2 w-2 rounded-full ${presentation.dotClassName}`}
+                          />
+                        </span>
                         <span>{agent.name}</span>
                         <span className="text-[9px] uppercase">{agent.label}</span>
                       </button>

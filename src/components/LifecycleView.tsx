@@ -48,6 +48,7 @@ import {
   type LatestRunTimelineSummary,
   type StageCompletionStatus
 } from '../utils/orchestrationTimeline';
+import { StageDependencyFlowDiagram } from './StageDependencyFlowDiagram';
 
 interface LifecycleViewProps {
   industry: IndustryDataBundle;
@@ -493,6 +494,16 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
           })}
         </div>
       </div>
+
+      {/* Stage Dependency Flow (D3 Async Hand-Off & Latency Bottleneck Diagram) */}
+      <StageDependencyFlowDiagram
+        industryName={industry.name}
+        stages={stages}
+        timelineStages={timelineSummary?.stages}
+        activeStageId={activeStageId}
+        isOrchestratingAll={isOrchestratingAll}
+        onSelectStage={onSelectStage}
+      />
 
       {/* Active Stage Detail & Multi-Agent Telemetry Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

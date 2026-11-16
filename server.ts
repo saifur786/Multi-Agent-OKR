@@ -2887,6 +2887,135 @@ Return a concise executiveNarrative (2 sentences) and 3 board-level highlights.`
 });
 
 // ============================================================================
+// EXECUTIVE DECISION MAKING ENGINE (AI Reasoning Synthesis + MongoDB Audit)
+// ============================================================================
+app.post('/api/agents/decision-engine', async (req, res) => {
+  const startedAt = Date.now();
+  try {
+    const {
+      industry = 'Telco',
+      quarter = 'Q1 2027',
+      condition = 'operational',
+      snapshotSummary = {}
+    } = req.body ?? {};
+
+    const summaryObj = typeof snapshotSummary === 'object' && snapshotSummary !== null ? snapshotSummary : {};
+    const reclaimableBudgetM = Number((summaryObj as any).totalReclaimableBudgetM ?? 3.6);
+    const reclaimableFte = Number((summaryObj as any).totalReclaimableFte ?? 14);
+    const stopCandidatesCount = Number((summaryObj as any).stopFundingCandidatesCount ?? 1);
+    const topQuantifiedTitle = String((summaryObj as any).topQuantifiedTitle || 'Core Strategic Key Result');
+    const topQuantifiedExposureM = Number((summaryObj as any).topQuantifiedExposureM ?? 6.5);
+    const topDriftProgram = String((summaryObj as any).topDriftProgram || 'Core Delivery Program');
+    const topDriftGapPct = Number((summaryObj as any).topDriftGapPct ?? 14);
+    const weeksBeforeFailure = Number((summaryObj as any).weeksBeforeFailure ?? 3);
+    const reallocationLeadTimeDays = Number((summaryObj as any).reallocationLeadTimeDays ?? 5);
+    const projectedPortfolioLiftPct = Number((summaryObj as any).projectedPortfolioLiftPct ?? 8.4);
+
+    let resultPayload = {
+      executiveHeadline: `${industry} (${quarter}) Executive Decision Engine identifies $${reclaimableBudgetM.toFixed(2)}M (${reclaimableFte} FTE) reclaimable from low-value streams and ${topDriftGapPct.toFixed(1)}% early strategic drift in "${topDriftProgram}".`,
+      stopFundingReasoning: `${stopCandidatesCount} low-yield or unlinked initiative(s) fall below the 48/100 strategic value threshold. Halting them reclaims $${reclaimableBudgetM.toFixed(2)}M and ${reclaimableFte} FTE without degrading Layer 3 Key Result outcomes.`,
+      prioritisationReasoning: `"${topQuantifiedTitle}" ranks #1 under quantified business problem economics ($${topQuantifiedExposureM.toFixed(2)}M annual exposure), prioritizing verified dollar impact and causal root-cause evidence over subjective weighting.`,
+      driftDetectionReasoning: `Timeline variance in "${topDriftProgram}" reaches ${topDriftGapPct.toFixed(1)}% (${weeksBeforeFailure} weeks ahead of budget loss or SLA breach), driven by compounding external operational, market demand, and regulatory influences.`,
+      resourceReallocationReasoning: `Reallocating reclaimed capital under ${String(condition).replace('_', ' ')} triggers executes in ${reallocationLeadTimeDays} days versus a 28-day quarterly cycle, raising priority OKR attainment by +${projectedPortfolioLiftPct.toFixed(1)}%.`,
+      recommendedActions: [
+        `Approve stop-funding on bottom-quartile initiatives to unlock $${reclaimableBudgetM.toFixed(2)}M and ${reclaimableFte} FTE.`,
+        `Lock capital priority on "${topQuantifiedTitle}" using verified business problem ROI evidence.`,
+        `Execute early drift mitigation on "${topDriftProgram}" ahead of the ${weeksBeforeFailure}-week risk threshold.`
+      ]
+    };
+    let source = 'deterministic-engine';
+
+    const client = getGeminiClient();
+    if (client) {
+      let response: any;
+      try {
+        response = await generateWithGeminiRetry((c) =>
+          c.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: `You are Planview Anvi's Executive Decision Making Engine advisor for ${industry} (${quarter}), condition="${condition}".
+Portfolio Metrics Summary: ${JSON.stringify(summaryObj).slice(0, 2400)}.
+Provide concise, crisp, board-level executive AI reasoning (1-2 sentences per attribute) covering:
+1. executiveHeadline
+2. stopFundingReasoning (stopping funding for initiatives that no longer contribute meaningful value)
+3. prioritisationReasoning (prioritised investment based on quantified business problems rather than opinion)
+4. driftDetectionReasoning (detecting strategic drift early via program timeline & external influences before budget loss or delivery failure)
+5. resourceReallocationReasoning (reallocating resources faster when operational, market demand, or regulatory conditions change)
+6. recommendedActions (3 concrete executive actions with $M/FTE or % figures from the metrics).`,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  executiveHeadline: { type: Type.STRING },
+                  stopFundingReasoning: { type: Type.STRING },
+                  prioritisationReasoning: { type: Type.STRING },
+                  driftDetectionReasoning: { type: Type.STRING },
+                  resourceReallocationReasoning: { type: Type.STRING },
+                  recommendedActions: { type: Type.ARRAY, items: { type: Type.STRING } }
+                },
+                required: [
+                  'executiveHeadline',
+                  'stopFundingReasoning',
+                  'prioritisationReasoning',
+                  'driftDetectionReasoning',
+                  'resourceReallocationReasoning',
+                  'recommendedActions'
+                ]
+              }
+            }
+          })
+        );
+      } catch (err: any) {
+        return res.status(502).json({
+          error: err?.message || 'Gemini Decision Engine AI synthesis request failed'
+        });
+      }
+
+      const parsed = parseGeminiJsonSafe<typeof resultPayload>(response?.text);
+      if (parsed?.stopFundingReasoning && parsed?.prioritisationReasoning && parsed?.driftDetectionReasoning && parsed?.resourceReallocationReasoning) {
+        resultPayload = {
+          executiveHeadline: parsed.executiveHeadline || resultPayload.executiveHeadline,
+          stopFundingReasoning: parsed.stopFundingReasoning,
+          prioritisationReasoning: parsed.prioritisationReasoning,
+          driftDetectionReasoning: parsed.driftDetectionReasoning,
+          resourceReallocationReasoning: parsed.resourceReallocationReasoning,
+          recommendedActions:
+            Array.isArray(parsed.recommendedActions) && parsed.recommendedActions.length > 0
+              ? parsed.recommendedActions.slice(0, 4)
+              : resultPayload.recommendedActions
+        };
+        source = GEMINI_MODEL;
+      }
+    }
+
+    const latencyMs = Date.now() - startedAt;
+    const logged = await persistAgentInteraction({
+      agent: 'ExecutiveDecisionEngine',
+      context: `decision-engine:${industry}`,
+      message: `Synthesized executive decision reasoning for ${industry} (${quarter}, condition=${condition})`,
+      response: resultPayload.executiveHeadline,
+      metadata: {
+        condition,
+        source,
+        latencyMs,
+        recommendedActions: resultPayload.recommendedActions
+      }
+    });
+
+    return res.json({
+      success: true,
+      ...resultPayload,
+      generatedAt: new Date().toISOString(),
+      source,
+      persistence: logged.source,
+      latencyMs
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Decision Engine synthesis failed' });
+  }
+});
+
+// ============================================================================
 // RETROSPECTIVE & LEARNING AGENT (Updates MongoDB KB + Notifies OKR Owner)
 // ============================================================================
 app.post('/api/agents/retrospective-learn', async (req, res) => {
