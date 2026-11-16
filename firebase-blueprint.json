@@ -102,6 +102,10 @@
           "type": "array",
           "description": "Native list of up to 5 KnowledgeBasePillar maps updated by RAG ingestion."
         },
+        "organisationalPrerequisites": {
+          "type": "array",
+          "description": "Optional list of up to 40 configured Organisational/Industry Pre-Requisites items grounding AI agents."
+        },
         "updatedAt": {
           "type": "string",
           "format": "date-time",

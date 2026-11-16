@@ -43,28 +43,45 @@ import {
   TraceabilityNode,
   BusEvent,
   IndustryDataBundle,
-  KnowledgeBasePillar
+  KnowledgeBasePillar,
+  OrganisationalPrerequisiteItem
 } from './types/orchestration';
 import { eventBus } from './utils/eventBus';
 import { useFirebase } from './context/FirebaseContext';
 import {
-  loadIndustryKnowledgeSnapshotFromFirestore,
+  loadIndustrySnapshotWithPrerequisitesFromFirestore,
   loadUserPreferencesFromFirestore,
   saveIndustryKnowledgeSnapshotToFirestore,
   saveUserPreferencesToFirestore
 } from './services/firestorePersistence';
+import {
+  buildDefaultOrganisationalPrerequisites,
+  buildPrerequisitesAgentContext,
+  normalizeOrganisationalPrerequisites
+} from './utils/orgPrerequisites';
 import type { ParsedDocumentPreview } from './utils/ragIngestion';
 import { Header, ActiveNavView } from './components/Header';
 import { WorkerAgentLogsModal } from './components/WorkerAgentLogsModal';
+import { RiskSentinelThresholdPanel } from './components/RiskSentinelThresholdPanel';
+import { AgentImpactMatrixHeatmap } from './components/AgentImpactMatrixHeatmap';
+import { extractMatrixOkrs } from './utils/agentImpactMatrix';
 import {
-  computeAnomalyTelemetryStats,
-  isSignificantAnomalyDeviation,
+  type AnomalySensitivityLevel,
   type WorkerAgentStatusSummary
 } from './utils/workerAgentTelemetry';
 import {
   computeAllStagesOverview,
   filterInsightsByStage
 } from './utils/orchestrationDrilldown';
+import {
+  applyStageSensitivityPreset,
+  buildDefaultAgentThresholdConfigs,
+  evaluateOverviewAnomalySeries,
+  normalizeAgentThresholdConfigs,
+  SENSITIVITY_PRESETS,
+  updateAgentThresholdConfig,
+  type AgentAnomalyThresholdConfig
+} from './utils/riskSentinelThresholds';
 import { LifecycleView } from './components/LifecycleView';
 import {
   UserPreferences,
@@ -209,6 +226,9 @@ const mergeIndustryWithFallback = (
     ...incomingIndustry,
     stages: incomingIndustry.stages?.length ? incomingIndustry.stages : baseIndustry.stages,
     knowledgeBase: incomingIndustry.knowledgeBase?.length ? incomingIndustry.knowledgeBase : baseIndustry.knowledgeBase,
+    organisationalPrerequisites: incomingIndustry.organisationalPrerequisites?.length
+      ? incomingIndustry.organisationalPrerequisites
+      : baseIndustry.organisationalPrerequisites,
     traceability: hasTraceabilityNodes(incomingIndustry.traceability) ? incomingIndustry.traceability : baseIndustry.traceability
   });
 };
@@ -370,6 +390,10 @@ export default function App() {
   const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>([]);
   const [persistedNotifications, setPersistedNotifications] = useState<PortfolioNotification[]>([]);
   const [lastOrchestrationSummary, setLastOrchestrationSummary] = useState<IndustryOrchestrationSummary | null>(null);
+  const [lastOrchestrationRunId, setLastOrchestrationRunId] = useState<string | null>(null);
+  const [prerequisitesPersistenceSource, setPrerequisitesPersistenceSource] = useState<
+    'mongodb' | 'memory' | null
+  >(null);
   const [requestedStudioTarget, setRequestedStudioTarget] = useState<{
     tab: 'okrs' | 'network' | 'health' | 'programs' | 'disasters' | 'supervisor';
     okrId?: string;
@@ -624,13 +648,20 @@ export default function App() {
     };
   }, [isVerifiedFirebaseUser, user]);
 
-  // Load signed-in user's Firestore Knowledge Base snapshot for the active industry
+  // Load signed-in user's Firestore Knowledge Base & Pre-Requisites snapshot for the active industry
   useEffect(() => {
     if (!isVerifiedFirebaseUser || !user || !industry?.id) return;
     let cancelled = false;
-    void loadIndustryKnowledgeSnapshotFromFirestore(user.uid, industry.id)
-      .then((savedKnowledgeBase) => {
-        if (cancelled || !savedKnowledgeBase || savedKnowledgeBase.length === 0) return;
+    void loadIndustrySnapshotWithPrerequisitesFromFirestore(user.uid, industry.id)
+      .then((snapshot) => {
+        if (cancelled || !snapshot) return;
+        const { knowledgeBase: savedKnowledgeBase, organisationalPrerequisites: savedPrerequisites } = snapshot;
+        if (
+          (!savedKnowledgeBase || savedKnowledgeBase.length === 0) &&
+          (!savedPrerequisites || savedPrerequisites.length === 0)
+        ) {
+          return;
+        }
         setIndustriesDict((prev) => {
           const target = prev[selectedIndustry];
           if (!target) return prev;
@@ -638,7 +669,14 @@ export default function App() {
             ...prev,
             [selectedIndustry]: normalizeIndustryBundle({
               ...target,
-              knowledgeBase: savedKnowledgeBase
+              knowledgeBase:
+                savedKnowledgeBase && savedKnowledgeBase.length > 0
+                  ? savedKnowledgeBase
+                  : target.knowledgeBase,
+              organisationalPrerequisites:
+                savedPrerequisites && savedPrerequisites.length > 0
+                  ? savedPrerequisites
+                  : target.organisationalPrerequisites
             })
           };
         });
@@ -650,6 +688,42 @@ export default function App() {
       cancelled = true;
     };
   }, [isVerifiedFirebaseUser, user, industry?.id, selectedIndustry]);
+
+  // Load persisted Organisational & Industry Pre-Requisites from MongoDB / Session Store per industry
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`/api/prerequisites?industry=${encodeURIComponent(selectedIndustry)}`)
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((data) => {
+        if (cancelled || !data || !Array.isArray(data.prerequisites)) return;
+        setPrerequisitesPersistenceSource(
+          data.source === 'mongodb' ? 'mongodb' : 'memory'
+        );
+        setIndustriesDict((prev) => {
+          const target = prev[selectedIndustry];
+          if (!target) return prev;
+          const normalized = normalizeOrganisationalPrerequisites(data.prerequisites, target);
+          if (
+            JSON.stringify(target.organisationalPrerequisites || []) === JSON.stringify(normalized)
+          ) {
+            return prev;
+          }
+          const updatedBundle = normalizeIndustryBundle({
+            ...target,
+            organisationalPrerequisites: normalized
+          });
+          lastPersistedSnapshotRef.current = JSON.stringify(updatedBundle);
+          return {
+            ...prev,
+            [selectedIndustry]: updatedBundle
+          };
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedIndustry]);
 
   const handleUpdateNavButtonOrder = useCallback((nextOrder: ActiveNavView[]) => {
     const saved = savePersistedUserPreferences({ navButtonOrder: nextOrder });
@@ -835,7 +909,8 @@ export default function App() {
           user.uid,
           nextBundle.id,
           nextBundle.name,
-          updatedPillars
+          updatedPillars,
+          nextBundle.organisationalPrerequisites
         );
       }
 
@@ -857,6 +932,86 @@ export default function App() {
     },
     [currentIndustryBundle, selectedIndustry, persistIndustry, isVerifiedFirebaseUser, user]
   );
+
+  const handleUpdatePrerequisites = useCallback(
+    async (updatedItems: OrganisationalPrerequisiteItem[], actionSummary?: string) => {
+      const normalized = normalizeOrganisationalPrerequisites(
+        updatedItems,
+        currentIndustryBundle
+      );
+      const nextBundle = normalizeIndustryBundle({
+        ...currentIndustryBundle,
+        organisationalPrerequisites: normalized
+      });
+
+      setIndustriesDict((prev) => ({
+        ...prev,
+        [selectedIndustry]: nextBundle
+      }));
+
+      lastPersistedSnapshotRef.current = JSON.stringify(nextBundle);
+
+      try {
+        const resp = await fetch('/api/prerequisites', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            industry: selectedIndustry,
+            prerequisites: normalized,
+            actionSummary
+          })
+        });
+        if (resp.ok) {
+          const payload = await resp.json();
+          setPrerequisitesPersistenceSource(
+            payload?.source === 'mongodb' ? 'mongodb' : 'memory'
+          );
+        }
+      } catch {
+        // Fallback persisted via industry snapshot below
+      }
+
+      await persistIndustry(nextBundle);
+
+      if (isVerifiedFirebaseUser && user) {
+        await saveIndustryKnowledgeSnapshotToFirestore(
+          user.uid,
+          nextBundle.id,
+          nextBundle.name,
+          nextBundle.knowledgeBase,
+          normalized
+        );
+      }
+
+      eventBus.publish({
+        topic: 'KNOWLEDGE_BASE_UPDATED',
+        sourceAgent: 'Organisational Pre-Requisites Controller',
+        targetAgent: 'Supervisor Agent',
+        summary:
+          actionSummary ||
+          `Updated Organisational/Industry Pre-Requisites knowledge base for ${nextBundle.name}`,
+        payload: {
+          industry: nextBundle.name,
+          enabledCount: normalized.filter((item) => item.enabledForAgents).length,
+          totalCount: normalized.length
+        },
+        latencyMs: 22,
+        severity: 'info'
+      });
+    },
+    [currentIndustryBundle, selectedIndustry, persistIndustry, isVerifiedFirebaseUser, user]
+  );
+
+  const handleSyncPrerequisitesFromWorkspace = useCallback(async () => {
+    const existingCustomItems = (
+      currentIndustryBundle.organisationalPrerequisites || []
+    ).filter((item) => !item.isCanonical);
+    const refreshedCanonical = buildDefaultOrganisationalPrerequisites(currentIndustryBundle);
+    await handleUpdatePrerequisites(
+      [...refreshedCanonical, ...existingCustomItems],
+      `Synchronized Organisational & Industry Pre-Requisites from live ${currentIndustryBundle.name} workspace telemetry`
+    );
+  }, [currentIndustryBundle, handleUpdatePrerequisites]);
 
   // Cross-industry live Notification Center collector (Critical OKRs + New Disaster Events + Escalations & Retrospective Owner Alerts)
   const portfolioNotifications = useMemo(() => {
@@ -1063,7 +1218,11 @@ export default function App() {
         criticalOkrCount: result.summary.criticalOkrCount,
         activeProgramCount: result.summary.activeProgramCount,
         activeDisasterCount: result.summary.activeDisasterCount,
-        summaryHeadline: result.summary.headline
+        summaryHeadline: result.summary.headline,
+        prerequisitesContext: buildPrerequisitesAgentContext(
+          currentIndustryBundle.organisationalPrerequisites || [],
+          3
+        )
       })
     })
       .then((resp) => (resp.ok ? resp.json() : null))
@@ -1078,7 +1237,13 @@ export default function App() {
             source: String(data?.persistence || data?.run?.source || '').includes('mongodb') ? 'mongodb' : 'memory',
             savedCount: normalized.length * 6
           });
+          if (data?.run?.id) {
+            setLastOrchestrationRunId(String(data.run.id));
+          }
         } else if (data?.run) {
+          if (data.run.id) {
+            setLastOrchestrationRunId(String(data.run.id));
+          }
           setOrchestrationRuns((prev) => {
             const next = normalizeOrchestrationRuns([...prev, data.run]).slice(-10).map((r, i) => ({
               ...r,
@@ -1234,10 +1399,19 @@ export default function App() {
     source: 'mongodb' | 'memory';
     savedCount: number;
   } | null>(null);
+  const [agentThresholdConfigs, setAgentThresholdConfigs] = useState<AgentAnomalyThresholdConfig[]>(
+    () => buildDefaultAgentThresholdConfigs('Telco')
+  );
+  const [isThresholdPanelOpen, setIsThresholdPanelOpen] = useState(false);
+  const [thresholdPersistenceSource, setThresholdPersistenceSource] = useState<'mongodb' | 'memory' | null>(null);
+  const [isSavingThresholds, setIsSavingThresholds] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     setSelectedInsightStageId(null);
+    setLastOrchestrationRunId(null);
+    setAgentThresholdConfigs(buildDefaultAgentThresholdConfigs(selectedIndustry));
+
     void fetch(`/api/orchestration-runs?industry=${encodeURIComponent(selectedIndustry)}`)
       .then((resp) => (resp.ok ? resp.json() : null))
       .then((data) => {
@@ -1252,39 +1426,125 @@ export default function App() {
         }
       })
       .catch(() => {});
+
+    void fetch(`/api/risk-sentinel/thresholds?industry=${encodeURIComponent(selectedIndustry)}`)
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((data) => {
+        if (!cancelled && Array.isArray(data?.configs) && data.configs.length > 0) {
+          setAgentThresholdConfigs(normalizeAgentThresholdConfigs(data.configs, selectedIndustry));
+          setThresholdPersistenceSource(String(data.source || '').startsWith('mongodb') ? 'mongodb' : 'memory');
+        }
+      })
+      .catch(() => {});
+
     return () => {
       cancelled = true;
     };
   }, [selectedIndustry]);
 
+  const persistThresholdConfigs = useCallback(
+    async (
+      nextConfigs: AgentAnomalyThresholdConfig[],
+      meta?: { updatedAgentId?: string; updatedStageId?: number; reset?: boolean }
+    ) => {
+      setIsSavingThresholds(true);
+      try {
+        const resp = await fetch('/api/risk-sentinel/thresholds', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            industry: selectedIndustry,
+            configs: nextConfigs,
+            updatedAgentId: meta?.updatedAgentId,
+            updatedStageId: meta?.updatedStageId,
+            reset: Boolean(meta?.reset)
+          })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          if (Array.isArray(data?.configs)) {
+            setAgentThresholdConfigs(normalizeAgentThresholdConfigs(data.configs, selectedIndustry));
+          }
+          setThresholdPersistenceSource(String(data?.source || '').startsWith('mongodb') ? 'mongodb' : 'memory');
+        }
+      } catch {
+        // Local threshold state remains active
+      } finally {
+        setIsSavingThresholds(false);
+      }
+    },
+    [selectedIndustry]
+  );
+
+  const handleUpdateStageSensitivity = useCallback(
+    (stageId: number, sensitivity: AnomalySensitivityLevel) => {
+      const next = applyStageSensitivityPreset(agentThresholdConfigs, stageId, sensitivity);
+      setAgentThresholdConfigs(next);
+      void persistThresholdConfigs(next, { updatedStageId: stageId });
+    },
+    [agentThresholdConfigs, persistThresholdConfigs]
+  );
+
+  const handleUpdateAgentThreshold = useCallback(
+    (
+      agentId: string,
+      patch: {
+        sensitivity?: AnomalySensitivityLevel;
+        stdDevMultiplier?: number;
+        minAnomalyFloor?: number;
+      }
+    ) => {
+      const next = updateAgentThresholdConfig(agentThresholdConfigs, agentId, patch);
+      setAgentThresholdConfigs(next);
+      const targetStageId = next.find((c) => c.agentId === agentId)?.stageId;
+      void persistThresholdConfigs(next, { updatedAgentId: agentId, updatedStageId: targetStageId });
+    },
+    [agentThresholdConfigs, persistThresholdConfigs]
+  );
+
+  const handleResetThresholds = useCallback(() => {
+    const defaults = buildDefaultAgentThresholdConfigs(selectedIndustry);
+    setAgentThresholdConfigs(defaults);
+    void persistThresholdConfigs(defaults, { reset: true });
+  }, [persistThresholdConfigs, selectedIndustry]);
+
   const orchestrationInsights = useMemo(() => orchestrationRuns.slice(-10), [orchestrationRuns]);
 
-  const anomalyStats = useMemo(
-    () => computeAnomalyTelemetryStats(orchestrationInsights),
-    [orchestrationInsights]
+  const overviewAnomalyEvaluation = useMemo(
+    () => evaluateOverviewAnomalySeries(orchestrationInsights, agentThresholdConfigs),
+    [orchestrationInsights, agentThresholdConfigs]
   );
+
+  const anomalyStats = overviewAnomalyEvaluation.stats;
 
   const anomalyChartData = useMemo(
     () =>
-      orchestrationInsights.map((item) => {
-        const count = Number(item.anomalyCount || 0);
-        return {
-          ...item,
-          anomalyCount: count,
-          isAnomalySpike: isSignificantAnomalyDeviation(count, anomalyStats)
-        };
-      }),
-    [orchestrationInsights, anomalyStats]
+      overviewAnomalyEvaluation.points.map((pt) => ({
+        ...pt.raw,
+        anomalyCount: pt.anomalyCount,
+        isAnomalySpike: pt.isAnomalySpike,
+        stageSensitivity: pt.stageSensitivity,
+        stageThreshold: pt.stageThreshold
+      })),
+    [overviewAnomalyEvaluation]
   );
 
   const stageOverviewCards = useMemo(
-    () => computeAllStagesOverview(orchestrationInsights),
-    [orchestrationInsights]
+    () => computeAllStagesOverview(orchestrationInsights, agentThresholdConfigs),
+    [orchestrationInsights, agentThresholdConfigs]
+  );
+
+  const matrixOkrs = useMemo(
+    () => extractMatrixOkrs(currentIndustryBundle.traceability, nodesMap),
+    [currentIndustryBundle.traceability, nodesMap]
   );
 
   const stageDrilldown = useMemo(
-    () => (selectedInsightStageId !== null ? filterInsightsByStage(orchestrationInsights, selectedInsightStageId) : null),
-    [orchestrationInsights, selectedInsightStageId]
+    () =>
+      selectedInsightStageId !== null
+        ? filterInsightsByStage(orchestrationInsights, selectedInsightStageId, agentThresholdConfigs)
+        : null,
+    [orchestrationInsights, selectedInsightStageId, agentThresholdConfigs]
   );
 
   const displayedInsightsRuns: OrchestrationRunRecord[] = stageDrilldown
@@ -1979,6 +2239,20 @@ export default function App() {
                       All 6 Stages
                     </button>
                   )}
+                  <button
+                    type="button"
+                    data-testid="configure-thresholds-btn"
+                    aria-expanded={isThresholdPanelOpen}
+                    onClick={() => setIsThresholdPanelOpen((prev) => !prev)}
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-semibold cursor-pointer transition-colors ${
+                      isThresholdPanelOpen
+                        ? 'border-indigo-500 bg-indigo-600 text-white'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <Sliders className="h-3.5 w-3.5" />
+                    Thresholds
+                  </button>
                   <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-[11px] font-semibold text-indigo-700 tabular-nums">
                     <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
                     Last {displayedInsightsRuns.length} runs tracked
@@ -1995,6 +2269,21 @@ export default function App() {
 
               {!isInsightsCollapsed && (
                 <div className="space-y-4">
+                  {isThresholdPanelOpen && (
+                    <RiskSentinelThresholdPanel
+                      industryName={currentIndustryBundle.name}
+                      configs={agentThresholdConfigs}
+                      selectedStageId={selectedInsightStageId}
+                      persistenceSource={thresholdPersistenceSource}
+                      isSaving={isSavingThresholds}
+                      onUpdateStagePreset={handleUpdateStageSensitivity}
+                      onUpdateAgentConfig={handleUpdateAgentThreshold}
+                      onSelectStage={(stageId) => void handleSelectInsightStage(stageId)}
+                      onResetDefaults={handleResetThresholds}
+                      onClose={() => setIsThresholdPanelOpen(false)}
+                    />
+                  )}
+
                   {/* Interactive 6-Stage Drilldown Selector */}
                   <div
                     data-testid="insights-stage-selector"
@@ -2002,6 +2291,18 @@ export default function App() {
                   >
                     {stageOverviewCards.map((stageCard) => {
                       const isSelected = selectedInsightStageId === stageCard.stageId;
+                      const confidenceTextClass =
+                        stageCard.confidenceBand === 'high'
+                          ? 'text-emerald-700'
+                          : stageCard.confidenceBand === 'moderate'
+                            ? 'text-amber-700'
+                            : 'text-red-700';
+                      const confidenceBarClass =
+                        stageCard.confidenceBand === 'high'
+                          ? 'bg-emerald-500'
+                          : stageCard.confidenceBand === 'moderate'
+                            ? 'bg-amber-500'
+                            : 'bg-red-500';
                       return (
                         <button
                           key={stageCard.stageId}
@@ -2017,18 +2318,26 @@ export default function App() {
                         >
                           <div className="flex items-center justify-between gap-1">
                             <span
-                              className={`text-[10px] font-bold uppercase tracking-wider ${
+                              className={`text-[10px] font-bold uppercase tracking-wider whitespace-nowrap shrink-0 ${
                                 isSelected ? 'text-indigo-700' : 'text-slate-500'
                               }`}
                             >
                               Stage {stageCard.stageId}
                             </span>
                             <span
-                              className={`text-[10px] font-bold tabular-nums ${
-                                stageCard.totalAnomalies > 0 ? 'text-red-700' : 'text-emerald-700'
+                              data-testid={`insight-stage-sensitivity-${stageCard.stageId}`}
+                              className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase border whitespace-nowrap shrink-0 ${
+                                stageCard.sensitivity === 'high'
+                                  ? 'bg-red-50 text-red-700 border-red-200'
+                                  : stageCard.sensitivity === 'balanced'
+                                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                    : 'bg-slate-100 text-slate-600 border-slate-200'
                               }`}
                             >
-                              {stageCard.totalAnomalies} anom
+                              {stageCard.sensitivity === 'balanced'
+                                ? 'Bal'
+                                : SENSITIVITY_PRESETS[stageCard.sensitivity].shortLabel}{' '}
+                              · ≥{stageCard.minAnomalyFloor}
                             </span>
                           </div>
                           <p className="mt-1 text-xs font-bold text-slate-900 truncate">
@@ -2036,7 +2345,34 @@ export default function App() {
                           </p>
                           <div className="mt-1.5 flex items-center justify-between text-[10px] text-slate-600 tabular-nums">
                             <span>{stageCard.avgSuccessRate.toFixed(1)}%</span>
-                            <span>{stageCard.avgLatencyMs}ms</span>
+                            <span className={stageCard.spikeRunCount > 0 ? 'font-bold text-red-700' : 'text-slate-600'}>
+                              {stageCard.spikeRunCount} spike{stageCard.spikeRunCount === 1 ? '' : 's'}
+                            </span>
+                          </div>
+                          <div className="mt-2 pt-1.5 border-t border-slate-200/70">
+                            <div className="flex items-center justify-between text-[10px] leading-tight">
+                              <span className="font-medium text-slate-500">Confidence</span>
+                              <span
+                                data-testid={`stage-confidence-value-${stageCard.stageId}`}
+                                className={`font-bold tabular-nums ${confidenceTextClass}`}
+                              >
+                                {stageCard.confidenceScore}%
+                              </span>
+                            </div>
+                            <div
+                              role="progressbar"
+                              aria-valuenow={stageCard.confidenceScore}
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                              aria-label={`${stageCard.stageName} confidence score ${stageCard.confidenceScore}%`}
+                              data-testid={`stage-confidence-bar-${stageCard.stageId}`}
+                              className="mt-1 h-1.5 w-full rounded-full bg-slate-200/80 overflow-hidden"
+                            >
+                              <div
+                                className={`h-full rounded-full transition-all duration-300 ${confidenceBarClass}`}
+                                style={{ width: `${stageCard.confidenceScore}%` }}
+                              />
+                            </div>
                           </div>
                         </button>
                       );
@@ -2129,24 +2465,38 @@ export default function App() {
                       data-testid="historical-anomaly-chart"
                       className="h-64 rounded-xl border border-slate-200 bg-slate-50 p-3"
                     >
-                      <div className="mb-2 flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-slate-700 truncate">
-                          {stageDrilldown ? `${stageDrilldown.stageName} Anomalies` : 'Historical Anomaly Frequency'}
-                        </span>
+                      <div className="mb-2 flex items-center justify-between gap-1.5">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="text-xs font-semibold text-slate-700 truncate">
+                            {stageDrilldown ? `${stageDrilldown.stageName}` : 'Anomaly Frequency'}
+                          </span>
+                          <span
+                            data-testid="anomaly-active-sensitivity-badge"
+                            className={`rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase shrink-0 ${
+                              activeAnomalyStats.sensitivity === 'high'
+                                ? 'bg-red-50 text-red-700 border-red-200'
+                                : activeAnomalyStats.sensitivity === 'balanced'
+                                  ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                  : 'bg-slate-100 text-slate-700 border-slate-200'
+                            }`}
+                          >
+                            {SENSITIVITY_PRESETS[activeAnomalyStats.sensitivity].shortLabel}
+                          </span>
+                        </div>
                         <span
                           data-testid="anomaly-mean-summary"
-                          className={`text-[11px] font-semibold tabular-nums whitespace-nowrap shrink-0 ${
+                          className={`text-[10px] font-semibold tabular-nums whitespace-nowrap shrink-0 ${
                             activeAnomalyStats.spikeRunCount > 0 ? 'text-red-700' : 'text-slate-600'
                           }`}
                         >
-                          Mean {activeAnomalyStats.mean.toFixed(1)} · {activeAnomalyStats.spikeRunCount} spike{activeAnomalyStats.spikeRunCount === 1 ? '' : 's'}
+                          Mean {activeAnomalyStats.mean.toFixed(1)} · ≥{activeAnomalyStats.effectiveThreshold.toFixed(1)} · {activeAnomalyStats.spikeRunCount} spike{activeAnomalyStats.spikeRunCount === 1 ? '' : 's'}
                         </span>
                       </div>
                       <ResponsiveContainer width="100%" height="90%">
                         <AreaChart
                           data={activeAnomalyChartData}
                           onClick={handleChartDrilldownClick}
-                          margin={{ top: 14, right: 12, left: -12, bottom: 0 }}
+                          margin={{ top: 18, right: 12, left: -12, bottom: 0 }}
                           className="cursor-pointer"
                         >
                           <defs>
@@ -2161,10 +2511,15 @@ export default function App() {
                           <Tooltip
                             formatter={(value, _name, item) => {
                               const count = Number(value ?? 0);
-                              const isSpike = Boolean(item?.payload?.isAnomalySpike);
+                              const payload = item?.payload || {};
+                              const isSpike = Boolean(payload.isAnomalySpike);
+                              const sensitivityTag = payload.stageSensitivity
+                                ? SENSITIVITY_PRESETS[payload.stageSensitivity as AnomalySensitivityLevel]?.shortLabel || payload.stageSensitivity
+                                : SENSITIVITY_PRESETS[activeAnomalyStats.sensitivity].shortLabel;
+                              const cutoff = Number(payload.stageThreshold ?? activeAnomalyStats.effectiveThreshold);
                               return [
-                                `${count} anomalies${isSpike ? ` (Significantly above mean ${activeAnomalyStats.mean.toFixed(1)})` : ` (Mean ${activeAnomalyStats.mean.toFixed(1)})`}`,
-                                isSpike ? 'Alert Spike' : stageDrilldown ? stageDrilldown.stageName : 'Risk Sentinel'
+                                `${count} anomalies (${sensitivityTag} sensitivity · Cutoff ≥ ${cutoff.toFixed(1)} · Mean ${activeAnomalyStats.mean.toFixed(1)})`,
+                                isSpike ? `Alert Spike · ${payload.stage || 'Risk Sentinel'}` : `${payload.stage || 'Risk Sentinel'}`
                               ];
                             }}
                           />
@@ -2177,9 +2532,24 @@ export default function App() {
                             ifOverflow="extendDomain"
                             label={{
                               value: `Mean (${activeAnomalyStats.mean.toFixed(1)})`,
+                              position: 'insideBottomRight',
+                              dy: 12,
+                              fill: '#475569',
+                              fontSize: 10,
+                              fontWeight: 700
+                            }}
+                          />
+                          <ReferenceLine
+                            y={activeAnomalyStats.effectiveThreshold}
+                            stroke="#dc2626"
+                            strokeDasharray="2 3"
+                            strokeWidth={1.5}
+                            ifOverflow="extendDomain"
+                            label={{
+                              value: `Threshold (${activeAnomalyStats.effectiveThreshold.toFixed(1)} · ${SENSITIVITY_PRESETS[activeAnomalyStats.sensitivity].shortLabel})`,
                               position: 'insideTopRight',
                               dy: -14,
-                              fill: '#334155',
+                              fill: '#b91c1c',
                               fontSize: 10,
                               fontWeight: 700
                             }}
@@ -2247,6 +2617,16 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* D3-based Agent Impact Matrix Heatmap */}
+                  <AgentImpactMatrixHeatmap
+                    runs={orchestrationInsights}
+                    okrs={matrixOkrs}
+                    thresholdConfigs={agentThresholdConfigs}
+                    selectedStageId={selectedInsightStageId}
+                    industryName={currentIndustryBundle.name}
+                    onSelectStage={(stageId) => void handleSelectInsightStage(stageId)}
+                  />
+
                   {/* Constituent Agents Drilldown Table */}
                   {stageDrilldown && (
                     <div
@@ -2255,10 +2635,27 @@ export default function App() {
                     >
                       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                         <div>
-                          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-indigo-600">
-                            Stage {stageDrilldown.stageId} Constituent Agents
-                          </p>
-                          <h3 className="text-sm font-bold text-slate-900">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-indigo-600">
+                              Stage {stageDrilldown.stageId} Constituent Agents
+                            </p>
+                            <span className="rounded border border-indigo-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-indigo-700 tabular-nums">
+                              Stage Sensitivity: {SENSITIVITY_PRESETS[stageDrilldown.thresholdSummary.sensitivity].shortLabel} (+{stageDrilldown.thresholdSummary.stdDevMultiplier.toFixed(2)}σ · Min ≥{stageDrilldown.thresholdSummary.minAnomalyFloor})
+                            </span>
+                            <span
+                              data-testid="stage-drilldown-confidence-badge"
+                              className={`rounded border px-2 py-0.5 text-[10px] font-bold tabular-nums ${
+                                stageDrilldown.confidenceBand === 'high'
+                                  ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                  : stageDrilldown.confidenceBand === 'moderate'
+                                    ? 'border-amber-200 bg-amber-50 text-amber-800'
+                                    : 'border-red-200 bg-red-50 text-red-700'
+                              }`}
+                            >
+                              Confidence: {stageDrilldown.confidenceScore}%
+                            </span>
+                          </div>
+                          <h3 className="text-sm font-bold text-slate-900 mt-0.5">
                             {stageDrilldown.stageName} ({stageDrilldown.processFlowAgent})
                           </h3>
                         </div>
@@ -2285,7 +2682,7 @@ export default function App() {
                           <div
                             key={agent.agentId}
                             data-testid={`constituent-agent-card-${agent.agentId}`}
-                            className="rounded-xl border border-slate-200 bg-white p-3.5 space-y-2"
+                            className="rounded-xl border border-slate-200 bg-white p-3.5 space-y-2.5"
                           >
                             <div className="flex items-start justify-between gap-2">
                               <div className="min-w-0">
@@ -2322,6 +2719,30 @@ export default function App() {
                                   {agent.totalAnomalies}
                                 </p>
                               </div>
+                            </div>
+
+                            <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-[11px]">
+                              <span className="text-slate-600 tabular-nums">
+                                Threshold:{' '}
+                                <strong className="text-slate-800">
+                                  +{agent.stdDevMultiplier.toFixed(2)}σ · ≥{agent.minAnomalyFloor}
+                                </strong>
+                              </span>
+                              <select
+                                aria-label={`Sensitivity for ${agent.agentName}`}
+                                data-testid={`drilldown-agent-sensitivity-${agent.agentId}`}
+                                value={agent.sensitivity}
+                                onChange={(e) =>
+                                  handleUpdateAgentThreshold(agent.agentId, {
+                                    sensitivity: e.target.value as AnomalySensitivityLevel
+                                  })
+                                }
+                                className="rounded-md border border-slate-300 bg-slate-50 px-2 py-0.5 text-[11px] font-semibold text-slate-800 cursor-pointer"
+                              >
+                                <option value="high">High</option>
+                                <option value="balanced">Balanced</option>
+                                <option value="low">Low</option>
+                              </select>
                             </div>
                           </div>
                         ))}
@@ -2518,6 +2939,7 @@ export default function App() {
         {activeView === 'lifecycle' && (
           <LifecycleView
             industry={industry}
+            industryKey={selectedIndustry}
             activeStageId={activeStageId}
             onSelectStage={setActiveStageId}
             nodesMap={nodesMap}
@@ -2527,6 +2949,7 @@ export default function App() {
             isOrchestratingAll={isOrchestratingAll}
             onRunFullOrchestration={handleRunFullOrchestration}
             lastOrchestrationSummary={lastOrchestrationSummary}
+            lastOrchestrationRunId={lastOrchestrationRunId}
             onRetrospectiveCompleted={handleRetrospectiveCompleted}
           />
         )}
@@ -2575,7 +2998,7 @@ export default function App() {
         {activeView === 'strategy' && (
           <StrategicPortfolioPlannerView industry={industry} />
         )}
-        {/* View 7: 5-Pillar AI Knowledge Base */}
+        {/* View 7: 5-Pillar AI Knowledge Base & Organisational Pre-Requisites */}
         {activeView === 'knowledge' && (
           <KnowledgeBaseView
             industry={industry}
@@ -2583,6 +3006,10 @@ export default function App() {
             onToggleFedPillar={handleToggleFedPillar}
             activeFedCount={activeFedCount}
             onUpdateKnowledgeBase={handleUpdateKnowledgeBase}
+            canManagePrerequisites={canManagePolicy || canCreateOkr}
+            prerequisitesPersistenceSource={prerequisitesPersistenceSource}
+            onUpdatePrerequisites={handleUpdatePrerequisites}
+            onSyncPrerequisitesFromWorkspace={handleSyncPrerequisitesFromWorkspace}
           />
         )}
         {/* View 6: OKR Future Attainment Trajectory (Target vs Predicted Recharts) */}
@@ -2630,6 +3057,10 @@ export default function App() {
             onUpdateOrgDirectory={setOrgDirectory}
             policies={policies}
             onUpdatePolicies={setPolicies}
+            onOpenKnowledgeBase={() => {
+              setIsGovernanceOpen(false);
+              setActiveView('knowledge');
+            }}
             onClose={() => setIsGovernanceOpen(false)}
           />
         )}

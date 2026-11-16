@@ -14,7 +14,7 @@ import {
 } from 'firebase/firestore';
 import type { User } from 'firebase/auth';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
-import type { KnowledgeBasePillar } from '../types/orchestration';
+import type { KnowledgeBasePillar, OrganisationalPrerequisiteItem } from '../types/orchestration';
 import type { ActiveNavView, UserPreferences } from '../utils/navOrder';
 import { normalizeNavOrder, normalizeUserPreferences } from '../utils/navOrder';
 import type { GeminiChatModelId } from '../utils/geminiChatConfig';
@@ -141,11 +141,34 @@ export async function saveUserPreferencesToFirestore(
   }
 }
 
+function boundOrganisationalPrerequisites(
+  items?: OrganisationalPrerequisiteItem[]
+): OrganisationalPrerequisiteItem[] | undefined {
+  if (!Array.isArray(items) || items.length === 0) return undefined;
+  return items.slice(0, 40).map((item) => ({
+    id: String(item.id || '').slice(0, 80),
+    categoryKey: item.categoryKey,
+    categoryLabel: String(item.categoryLabel || '').slice(0, 80),
+    label: String(item.label || '').slice(0, 180),
+    description: String(item.description || '').slice(0, 400),
+    content: String(item.content || '').slice(0, 2000),
+    sourceSystem: String(item.sourceSystem || '').slice(0, 140),
+    owner: String(item.owner || '').slice(0, 100),
+    targetAgents: (item.targetAgents || []).slice(0, 8).map((a) => String(a).slice(0, 80)),
+    enabledForAgents: Boolean(item.enabledForAgents),
+    syncStatus: item.syncStatus || 'Synced',
+    isCanonical: Boolean(item.isCanonical),
+    tags: (item.tags || []).slice(0, 6).map((t) => String(t).slice(0, 60)),
+    updatedAt: String(item.updatedAt || new Date().toISOString()).slice(0, 64)
+  }));
+}
+
 export async function saveIndustryKnowledgeSnapshotToFirestore(
   uid: string,
   industryId: string,
   industryName: string,
-  knowledgeBase: KnowledgeBasePillar[]
+  knowledgeBase: KnowledgeBasePillar[],
+  organisationalPrerequisites?: OrganisationalPrerequisiteItem[]
 ): Promise<void> {
   const cleanUid = sanitizeFirestoreId(uid);
   const cleanIndustryId = sanitizeFirestoreId(industryId, 'industry');
@@ -165,33 +188,45 @@ export async function saveIndustryKnowledgeSnapshotToFirestore(
       source: String(c.source).slice(0, 140)
     }))
   }));
+  const boundedPrerequisites = boundOrganisationalPrerequisites(organisationalPrerequisites);
 
   try {
     const snap = await getDoc(ref);
     if (!snap.exists()) {
-      await setDoc(ref, {
+      const createPayload: Record<string, any> = {
         ownerUid: cleanUid,
         industryId: cleanIndustryId,
         industryName: industryName.slice(0, 120),
         knowledgeBase: boundedPillars,
         updatedAt: serverTimestamp()
-      });
+      };
+      if (boundedPrerequisites) {
+        createPayload.organisationalPrerequisites = boundedPrerequisites;
+      }
+      await setDoc(ref, createPayload);
     } else {
-      await updateDoc(ref, {
+      const updatePayload: Record<string, any> = {
         industryName: industryName.slice(0, 120),
         knowledgeBase: boundedPillars,
         updatedAt: serverTimestamp()
-      });
+      };
+      if (boundedPrerequisites) {
+        updatePayload.organisationalPrerequisites = boundedPrerequisites;
+      }
+      await updateDoc(ref, updatePayload);
     }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 
-export async function loadIndustryKnowledgeSnapshotFromFirestore(
+export async function loadIndustrySnapshotWithPrerequisitesFromFirestore(
   uid: string,
   industryId: string
-): Promise<KnowledgeBasePillar[] | null> {
+): Promise<{
+  knowledgeBase: KnowledgeBasePillar[] | null;
+  organisationalPrerequisites: OrganisationalPrerequisiteItem[] | null;
+} | null> {
   const cleanUid = sanitizeFirestoreId(uid);
   const cleanIndustryId = sanitizeFirestoreId(industryId, 'industry');
   const path = `users/${cleanUid}/industries/${cleanIndustryId}`;
@@ -200,10 +235,23 @@ export async function loadIndustryKnowledgeSnapshotFromFirestore(
     const snap = await getDoc(doc(db, 'users', cleanUid, 'industries', cleanIndustryId));
     if (!snap.exists()) return null;
     const data = snap.data();
-    return Array.isArray(data.knowledgeBase) ? (data.knowledgeBase as KnowledgeBasePillar[]) : null;
+    return {
+      knowledgeBase: Array.isArray(data.knowledgeBase) ? (data.knowledgeBase as KnowledgeBasePillar[]) : null,
+      organisationalPrerequisites: Array.isArray(data.organisationalPrerequisites)
+        ? (data.organisationalPrerequisites as OrganisationalPrerequisiteItem[])
+        : null
+    };
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, path);
   }
+}
+
+export async function loadIndustryKnowledgeSnapshotFromFirestore(
+  uid: string,
+  industryId: string
+): Promise<KnowledgeBasePillar[] | null> {
+  const result = await loadIndustrySnapshotWithPrerequisitesFromFirestore(uid, industryId);
+  return result?.knowledgeBase ?? null;
 }
 
 export function subscribeToUserChatSessions(

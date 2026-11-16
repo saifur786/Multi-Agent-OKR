@@ -51,6 +51,20 @@ import {
   resolveStageDefinition,
   type PersistedStageMetricRecord
 } from './src/utils/orchestrationDrilldown';
+import {
+  buildDefaultAgentThresholdConfigs,
+  computeAllStageThresholdSummaries,
+  normalizeAgentThresholdConfigs,
+  type AgentAnomalyThresholdConfig
+} from './src/utils/riskSentinelThresholds';
+import { extractLatestRunStageTimeline } from './src/utils/orchestrationTimeline';
+import {
+  buildDefaultOrganisationalPrerequisites,
+  buildPrerequisitesAgentContext,
+  computePrerequisitesCoverageStats,
+  normalizeOrganisationalPrerequisites
+} from './src/utils/orgPrerequisites';
+import type { OrganisationalPrerequisiteItem } from './src/types/orchestration';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -126,6 +140,8 @@ let memoryUserPreferences: {
 };
 const memoryOrchestrationRuns: OrchestrationRunRecord[] = [];
 const memoryStageMetrics: PersistedStageMetricRecord[] = [];
+const memoryAgentThresholdConfigs = new Map<string, AgentAnomalyThresholdConfig[]>();
+const memoryPrerequisites = new Map<string, OrganisationalPrerequisiteItem[]>();
 const memoryRiskConnectors: RiskConnectorConfig[] = [
   {
     id: 'conn-servicenow-default',
@@ -313,6 +329,8 @@ async function connectMongo(): Promise<Db | null> {
     await mongoDb.collection('orchestration_runs').createIndex({ industry: 1, createdAt: 1 });
     await mongoDb.collection('orchestration_stage_metrics').createIndex({ industry: 1, stageId: 1, createdAt: -1 });
     await mongoDb.collection('orchestration_stage_metrics').createIndex({ id: 1 }, { unique: true });
+    await mongoDb.collection('agent_threshold_configs').createIndex({ industry: 1, stageId: 1 });
+    await mongoDb.collection('agent_threshold_configs').createIndex({ id: 1 }, { unique: true });
     console.log(`Connected to MongoDB (${DATABASE_NAME}).`);
     return mongoDb;
   } catch (error) {
@@ -489,6 +507,201 @@ app.post('/api/industries', async (req, res) => {
   );
 
   return res.status(201).json({ industry: timestamped, source: 'mongodb', upserted: result.upsertedCount > 0 });
+});
+
+function resolveIndustryBundleForKey(industryKey: string): any | null {
+  const target = String(industryKey || '').trim().toLowerCase();
+  if (!target) return null;
+  for (const ind of memoryIndustries.values()) {
+    if (
+      String(ind?.id || '').toLowerCase() === target ||
+      String(ind?.name || '').toLowerCase() === target
+    ) {
+      return ind;
+    }
+  }
+  for (const ind of Object.values(INDUSTRY_DATA)) {
+    if (
+      String(ind.id || '').toLowerCase() === target ||
+      String(ind.name || '').toLowerCase() === target
+    ) {
+      return ind;
+    }
+  }
+  return null;
+}
+
+async function loadPrerequisitesForIndustry(industryKey: string): Promise<{
+  prerequisites: OrganisationalPrerequisiteItem[];
+  source: 'mongodb' | 'memory';
+  updatedAt: string;
+}> {
+  const normalizedKey = String(industryKey || 'Telco').trim() || 'Telco';
+  const db = await connectMongo();
+  const baseBundle = resolveIndustryBundleForKey(normalizedKey);
+
+  if (db) {
+    const prereqDoc = await db.collection('org_prerequisites').findOne({ industryKey: normalizedKey });
+    if (prereqDoc && Array.isArray(prereqDoc.prerequisites)) {
+      const normalized = normalizeOrganisationalPrerequisites(prereqDoc.prerequisites, baseBundle);
+      return {
+        prerequisites: normalized,
+        source: 'mongodb',
+        updatedAt: String(prereqDoc.updatedAt || new Date().toISOString())
+      };
+    }
+
+    const industryDoc = await db.collection('industries').findOne({
+      $or: [{ id: normalizedKey.toLowerCase() }, { name: normalizedKey }]
+    });
+    if (industryDoc && Array.isArray((industryDoc as any).organisationalPrerequisites)) {
+      const normalized = normalizeOrganisationalPrerequisites(
+        (industryDoc as any).organisationalPrerequisites,
+        industryDoc as any
+      );
+      return {
+        prerequisites: normalized,
+        source: 'mongodb',
+        updatedAt: String((industryDoc as any)._lastUpdated || new Date().toISOString())
+      };
+    }
+
+    const defaults = buildDefaultOrganisationalPrerequisites((industryDoc as any) || baseBundle);
+    return {
+      prerequisites: defaults,
+      source: 'mongodb',
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  const memSaved = memoryPrerequisites.get(normalizedKey);
+  if (memSaved) {
+    return {
+      prerequisites: normalizeOrganisationalPrerequisites(memSaved, baseBundle),
+      source: 'memory',
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  if (baseBundle && Array.isArray(baseBundle.organisationalPrerequisites)) {
+    return {
+      prerequisites: normalizeOrganisationalPrerequisites(baseBundle.organisationalPrerequisites, baseBundle),
+      source: 'memory',
+      updatedAt: String(baseBundle._lastUpdated || new Date().toISOString())
+    };
+  }
+
+  return {
+    prerequisites: buildDefaultOrganisationalPrerequisites(baseBundle),
+    source: 'memory',
+    updatedAt: new Date().toISOString()
+  };
+}
+
+app.get('/api/prerequisites', async (req, res) => {
+  try {
+    const industryKey = String(req.query.industry || 'Telco').trim() || 'Telco';
+    const loaded = await loadPrerequisitesForIndustry(industryKey);
+    const stats = computePrerequisitesCoverageStats(loaded.prerequisites);
+    return res.json({
+      industry: industryKey,
+      prerequisites: loaded.prerequisites,
+      stats,
+      source: loaded.source,
+      updatedAt: loaded.updatedAt
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Failed to load Organisational Pre-Requisites' });
+  }
+});
+
+app.post('/api/prerequisites', async (req, res) => {
+  try {
+    const industryKey = String(req.body?.industry || 'Telco').trim() || 'Telco';
+    const rawPrerequisites = req.body?.prerequisites;
+    const actionSummary = typeof req.body?.actionSummary === 'string' ? req.body.actionSummary.trim() : '';
+
+    if (!Array.isArray(rawPrerequisites)) {
+      return res.status(400).json({ error: 'prerequisites array is required.' });
+    }
+
+    const db = await connectMongo();
+    let baseBundle = resolveIndustryBundleForKey(industryKey);
+    if (db) {
+      const industryDoc = await db.collection('industries').findOne({
+        $or: [{ id: industryKey.toLowerCase() }, { name: industryKey }]
+      });
+      if (industryDoc) {
+        baseBundle = industryDoc;
+      }
+    }
+
+    const normalized = normalizeOrganisationalPrerequisites(rawPrerequisites, baseBundle);
+    const stats = computePrerequisitesCoverageStats(normalized);
+    const updatedAt = new Date().toISOString();
+    let source: 'mongodb' | 'memory' = 'memory';
+
+    memoryPrerequisites.set(industryKey, normalized);
+    if (baseBundle?.id && memoryIndustries.has(baseBundle.id)) {
+      const existingMem = memoryIndustries.get(baseBundle.id);
+      memoryIndustries.set(baseBundle.id, {
+        ...existingMem,
+        organisationalPrerequisites: normalized,
+        _lastUpdated: updatedAt
+      });
+    }
+
+    if (db) {
+      await db.collection('org_prerequisites').updateOne(
+        { industryKey },
+        {
+          $set: {
+            industryKey,
+            prerequisites: normalized,
+            stats,
+            updatedAt
+          }
+        },
+        { upsert: true }
+      );
+      await db.collection('industries').updateMany(
+        { $or: [{ id: industryKey.toLowerCase() }, { name: industryKey }] },
+        {
+          $set: {
+            organisationalPrerequisites: normalized,
+            _lastUpdated: updatedAt
+          }
+        }
+      );
+      source = 'mongodb';
+    }
+
+    await persistAgentInteraction({
+      agent: 'SupervisorAgent',
+      context: `prerequisites-kb-sync:${industryKey}`,
+      message:
+        actionSummary ||
+        `Configured Organisational & Industry Pre-Requisites knowledge base for ${industryKey}`,
+      response: `Persisted ${stats.enabledCount}/${stats.totalCount} active pre-requisites across 4 governance domains to ${source}.`,
+      metadata: {
+        industryKey,
+        stats,
+        persistence: source,
+        updatedAt
+      }
+    });
+
+    return res.json({
+      success: true,
+      industry: industryKey,
+      prerequisites: normalized,
+      stats,
+      source,
+      updatedAt
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Failed to persist Organisational Pre-Requisites' });
+  }
 });
 
 app.get('/api/user-preferences', async (_req, res) => {
@@ -1630,30 +1843,52 @@ app.get('/api/orchestration-stage-metrics', async (req, res) => {
   try {
     const industry = String(req.query.industry || 'Telco').trim() || 'Telco';
     const stageIdParam = req.query.stageId ? Number(req.query.stageId) : null;
+    const runIdParam = req.query.runId ? String(req.query.runId).trim() : null;
     const db = await connectMongo();
+
+    const sortStageDocsChronologically = (list: any[]) =>
+      list.slice().sort((a, b) => {
+        const tsDiff = Date.parse(String(a?.createdAt || '')) - Date.parse(String(b?.createdAt || ''));
+        if (Number.isFinite(tsDiff) && tsDiff !== 0) return tsDiff;
+        return Number(a?.stageId || 0) - Number(b?.stageId || 0);
+      });
 
     if (db) {
       const filter: Record<string, any> = { industry };
       if (stageIdParam && stageIdParam >= 1 && stageIdParam <= 6) {
         filter.stageId = stageIdParam;
       }
-      let docs = await db.collection('orchestration_stage_metrics')
+      if (runIdParam) {
+        filter.runId = runIdParam;
+      }
+
+      let latestDocs = await db.collection('orchestration_stage_metrics')
         .find(filter)
-        .sort({ createdAt: 1 })
+        .sort({ createdAt: -1, stageId: 1 })
         .limit(120)
         .toArray();
 
-      if (docs.length === 0) {
+      if (latestDocs.length === 0 && !runIdParam) {
         const seeded = buildDefaultRunsForIndustry(industry);
         await db.collection('orchestration_runs').insertMany(seeded).catch(() => {});
         await persistStageMetricsToMongoOrMemory(seeded);
-        docs = await db.collection('orchestration_stage_metrics')
+        latestDocs = await db.collection('orchestration_stage_metrics')
           .find(filter)
-          .sort({ createdAt: 1 })
+          .sort({ createdAt: -1, stageId: 1 })
           .limit(120)
           .toArray();
       }
-      return res.json({ metrics: docs, total: docs.length, source: 'mongodb' });
+
+      const docs = sortStageDocsChronologically(latestDocs);
+      const latestTimeline = extractLatestRunStageTimeline(docs as any[], runIdParam);
+      return res.json({
+        metrics: docs,
+        latestRunId: latestTimeline?.runId || null,
+        latestRunStages: latestTimeline?.stages || [],
+        latestTimeline,
+        total: docs.length,
+        source: 'mongodb'
+      });
     }
 
     let memFiltered = memoryStageMetrics.filter((m) => m.industry === industry);
@@ -1663,10 +1898,25 @@ app.get('/api/orchestration-stage-metrics', async (req, res) => {
       await persistStageMetricsToMongoOrMemory(seeded);
       memFiltered = memoryStageMetrics.filter((m) => m.industry === industry);
     }
-    const metrics = stageIdParam && stageIdParam >= 1 && stageIdParam <= 6
-      ? memFiltered.filter((m) => m.stageId === stageIdParam)
-      : memFiltered;
-    return res.json({ metrics, total: metrics.length, source: 'memory' });
+    const filteredMem = memFiltered.filter((m) => {
+      if (stageIdParam && stageIdParam >= 1 && stageIdParam <= 6 && m.stageId !== stageIdParam) {
+        return false;
+      }
+      if (runIdParam && m.runId !== runIdParam) {
+        return false;
+      }
+      return true;
+    });
+    const metrics = sortStageDocsChronologically(filteredMem).slice(-120);
+    const latestTimeline = extractLatestRunStageTimeline(metrics as any[], runIdParam);
+    return res.json({
+      metrics,
+      latestRunId: latestTimeline?.runId || null,
+      latestRunStages: latestTimeline?.stages || [],
+      latestTimeline,
+      total: metrics.length,
+      source: 'memory'
+    });
   } catch (error: any) {
     return res.status(500).json({ error: error?.message || 'Failed to load stage metrics' });
   }
@@ -1712,6 +1962,137 @@ app.post('/api/orchestration-stage-metrics', async (req, res) => {
   }
 });
 
+app.get('/api/risk-sentinel/thresholds', async (req, res) => {
+  try {
+    const industry = String(req.query.industry || 'Telco').trim() || 'Telco';
+    const db = await connectMongo();
+
+    if (db) {
+      const existing = await db
+        .collection('agent_threshold_configs')
+        .find({ industry })
+        .sort({ stageId: 1, agentId: 1 })
+        .toArray();
+      if (existing.length > 0) {
+        const configs = normalizeAgentThresholdConfigs(existing, industry);
+        return res.json({
+          industry,
+          configs,
+          stageSummaries: computeAllStageThresholdSummaries(configs),
+          source: 'mongodb'
+        });
+      }
+      const seeded = buildDefaultAgentThresholdConfigs(industry);
+      await db.collection('agent_threshold_configs').insertMany(seeded).catch(() => {});
+      return res.json({
+        industry,
+        configs: seeded,
+        stageSummaries: computeAllStageThresholdSummaries(seeded),
+        source: 'mongodb-seeded'
+      });
+    }
+
+    const existingMem = memoryAgentThresholdConfigs.get(industry);
+    if (existingMem && existingMem.length > 0) {
+      const configs = normalizeAgentThresholdConfigs(existingMem, industry);
+      memoryAgentThresholdConfigs.set(industry, configs);
+      return res.json({
+        industry,
+        configs,
+        stageSummaries: computeAllStageThresholdSummaries(configs),
+        source: 'memory'
+      });
+    }
+
+    const seeded = buildDefaultAgentThresholdConfigs(industry);
+    memoryAgentThresholdConfigs.set(industry, seeded);
+    return res.json({
+      industry,
+      configs: seeded,
+      stageSummaries: computeAllStageThresholdSummaries(seeded),
+      source: 'memory-seeded'
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Failed to load Risk Sentinel threshold configs' });
+  }
+});
+
+app.post('/api/risk-sentinel/thresholds', async (req, res) => {
+  try {
+    const industry = String(req.body?.industry || 'Telco').trim() || 'Telco';
+    const reset = Boolean(req.body?.reset);
+    const updatedAgentId = req.body?.updatedAgentId ? String(req.body.updatedAgentId) : null;
+    const updatedStageId = req.body?.updatedStageId ? Number(req.body.updatedStageId) : null;
+
+    const configs = reset
+      ? buildDefaultAgentThresholdConfigs(industry)
+      : normalizeAgentThresholdConfigs(req.body?.configs, industry);
+
+    memoryAgentThresholdConfigs.set(industry, configs);
+
+    let source: 'mongodb' | 'memory' = 'memory';
+    const db = await connectMongo();
+    if (db) {
+      await db
+        .collection('agent_threshold_configs')
+        .bulkWrite(
+          configs.map((cfg) => ({
+            updateOne: {
+              filter: { id: cfg.id },
+              update: { $set: cfg },
+              upsert: true
+            }
+          })),
+          { ordered: false }
+        )
+        .catch(() => {});
+      source = 'mongodb';
+    }
+
+    const stageSummaries = computeAllStageThresholdSummaries(configs);
+    const targetSummary =
+      updatedStageId && updatedStageId >= 1 && updatedStageId <= 6
+        ? stageSummaries.find((s) => s.stageId === updatedStageId)
+        : undefined;
+
+    await persistAgentInteraction({
+      agent: 'RiskSentinel',
+      context: `risk-threshold:${industry}${updatedStageId ? `:stage-${updatedStageId}` : ''}`,
+      message: reset
+        ? `Reset Risk Sentinel per-agent anomaly thresholds to stage defaults for ${industry}`
+        : updatedAgentId
+          ? `Updated anomaly sensitivity config for agent "${updatedAgentId}" in ${industry}`
+          : `Updated 6-stage Risk Sentinel per-agent anomaly sensitivity matrix for ${industry}`,
+      response: targetSummary
+        ? `Stage ${targetSummary.stageId} (${targetSummary.stageName}) sensitivity set to ${targetSummary.sensitivity.toUpperCase()} (${targetSummary.stdDevMultiplier}σ, min ≥ ${targetSummary.minAnomalyFloor}) and saved to ${source}.`
+        : `Persisted ${configs.length} per-agent threshold configs across 6 stages to ${source}.`,
+      metadata: {
+        industry,
+        updatedAgentId,
+        updatedStageId,
+        reset,
+        persistence: source,
+        stageSummaries: stageSummaries.map((s) => ({
+          stageId: s.stageId,
+          sensitivity: s.sensitivity,
+          stdDevMultiplier: s.stdDevMultiplier,
+          minAnomalyFloor: s.minAnomalyFloor
+        }))
+      }
+    });
+
+    return res.json({
+      success: true,
+      industry,
+      configs,
+      stageSummaries,
+      source
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error?.message || 'Failed to save Risk Sentinel threshold configs' });
+  }
+});
+
 app.post('/api/agents/supervisor-orchestrate', async (req, res) => {
   const startedAt = Date.now();
   try {
@@ -1725,11 +2106,18 @@ app.post('/api/agents/supervisor-orchestrate', async (req, res) => {
       criticalOkrCount = 0,
       activeDisasterCount = 0,
       atRiskSummary = [],
-      activeStage = 1
+      activeStage = 1,
+      prerequisitesContext = ''
     } = req.body ?? {};
 
     const runIndustryKey = String(industry || industryName || 'Telco').trim() || 'Telco';
     const okrCount = Number(rawOkrCount ?? totalOkrs ?? 0);
+
+    let resolvedPrereqContext = String(prerequisitesContext || '').trim();
+    if (!resolvedPrereqContext) {
+      const loadedPrereqs = await loadPrerequisitesForIndustry(runIndustryKey);
+      resolvedPrereqContext = buildPrerequisitesAgentContext(loadedPrereqs.prerequisites, 2);
+    }
 
     let supervisorSummary = `Supervisor verified ${okrCount} OKRs across ${industryName}; ${criticalOkrCount} critical OKRs and ${activeDisasterCount} active crisis triggers coordinated across 6 worker agents.`;
     let source = 'supervisor-deterministic';
@@ -1750,6 +2138,8 @@ app.post('/api/agents/supervisor-orchestrate', async (req, res) => {
             contents: `You are Planview Anvi's Supervisor Agent orchestrating 6 worker agents (Strategy Explorer, OKR Quality Auditor, Alignment & Capacity, Risk Sentinel, Executive Reporter, Retrospective Learner).
 Industry: ${industryName} (${sector}), Mode: ${mode}, Total OKRs: ${okrCount}, Critical OKRs: ${criticalOkrCount}, Active Disasters: ${activeDisasterCount}.
 At-Risk Context: ${JSON.stringify(atRiskSummary).slice(0, 1200)}
+Organisational & Industry Pre-Requisites Knowledge Base:
+${resolvedPrereqContext.slice(0, 1400)}
 Provide a crisp supervisorSummary, 3 prioritized cross-agent recommendations, and per-stage health assessment.`,
             config: {
               responseMimeType: 'application/json',

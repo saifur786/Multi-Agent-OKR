@@ -33,6 +33,7 @@ interface EnterpriseGovernanceModalProps {
   onUpdateOrgDirectory: React.Dispatch<React.SetStateAction<OrgDirectoryMember[]>>;
   policies: OkrEnterprisePolicy[];
   onUpdatePolicies: React.Dispatch<React.SetStateAction<OkrEnterprisePolicy[]>>;
+  onOpenKnowledgeBase?: () => void;
   onClose: () => void;
 }
 
@@ -42,6 +43,7 @@ export const EnterpriseGovernanceModal: React.FC<EnterpriseGovernanceModalProps>
   onUpdateOrgDirectory,
   policies,
   onUpdatePolicies,
+  onOpenKnowledgeBase,
   onClose
 }) => {
   const [activeTab, setActiveTab] = useState<'policies' | 'marketData' | 'orgChart' | 'themes'>('policies');
@@ -397,6 +399,28 @@ export const EnterpriseGovernanceModal: React.FC<EnterpriseGovernanceModalProps>
           {/* TAB 3: MARKET DATA & 5 PILLARS */}
           {activeTab === 'marketData' && (
             <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3.5 rounded-xl border border-indigo-200 bg-indigo-50/70">
+                <div>
+                  <h4 className="text-xs font-bold text-indigo-950">
+                    Organisational &amp; Industry Pre-Requisites (4 Governance Domains)
+                  </h4>
+                  <p className="text-[11px] text-indigo-800">
+                    Configure Strategy &amp; Governance, Business Context, Execution Data, and Knowledge Sources (Planview, Jira, Planner).
+                  </p>
+                </div>
+                {onOpenKnowledgeBase && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onOpenKnowledgeBase();
+                      onClose();
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shrink-0 cursor-pointer"
+                  >
+                    Configure Pre-Requisites
+                  </button>
+                )}
+              </div>
               <h4 className="text-sm font-bold text-slate-900">5-Pillar Vector Knowledge Base &amp; Market Feeds</h4>
               <div className="space-y-3">
                 {industry.knowledgeBase.map((kb) => (

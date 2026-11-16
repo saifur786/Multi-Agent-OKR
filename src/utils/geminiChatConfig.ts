@@ -1,4 +1,5 @@
 import type { IndustryDataBundle, TraceabilityNode } from '../types/orchestration';
+import { buildPrerequisitesAgentContext, normalizeOrganisationalPrerequisites } from './orgPrerequisites';
 
 export type GeminiChatModelId =
   | 'gemini-4-hydrogen'
@@ -118,11 +119,17 @@ export function buildIndustryChatContext(
     .map((d) => `- ACTIVE CRISIS: ${d.title} (${d.severity}, ${d.impacts.attainmentDropPct}% attainment impact)`)
     .join('\n');
 
+  const prerequisitesContext = buildPrerequisitesAgentContext(
+    normalizeOrganisationalPrerequisites(industry.organisationalPrerequisites, industry),
+    4
+  );
+
   return [
     `Active Industry: ${industry.name} (${industry.sector}) | Quarter: ${industry.quarter} | Attainment: ${industry.attainment}% | Health: ${industry.overallHealth} | Budget: ${industry.totalBudget}`,
     activeDisasters ? `Active Disasters:\n${activeDisasters}` : 'Active Disasters: None active',
     `Key Objectives & Key Results:\n${okrs || 'No OKRs loaded'}`,
-    `Active 5-Pillar Knowledge Base Context:\n${kbSummary || 'No pillars enabled'}`
+    `Active 5-Pillar Knowledge Base Context:\n${kbSummary || 'No pillars enabled'}`,
+    `Organisational & Industry Pre-Requisites Knowledge Base:\n${prerequisitesContext}`
   ].join('\n\n');
 }
 

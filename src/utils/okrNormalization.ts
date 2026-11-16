@@ -1,4 +1,5 @@
 import { IndustryDataBundle, StructuredBusinessProblem } from '../types/orchestration';
+import { normalizeOrganisationalPrerequisites } from './orgPrerequisites';
 
 export const normalizeStructuredBusinessProblem = (
   problem?: Partial<StructuredBusinessProblem> | null
@@ -148,6 +149,14 @@ export const normalizeIndustryBundle = (industry: any): IndustryDataBundle => {
     policies: Array.isArray(safeIndustry.policies) ? safeIndustry.policies : [],
     programs: normalizedPrograms,
     activeDisasters: Array.isArray(safeIndustry.activeDisasters) ? safeIndustry.activeDisasters : [],
-    isCustom: Boolean(safeIndustry.isCustom)
+    isCustom: Boolean(safeIndustry.isCustom),
+    organisationalPrerequisites: normalizeOrganisationalPrerequisites(
+      safeIndustry.organisationalPrerequisites,
+      {
+        ...safeIndustry,
+        traceability: normalizedTraceability,
+        programs: normalizedPrograms
+      }
+    )
   } as IndustryDataBundle;
 };

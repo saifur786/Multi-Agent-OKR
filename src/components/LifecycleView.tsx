@@ -19,7 +19,12 @@ import {
   ChevronDown,
   RotateCcw,
   X,
-  ArrowRight
+  ArrowRight,
+  Clock,
+  CheckCircle2,
+  AlertTriangle,
+  XCircle,
+  Database
 } from 'lucide-react';
 import { IndustryDataBundle, LifecycleStage, TraceabilityNode } from '../types/orchestration';
 import { StatusBadge } from './StatusBadge';
@@ -37,9 +42,16 @@ import {
   generateRequirementTraceabilityMatrixCSV,
   triggerFileDownload
 } from '../utils/documentGenerators';
+import {
+  extractLatestRunStageTimeline,
+  formatStageCompletionTimestamp,
+  type LatestRunTimelineSummary,
+  type StageCompletionStatus
+} from '../utils/orchestrationTimeline';
 
 interface LifecycleViewProps {
   industry: IndustryDataBundle;
+  industryKey?: string;
   activeStageId: number;
   onSelectStage: (stageId: number) => void;
   nodesMap: Record<string, TraceabilityNode>;
@@ -49,6 +61,7 @@ interface LifecycleViewProps {
   isOrchestratingAll?: boolean;
   onRunFullOrchestration?: (mode?: OrchestrationMode) => void;
   lastOrchestrationSummary?: IndustryOrchestrationSummary | null;
+  lastOrchestrationRunId?: string | null;
   onRetrospectiveCompleted?: (payload: {
     actionableLesson: string;
     vectorChunk: { id: string; text: string; source: string; sourceDocument?: string; ingestedAt?: string };
@@ -66,6 +79,7 @@ const AI_PILLAR_META = [
 
 export const LifecycleView: React.FC<LifecycleViewProps> = ({
   industry,
+  industryKey,
   activeStageId,
   onSelectStage,
   nodesMap,
@@ -75,6 +89,7 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
   isOrchestratingAll = false,
   onRunFullOrchestration,
   lastOrchestrationSummary = null,
+  lastOrchestrationRunId = null,
   onRetrospectiveCompleted
 }) => {
   const [isSimulating, setIsSimulating] = useState(false);
@@ -82,6 +97,68 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
   const [deepDiveStage, setDeepDiveStage] = useState<LifecycleStage | null>(null);
   const [isPipelineMenuOpen, setIsPipelineMenuOpen] = useState(false);
   const pipelineContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const [timelineSummary, setTimelineSummary] = useState<LatestRunTimelineSummary | null>(null);
+  const [timelineSource, setTimelineSource] = useState<'mongodb' | 'memory' | null>(null);
+  const [isTimelineLoading, setIsTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
+  const [timelineRefreshNonce, setTimelineRefreshNonce] = useState(0);
+  const wasOrchestratingRef = useRef(isOrchestratingAll);
+
+  const effectiveIndustryKey = (industryKey || industry.name || 'Telco').trim();
+
+  useEffect(() => {
+    if (wasOrchestratingRef.current && !isOrchestratingAll) {
+      setTimelineRefreshNonce((prev) => prev + 1);
+    }
+    wasOrchestratingRef.current = isOrchestratingAll;
+  }, [isOrchestratingAll]);
+
+  useEffect(() => {
+    if (isOrchestratingAll) return;
+
+    let cancelled = false;
+    setIsTimelineLoading(true);
+    setTimelineError(null);
+
+    const params = new URLSearchParams({ industry: effectiveIndustryKey });
+    if (lastOrchestrationRunId) {
+      params.set('runId', lastOrchestrationRunId);
+    }
+
+    void fetch(`/api/orchestration-stage-metrics?${params.toString()}`)
+      .then(async (resp) => {
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => '');
+          throw new Error(text || `Failed to fetch timeline (${resp.status})`);
+        }
+        return resp.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const nextTimeline: LatestRunTimelineSummary | null =
+          data?.latestTimeline ||
+          extractLatestRunStageTimeline(
+            Array.isArray(data?.metrics) ? data.metrics : [],
+            lastOrchestrationRunId
+          );
+        setTimelineSummary(nextTimeline);
+        setTimelineSource(String(data?.source || '').startsWith('mongodb') ? 'mongodb' : 'memory');
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setTimelineError(err instanceof Error ? err.message : 'Unable to load MongoDB timeline');
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsTimelineLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveIndustryKey, lastOrchestrationRunId, timelineRefreshNonce, isOrchestratingAll]);
 
   useEffect(() => {
     const handlePointerDown = (e: MouseEvent) => {
@@ -631,6 +708,244 @@ export const LifecycleView: React.FC<LifecycleViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* 6-Stage Execution Vertical Timeline (Fetched from MongoDB) */}
+      <section
+        data-testid="lifecycle-vertical-timeline"
+        aria-label="6-Stage Pipeline Execution Vertical Timeline"
+        className="bg-white rounded-2xl border border-slate-200 p-6 shadow-2xs space-y-5"
+      >
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 pb-4 border-b border-slate-100">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <Clock className="w-4 h-4 text-indigo-600 shrink-0" />
+              <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider">
+                6-Stage Execution Vertical Timeline
+              </h3>
+              {timelineSummary && (
+                <span className="text-[11px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-md tabular-nums">
+                  {timelineSummary.runLabel} · {timelineSummary.totalLatencyMs} ms total
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-slate-500">
+              Sequential completion timestamp and execution outcome for all 6 pipeline stages stored in MongoDB ({effectiveIndustryKey}).
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {isOrchestratingAll && (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-50 border border-indigo-200 text-xs font-semibold text-indigo-700 tabular-nums">
+                <RotateCcw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                <span>Executing Stage {activeStageId}/6 — syncing after completion</span>
+              </span>
+            )}
+
+            {timelineSummary && !isOrchestratingAll && (
+              <span
+                data-testid="timeline-overall-summary"
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold tabular-nums ${
+                  timelineSummary.overallStatus === 'Failed'
+                    ? 'bg-rose-50 border-rose-200 text-rose-800'
+                    : timelineSummary.overallStatus === 'Warning'
+                      ? 'bg-amber-50 border-amber-200 text-amber-800'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                }`}
+              >
+                {timelineSummary.overallStatus === 'Failed' ? (
+                  <XCircle className="w-3.5 h-3.5 shrink-0" />
+                ) : timelineSummary.overallStatus === 'Warning' ? (
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                ) : (
+                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                )}
+                <span>
+                  {timelineSummary.succeededCount}/{timelineSummary.stages.length} Succeeded
+                  {timelineSummary.warningCount > 0 ? ` · ${timelineSummary.warningCount} Warning` : ''}
+                  {timelineSummary.failedCount > 0 ? ` · ${timelineSummary.failedCount} Failed` : ''}
+                </span>
+              </span>
+            )}
+
+            {timelineSource && (
+              <span
+                data-testid="timeline-persistence-source"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200 text-xs font-medium text-slate-700"
+              >
+                <Database className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                <span>{timelineSource === 'mongodb' ? 'MongoDB Fetched' : 'Telemetry Store'}</span>
+              </span>
+            )}
+
+            <button
+              type="button"
+              data-testid="refresh-lifecycle-timeline-btn"
+              onClick={() => setTimelineRefreshNonce((prev) => prev + 1)}
+              disabled={isTimelineLoading || isOrchestratingAll}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 text-xs font-semibold text-slate-700 transition-colors cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isTimelineLoading ? 'animate-spin' : ''}`} />
+              <span>Refresh Timeline</span>
+            </button>
+          </div>
+        </div>
+
+        {timelineError && (
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 p-4 rounded-xl bg-rose-50 border border-rose-200 text-rose-900">
+            <div className="flex items-center gap-2 text-xs font-medium">
+              <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>Could not load pipeline timeline from MongoDB: {timelineError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setTimelineRefreshNonce((prev) => prev + 1)}
+              className="px-3 py-1.5 rounded-lg bg-white border border-rose-300 text-xs font-semibold text-rose-700 hover:bg-rose-100 cursor-pointer shrink-0"
+            >
+              Retry Fetch
+            </button>
+          </div>
+        )}
+
+        {isTimelineLoading && !timelineSummary ? (
+          <div className="space-y-3 pl-8 relative" aria-busy="true" aria-label="Loading stage timeline">
+            <div aria-hidden="true" className="absolute left-3.5 top-2 bottom-2 w-px bg-slate-200" />
+            {[1, 2, 3, 4, 5, 6].map((idx) => (
+              <div
+                key={idx}
+                className="h-16 rounded-xl border border-slate-200 bg-slate-50 animate-pulse"
+              />
+            ))}
+          </div>
+        ) : timelineSummary && timelineSummary.stages.length > 0 ? (
+          <ol className="relative pl-9 space-y-3">
+            <div
+              aria-hidden="true"
+              className="absolute left-[13px] top-4 bottom-4 w-0.5 bg-slate-200"
+            />
+            {timelineSummary.stages.map((entry) => {
+              const matchedStage = stages.find((s) => s.id === entry.stageId);
+              const isSelectedStage = activeStageId === entry.stageId;
+              const isExecutingThisStage = isOrchestratingAll && activeStageId === entry.stageId;
+              const statusMeta: Record<
+                StageCompletionStatus,
+                {
+                  badgeClass: string;
+                  markerClass: string;
+                  icon: React.ReactNode;
+                }
+              > = {
+                Succeeded: {
+                  badgeClass: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+                  markerClass: 'bg-emerald-50 border-emerald-500 text-emerald-700',
+                  icon: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                },
+                Warning: {
+                  badgeClass: 'bg-amber-50 text-amber-800 border-amber-200',
+                  markerClass: 'bg-amber-50 border-amber-500 text-amber-700',
+                  icon: <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                },
+                Failed: {
+                  badgeClass: 'bg-rose-50 text-rose-800 border-rose-200',
+                  markerClass: 'bg-rose-50 border-rose-500 text-rose-700',
+                  icon: <XCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                }
+              };
+
+              const meta = statusMeta[entry.status];
+
+              return (
+                <li
+                  key={entry.id}
+                  data-testid={`timeline-stage-item-${entry.stageId}`}
+                  className="relative"
+                >
+                  <span
+                    aria-hidden="true"
+                    className={`absolute -left-9 top-3.5 w-7 h-7 rounded-full border-2 flex items-center justify-center shadow-2xs ${
+                      isExecutingThisStage
+                        ? 'bg-indigo-600 border-indigo-600 text-white'
+                        : meta.markerClass
+                    }`}
+                  >
+                    {isExecutingThisStage ? (
+                      <RotateCcw className="w-3.5 h-3.5 animate-spin" />
+                    ) : entry.status === 'Failed' ? (
+                      <XCircle className="w-3.5 h-3.5" />
+                    ) : entry.status === 'Warning' ? (
+                      <AlertTriangle className="w-3.5 h-3.5" />
+                    ) : (
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                    )}
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={() => onSelectStage(entry.stageId)}
+                    aria-label={`Inspect Stage ${entry.stageId}: ${matchedStage?.title || entry.stageName}`}
+                    className={`w-full text-left p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col md:flex-row md:items-center md:justify-between gap-3 ${
+                      isSelectedStage
+                        ? 'bg-indigo-50/75 border-indigo-400 ring-1 ring-indigo-300 shadow-xs'
+                        : 'bg-slate-50/70 border-slate-200 hover:bg-white hover:border-slate-300'
+                    }`}
+                  >
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="px-2 py-0.5 rounded-md text-[11px] font-bold bg-indigo-100 text-indigo-800 tabular-nums">
+                          Stage {entry.stageId}
+                        </span>
+                        <span className="text-sm font-bold text-slate-900">
+                          {matchedStage?.title || entry.stageName}
+                        </span>
+                        <span className="text-xs font-medium text-slate-500">
+                          · {entry.primaryWorkerName} ({entry.processFlowAgent})
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-600 tabular-nums">
+                        <span>
+                          Success Rate: <strong className="text-slate-900">{entry.successRate.toFixed(1)}%</strong>
+                        </span>
+                        <span>
+                          Duration: <strong className="text-slate-900">{entry.latencyMs} ms</strong>
+                        </span>
+                        <span>
+                          Anomalies: <strong className="text-slate-900">{entry.anomalyCount}</strong>
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row sm:items-center md:flex-col md:items-end gap-1.5 shrink-0">
+                      <span
+                        data-testid={`timeline-stage-status-${entry.stageId}`}
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md border text-xs font-bold ${meta.badgeClass}`}
+                      >
+                        {meta.icon}
+                        <span>{entry.status}</span>
+                      </span>
+                      <span
+                        data-testid={`timeline-stage-timestamp-${entry.stageId}`}
+                        title={`ISO Completion Timestamp: ${entry.completedAt}`}
+                        className="inline-flex items-center gap-1.5 text-xs font-mono text-slate-700 tabular-nums"
+                      >
+                        <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                        <span>Completed {formatStageCompletionTimestamp(entry.completedAt)}</span>
+                      </span>
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ol>
+        ) : (
+          <div className="p-6 rounded-xl border border-dashed border-slate-300 bg-slate-50/70 text-center space-y-2">
+            <p className="text-xs font-semibold text-slate-700">
+              No persisted stage completion timeline found yet for {effectiveIndustryKey}.
+            </p>
+            <p className="text-xs text-slate-500">
+              Click &ldquo;Orchestrate Pipeline&rdquo; above to execute Stages 1–6 and record per-stage timestamps in MongoDB.
+            </p>
+          </div>
+        )}
+      </section>
 
       {/* Deep Dive Workbench Modal */}
       {deepDiveStage && (

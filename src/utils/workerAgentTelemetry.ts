@@ -440,31 +440,75 @@ export function computeAnomalyCountForRun(params: {
   return disasters * 2 + (criticalOkrs > 0 ? Math.ceil(criticalOkrs / 2) : 0) + signals;
 }
 
+export type AnomalySensitivityLevel = 'high' | 'balanced' | 'low';
+
+export interface AnomalyThresholdPolicy {
+  sensitivity?: AnomalySensitivityLevel;
+  stdDevMultiplier?: number;
+  minAnomalyFloor?: number;
+}
+
 export interface AnomalyTelemetryStats {
   mean: number;
   stdDev: number;
   deviationThreshold: number;
+  effectiveThreshold: number;
+  stdDevMultiplier: number;
+  minAnomalyFloor: number;
+  sensitivity: AnomalySensitivityLevel;
   totalAnomalies: number;
   spikeRunCount: number;
 }
 
 export function isSignificantAnomalyDeviation(
   anomalyCount: number,
-  stats: Pick<AnomalyTelemetryStats, 'mean' | 'deviationThreshold'>
+  stats: Pick<AnomalyTelemetryStats, 'mean' | 'deviationThreshold'> & {
+    effectiveThreshold?: number;
+    minAnomalyFloor?: number;
+  }
 ): boolean {
   const value = Math.max(0, Number(anomalyCount || 0));
-  return value > stats.mean && value >= stats.deviationThreshold;
+  const floor = Math.max(0, Number(stats.minAnomalyFloor ?? 0));
+  const cutoff = Number(stats.effectiveThreshold ?? Math.max(stats.deviationThreshold, floor));
+  return value > stats.mean && value >= cutoff && value >= floor;
 }
 
 export function computeAnomalyTelemetryStats(
-  runs: Array<{ anomalyCount?: number }>
+  runs: Array<{ anomalyCount?: number }>,
+  policy?: AnomalyThresholdPolicy
 ): AnomalyTelemetryStats {
+  const stdDevMultiplier =
+    typeof policy?.stdDevMultiplier === 'number' && Number.isFinite(policy.stdDevMultiplier)
+      ? Math.max(0.1, Math.min(2.5, Number(policy.stdDevMultiplier)))
+      : policy?.sensitivity === 'high'
+        ? 0.3
+        : policy?.sensitivity === 'low'
+          ? 1.35
+          : 0.75;
+
+  const minAnomalyFloor =
+    typeof policy?.minAnomalyFloor === 'number' && Number.isFinite(policy.minAnomalyFloor)
+      ? Math.max(1, Math.min(10, Math.round(Number(policy.minAnomalyFloor))))
+      : policy?.sensitivity === 'high'
+        ? 1
+        : policy?.sensitivity === 'low'
+          ? 3
+          : 1;
+
+  const sensitivity: AnomalySensitivityLevel =
+    policy?.sensitivity ||
+    (stdDevMultiplier <= 0.55 ? 'high' : stdDevMultiplier >= 1.1 ? 'low' : 'balanced');
+
   const counts = (runs || []).map((run) => Math.max(0, Number(run?.anomalyCount || 0)));
   if (counts.length === 0) {
     return {
       mean: 0,
       stdDev: 0,
       deviationThreshold: 0,
+      effectiveThreshold: minAnomalyFloor,
+      stdDevMultiplier,
+      minAnomalyFloor,
+      sensitivity,
       totalAnomalies: 0,
       spikeRunCount: 0
     };
@@ -476,18 +520,29 @@ export function computeAnomalyTelemetryStats(
     counts.reduce((sum, count) => sum + Math.pow(count - mean, 2), 0) / counts.length;
   const stdDev = Number(Math.sqrt(variance).toFixed(2));
   const deviationThreshold =
-    stdDev > 0 ? Number((mean + 0.75 * stdDev).toFixed(2)) : Number((mean + 0.5).toFixed(2));
+    stdDev > 0
+      ? Number((mean + stdDevMultiplier * stdDev).toFixed(2))
+      : Number((mean + Math.max(0.25, stdDevMultiplier * 0.65)).toFixed(2));
+  const effectiveThreshold = Number(Math.max(deviationThreshold, minAnomalyFloor).toFixed(2));
 
   const spikeRunCount = counts.filter((count) =>
-    isSignificantAnomalyDeviation(count, { mean, deviationThreshold })
+    isSignificantAnomalyDeviation(count, {
+      mean,
+      deviationThreshold,
+      effectiveThreshold,
+      minAnomalyFloor
+    })
   ).length;
 
   return {
     mean,
     stdDev,
     deviationThreshold,
+    effectiveThreshold,
+    stdDevMultiplier,
+    minAnomalyFloor,
+    sensitivity,
     totalAnomalies,
     spikeRunCount
   };
 }
-

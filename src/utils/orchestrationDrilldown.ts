@@ -1,9 +1,17 @@
 import {
   computeAnomalyTelemetryStats,
   isSignificantAnomalyDeviation,
+  type AnomalySensitivityLevel,
   type AnomalyTelemetryStats,
   type WorkerAgentId
 } from './workerAgentTelemetry';
+import {
+  buildDefaultAgentThresholdConfigs,
+  computeStageThresholdSummary,
+  resolveAgentThresholdConfig,
+  type AgentAnomalyThresholdConfig,
+  type StageThresholdSummary
+} from './riskSentinelThresholds';
 
 export interface ConstituentAgentDefinition {
   agentId: string;
@@ -62,7 +70,11 @@ export interface PersistedStageMetricRecord {
   constituentAgents: ConstituentAgentMetric[];
   source: string;
   createdAt: string;
+  completedAt?: string;
+  status?: 'Succeeded' | 'Warning' | 'Failed';
 }
+
+export type ConfidenceBand = 'high' | 'moderate' | 'low';
 
 export interface StageDrilldownSummary {
   stageId: number;
@@ -74,6 +86,9 @@ export interface StageDrilldownSummary {
   avgLatencyMs: number;
   totalAnomalies: number;
   runCount: number;
+  confidenceScore: number;
+  confidenceBand: ConfidenceBand;
+  thresholdSummary: StageThresholdSummary;
   anomalyStats: AnomalyTelemetryStats;
   filteredRuns: Array<{
     id: string;
@@ -86,6 +101,8 @@ export interface StageDrilldownSummary {
     latencyMs: number;
     anomalyCount: number;
     isAnomalySpike: boolean;
+    stageSensitivity: AnomalySensitivityLevel;
+    stageThreshold: number;
     source: string;
     createdAt: string;
   }>;
@@ -94,6 +111,10 @@ export interface StageDrilldownSummary {
     agentName: string;
     processFlowRole: string;
     status: 'healthy' | 'warning' | 'critical';
+    sensitivity: AnomalySensitivityLevel;
+    stdDevMultiplier: number;
+    minAnomalyFloor: number;
+    agentStats: AnomalyTelemetryStats;
     avgSuccessRate: number;
     avgLatencyMs: number;
     totalAnomalies: number;
@@ -306,6 +327,39 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+export function classifyConfidenceBand(score: number): ConfidenceBand {
+  if (score >= 85) return 'high';
+  if (score >= 70) return 'moderate';
+  return 'low';
+}
+
+export function computeStageConfidenceScore(params: {
+  avgSuccessRate: number;
+  avgLatencyMs: number;
+  totalAnomalies: number;
+  spikeRunCount: number;
+  runCount: number;
+}): { confidenceScore: number; confidenceBand: ConfidenceBand } {
+  const safeRuns = Math.max(1, Number(params.runCount || 1));
+  const successScore = clamp(Number(params.avgSuccessRate || 0), 0, 100);
+  const latencyScore = clamp(
+    100 - ((Math.max(0, Number(params.avgLatencyMs || 0)) - 150) / 500) * 65,
+    30,
+    100
+  );
+  const anomaliesPerRun = Math.max(0, Number(params.totalAnomalies || 0)) / safeRuns;
+  const spikeRatio = clamp(Math.max(0, Number(params.spikeRunCount || 0)) / safeRuns, 0, 1);
+  const anomalyScore = clamp(100 - anomaliesPerRun * 22 - spikeRatio * 30, 20, 100);
+
+  const confidenceScore = Math.round(
+    clamp(0.55 * successScore + 0.25 * latencyScore + 0.2 * anomalyScore, 0, 100)
+  );
+  return {
+    confidenceScore,
+    confidenceBand: classifyConfidenceBand(confidenceScore)
+  };
+}
+
 export function resolveStageDefinition(stageIdOrName: number | string): PipelineStageDefinition {
   if (typeof stageIdOrName === 'number' || /^\d+$/.test(String(stageIdOrName))) {
     const numeric = Number(stageIdOrName);
@@ -460,7 +514,8 @@ export function computeAllStagesOverview(
     latencyMs?: number;
     anomalyCount?: number;
     stageMetrics?: StageMetricBreakdown[];
-  }>
+  }>,
+  thresholdConfigs?: AgentAnomalyThresholdConfig[]
 ): Array<{
   stageId: number;
   stageName: string;
@@ -470,9 +525,21 @@ export function computeAllStagesOverview(
   avgSuccessRate: number;
   avgLatencyMs: number;
   totalAnomalies: number;
+  spikeRunCount: number;
+  confidenceScore: number;
+  confidenceBand: ConfidenceBand;
+  sensitivity: AnomalySensitivityLevel;
+  effectiveThreshold: number;
+  stdDevMultiplier: number;
+  minAnomalyFloor: number;
   constituentCount: number;
 }> {
   const safeRuns = Array.isArray(runs) ? runs : [];
+  const activeConfigs =
+    thresholdConfigs && thresholdConfigs.length > 0
+      ? thresholdConfigs
+      : buildDefaultAgentThresholdConfigs();
+
   return PIPELINE_STAGE_DEFINITIONS.map((stageDef) => {
     const perRun = safeRuns.map((run, idx) => {
       const stages = ensureRunStageMetrics(run, idx);
@@ -487,6 +554,19 @@ export function computeAllStagesOverview(
     );
     const totalAnomalies = perRun.reduce((sum, s) => sum + Number(s.anomalyCount || 0), 0);
 
+    const thresholdSummary = computeStageThresholdSummary(stageDef.stageId, activeConfigs);
+    const stageStats = computeAnomalyTelemetryStats(
+      perRun.map((s) => ({ anomalyCount: Number(s.anomalyCount || 0) })),
+      thresholdSummary.policy
+    );
+    const { confidenceScore, confidenceBand } = computeStageConfidenceScore({
+      avgSuccessRate,
+      avgLatencyMs,
+      totalAnomalies,
+      spikeRunCount: stageStats.spikeRunCount,
+      runCount: perRun.length
+    });
+
     return {
       stageId: stageDef.stageId,
       stageName: stageDef.stageName,
@@ -496,6 +576,13 @@ export function computeAllStagesOverview(
       avgSuccessRate,
       avgLatencyMs,
       totalAnomalies,
+      spikeRunCount: stageStats.spikeRunCount,
+      confidenceScore,
+      confidenceBand,
+      sensitivity: thresholdSummary.sensitivity,
+      effectiveThreshold: stageStats.effectiveThreshold,
+      stdDevMultiplier: thresholdSummary.stdDevMultiplier,
+      minAnomalyFloor: thresholdSummary.minAnomalyFloor,
       constituentCount: stageDef.constituentAgents.length
     };
   });
@@ -516,10 +603,15 @@ export function filterInsightsByStage(
     createdAt: string;
     stageMetrics?: StageMetricBreakdown[];
   }>,
-  selectedStageId: number
+  selectedStageId: number,
+  thresholdConfigs?: AgentAnomalyThresholdConfig[]
 ): StageDrilldownSummary {
   const stageDef = resolveStageDefinition(selectedStageId);
   const safeRuns = Array.isArray(runs) ? runs : [];
+  const activeConfigs =
+    thresholdConfigs && thresholdConfigs.length > 0
+      ? thresholdConfigs
+      : buildDefaultAgentThresholdConfigs();
 
   const stageSeries = safeRuns.map((run, idx) => {
     const breakdown = ensureRunStageMetrics(run, idx);
@@ -530,8 +622,10 @@ export function filterInsightsByStage(
     };
   });
 
+  const thresholdSummary = computeStageThresholdSummary(stageDef.stageId, activeConfigs);
   const anomalyStats = computeAnomalyTelemetryStats(
-    stageSeries.map(({ match }) => ({ anomalyCount: match.anomalyCount }))
+    stageSeries.map(({ match }) => ({ anomalyCount: match.anomalyCount })),
+    thresholdSummary.policy
   );
 
   const filteredRuns = stageSeries.map(({ run, match }) => ({
@@ -545,6 +639,8 @@ export function filterInsightsByStage(
     latencyMs: match.latencyMs,
     anomalyCount: match.anomalyCount,
     isAnomalySpike: isSignificantAnomalyDeviation(match.anomalyCount, anomalyStats),
+    stageSensitivity: thresholdSummary.sensitivity,
+    stageThreshold: anomalyStats.effectiveThreshold,
     source: run.source,
     createdAt: run.createdAt
   }));
@@ -559,9 +655,9 @@ export function filterInsightsByStage(
   const totalAnomalies = filteredRuns.reduce((sum, r) => sum + r.anomalyCount, 0);
 
   const constituentAgents = stageDef.constituentAgents.map((agentDef) => {
-    const snapshots = stageSeries.map(({ match }) =>
-      match.constituentAgents.find((a) => a.agentId === agentDef.agentId)
-    ).filter((a): a is ConstituentAgentMetric => Boolean(a));
+    const snapshots = stageSeries
+      .map(({ match }) => match.constituentAgents.find((a) => a.agentId === agentDef.agentId))
+      .filter((a): a is ConstituentAgentMetric => Boolean(a));
 
     const snapCount = Math.max(1, snapshots.length);
     const avgAgentSuccess = Number(
@@ -573,10 +669,20 @@ export function filterInsightsByStage(
     const totalAgentAnomalies = snapshots.reduce((sum, a) => sum + a.anomalyCount, 0);
     const totalInvocations = snapshots.reduce((sum, a) => sum + a.invocations, 0);
 
+    const agentCfg = resolveAgentThresholdConfig(agentDef.agentId, activeConfigs);
+    const agentStats = computeAnomalyTelemetryStats(
+      snapshots.map((s) => ({ anomalyCount: s.anomalyCount })),
+      {
+        sensitivity: agentCfg.sensitivity,
+        stdDevMultiplier: agentCfg.stdDevMultiplier,
+        minAnomalyFloor: agentCfg.minAnomalyFloor
+      }
+    );
+
     const status: 'healthy' | 'warning' | 'critical' =
-      totalAgentAnomalies >= 4 || avgAgentSuccess < 78
+      agentStats.spikeRunCount > 0 || avgAgentSuccess < 78 || totalAgentAnomalies >= agentCfg.minAnomalyFloor * 4
         ? 'critical'
-        : totalAgentAnomalies > 0 || avgAgentSuccess < 90
+        : totalAgentAnomalies >= agentCfg.minAnomalyFloor || avgAgentSuccess < 90
           ? 'warning'
           : 'healthy';
 
@@ -585,11 +691,23 @@ export function filterInsightsByStage(
       agentName: agentDef.agentName,
       processFlowRole: agentDef.processFlowRole,
       status,
+      sensitivity: agentCfg.sensitivity,
+      stdDevMultiplier: agentCfg.stdDevMultiplier,
+      minAnomalyFloor: agentCfg.minAnomalyFloor,
+      agentStats,
       avgSuccessRate: avgAgentSuccess,
       avgLatencyMs: avgAgentLatency,
       totalAnomalies: totalAgentAnomalies,
       totalInvocations
     };
+  });
+
+  const { confidenceScore, confidenceBand } = computeStageConfidenceScore({
+    avgSuccessRate,
+    avgLatencyMs,
+    totalAnomalies,
+    spikeRunCount: anomalyStats.spikeRunCount,
+    runCount: filteredRuns.length
   });
 
   return {
@@ -602,6 +720,9 @@ export function filterInsightsByStage(
     avgLatencyMs,
     totalAnomalies,
     runCount: filteredRuns.length,
+    confidenceScore,
+    confidenceBand,
+    thresholdSummary,
     anomalyStats,
     filteredRuns,
     constituentAgents
@@ -620,22 +741,42 @@ export function flattenStageMetricsForPersistence(run: {
   createdAt: string;
   stageMetrics?: StageMetricBreakdown[];
 }): PersistedStageMetricRecord[] {
-  const breakdown = ensureRunStageMetrics(run, 0);
-  return breakdown.map((stage) => ({
-    id: `${run.id}-stage-${stage.stageId}`,
-    runId: run.id,
-    run: run.run,
-    industry: run.industry,
-    stageId: stage.stageId,
-    stageName: stage.stageName,
-    processFlowAgent: stage.processFlowAgent,
-    primaryWorkerId: stage.primaryWorkerId,
-    primaryWorkerName: stage.primaryWorkerName,
-    successRate: stage.successRate,
-    latencyMs: stage.latencyMs,
-    anomalyCount: stage.anomalyCount,
-    constituentAgents: stage.constituentAgents,
-    source: run.source,
-    createdAt: run.createdAt
-  }));
+  const breakdown = ensureRunStageMetrics(run, 0)
+    .slice()
+    .sort((a, b) => a.stageId - b.stageId);
+  const parsedEndMs = Date.parse(run.createdAt);
+  const endTimeMs = Number.isFinite(parsedEndMs) ? parsedEndMs : Date.now();
+
+  return breakdown.map((stage, idx) => {
+    const remainingLatencyMs = breakdown
+      .slice(idx + 1)
+      .reduce((acc, nextStage) => acc + Math.max(80, Math.round(nextStage.latencyMs || 250)), 0);
+    const completedAt = new Date(endTimeMs - remainingLatencyMs).toISOString();
+    const status: 'Succeeded' | 'Warning' | 'Failed' =
+      stage.successRate < 70 || stage.anomalyCount >= 5
+        ? 'Failed'
+        : stage.successRate < 85 || stage.anomalyCount >= 3
+          ? 'Warning'
+          : 'Succeeded';
+
+    return {
+      id: `${run.id}-stage-${stage.stageId}`,
+      runId: run.id,
+      run: run.run,
+      industry: run.industry,
+      stageId: stage.stageId,
+      stageName: stage.stageName,
+      processFlowAgent: stage.processFlowAgent,
+      primaryWorkerId: stage.primaryWorkerId,
+      primaryWorkerName: stage.primaryWorkerName,
+      successRate: stage.successRate,
+      latencyMs: stage.latencyMs,
+      anomalyCount: stage.anomalyCount,
+      constituentAgents: stage.constituentAgents,
+      source: run.source,
+      createdAt: run.createdAt,
+      completedAt,
+      status
+    };
+  });
 }

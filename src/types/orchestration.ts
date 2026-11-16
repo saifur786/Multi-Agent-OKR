@@ -158,6 +158,29 @@ export interface KnowledgeBasePillar {
   }[];
 }
 
+export type PrerequisiteCategoryKey =
+  | 'strategy_governance'
+  | 'business_context'
+  | 'execution_data'
+  | 'knowledge_sources';
+
+export interface OrganisationalPrerequisiteItem {
+  id: string;
+  categoryKey: PrerequisiteCategoryKey;
+  categoryLabel: string;
+  label: string;
+  description: string;
+  content: string;
+  sourceSystem: string;
+  owner: string;
+  targetAgents: string[];
+  enabledForAgents: boolean;
+  syncStatus: 'Synced' | 'Configured' | 'Pending Review';
+  isCanonical?: boolean;
+  tags: string[];
+  updatedAt: string;
+}
+
 export interface SmartCriteria {
   specific: { score: number; feedback: string };
   measurable: { score: number; feedback: string };
@@ -453,6 +476,7 @@ export interface IndustryDataBundle {
   programs?: ManagedProgram[];
   activeDisasters?: SignificantDisasterEvent[];
   agentInteractions?: AgentInteractionRecord[];
+  organisationalPrerequisites?: OrganisationalPrerequisiteItem[];
 }
 
 export interface StrategicProblem {

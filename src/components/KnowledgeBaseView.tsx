@@ -8,10 +8,16 @@ import {
   Search,
   Upload
 } from 'lucide-react';
-import { IndustryDataBundle, KnowledgeBasePillar } from '../types/orchestration';
+import {
+  IndustryDataBundle,
+  KnowledgeBasePillar,
+  OrganisationalPrerequisiteItem
+} from '../types/orchestration';
 import { eventBus } from '../utils/eventBus';
 import { KnowledgeBaseImporter } from './KnowledgeBaseImporter';
 import type { ParsedDocumentPreview } from '../utils/ragIngestion';
+import { OrganisationalPrerequisitesManager } from './OrganisationalPrerequisitesManager';
+import { buildDefaultOrganisationalPrerequisites } from '../utils/orgPrerequisites';
 
 interface KnowledgeBaseViewProps {
   industry: IndustryDataBundle;
@@ -22,6 +28,13 @@ interface KnowledgeBaseViewProps {
     updatedPillars: KnowledgeBasePillar[],
     preview: ParsedDocumentPreview
   ) => void | Promise<void>;
+  canManagePrerequisites?: boolean;
+  prerequisitesPersistenceSource?: 'mongodb' | 'memory' | null;
+  onUpdatePrerequisites?: (
+    updated: OrganisationalPrerequisiteItem[],
+    actionSummary?: string
+  ) => void | Promise<void>;
+  onSyncPrerequisitesFromWorkspace?: () => void | Promise<void>;
 }
 
 const SAMPLE_QUERIES = [
@@ -37,7 +50,11 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
   fedPillars,
   onToggleFedPillar,
   activeFedCount,
-  onUpdateKnowledgeBase
+  onUpdateKnowledgeBase,
+  canManagePrerequisites = true,
+  prerequisitesPersistenceSource = null,
+  onUpdatePrerequisites,
+  onSyncPrerequisitesFromWorkspace
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [isImporterOpen, setIsImporterOpen] = useState(false);
@@ -50,6 +67,12 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
     ingestedAt: string;
     similarity: number;
   }[]>([]);
+
+  const resolvedPrerequisites =
+    Array.isArray(industry.organisationalPrerequisites) &&
+    industry.organisationalPrerequisites.length > 0
+      ? industry.organisationalPrerequisites
+      : buildDefaultOrganisationalPrerequisites(industry);
 
   const handleSearch = (q: string) => {
     setSearchQuery(q);
@@ -116,7 +139,7 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
             </h2>
           </div>
           <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
-            5-pillar enterprise vector memory grounding Planview Anvi agents across all 6 OKR lifecycle stages.
+            Organisational/Industry Pre-Requisites &amp; 5-pillar enterprise vector memory grounding Planview Anvi agents across all 6 OKR lifecycle stages.
           </p>
           {lastImportedNote && (
             <p className="text-xs font-medium text-emerald-700 mt-1.5">
@@ -142,6 +165,20 @@ export const KnowledgeBaseView: React.FC<KnowledgeBaseViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Organisational / Industry Pre-Requisites Knowledge Base Configurator */}
+      <OrganisationalPrerequisitesManager
+        industryName={industry.name}
+        prerequisites={resolvedPrerequisites}
+        canManage={canManagePrerequisites}
+        persistenceSource={prerequisitesPersistenceSource}
+        onUpdatePrerequisites={
+          onUpdatePrerequisites || (async () => {})
+        }
+        onSyncFromWorkspace={
+          onSyncPrerequisitesFromWorkspace || (async () => {})
+        }
+      />
 
       {/* Interactive Vector Search Workbench */}
       <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 shadow-2xs space-y-4">

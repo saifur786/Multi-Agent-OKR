@@ -76,7 +76,7 @@ service cloud.firestore {
 
     function isValidUserIndustrySnapshot(data, userId, industryId) {
       return data.keys().hasAll(['ownerUid', 'industryId', 'industryName', 'knowledgeBase', 'updatedAt'])
-        && data.keys().hasOnly(['ownerUid', 'industryId', 'industryName', 'knowledgeBase', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'industryId', 'industryName', 'knowledgeBase', 'organisationalPrerequisites', 'updatedAt'])
         && data.ownerUid is string && data.ownerUid == userId && data.ownerUid == request.auth.uid && data.ownerUid.size() <= 128
         && data.industryId is string && data.industryId == industryId && isValidId(data.industryId) && data.industryId.size() <= 64
         && data.industryName is string && data.industryName.size() >= 1 && data.industryName.size() <= 120
@@ -84,6 +84,13 @@ service cloud.firestore {
         && data.knowledgeBase.size() >= 1
         && data.knowledgeBase.size() <= 5
         && data.knowledgeBase[0] is map
+        && (
+          !data.keys().hasAny(['organisationalPrerequisites']) || (
+            data.organisationalPrerequisites is list
+            && data.organisationalPrerequisites.size() <= 40
+            && (data.organisationalPrerequisites.size() == 0 || data.organisationalPrerequisites[0] is map)
+          )
+        )
         && data.updatedAt is timestamp;
     }
 
@@ -188,7 +195,11 @@ service cloud.firestore {
           && incoming().ownerUid == existing().ownerUid
           && incoming().industryId == existing().industryId
           && incoming().updatedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly(['industryName', 'knowledgeBase', 'updatedAt']);
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['industryName', 'knowledgeBase', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['industryName', 'knowledgeBase', 'organisationalPrerequisites', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['industryName', 'organisationalPrerequisites', 'updatedAt'])
+          );
 
         allow delete: if isVerifiedOwner(userId) && isValidId(industryId);
       }

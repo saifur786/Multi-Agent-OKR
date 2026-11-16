@@ -2,12 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   PIPELINE_STAGE_DEFINITIONS,
+  classifyConfidenceBand,
   computeAllStagesOverview,
+  computeStageConfidenceScore,
   ensureRunStageMetrics,
   filterInsightsByStage,
   flattenStageMetricsForPersistence,
   generateStageMetricsForRun
 } from './orchestrationDrilldown';
+import { buildDefaultAgentThresholdConfigs } from './riskSentinelThresholds';
 
 test('generateStageMetricsForRun generates all 6 stages with constituent agent metrics', () => {
   const breakdown = generateStageMetricsForRun({
@@ -49,6 +52,8 @@ test('filterInsightsByStage isolates metrics for selected stage and its constitu
   assert.equal(drilldown.constituentAgents.length, 3);
   assert.equal(drilldown.constituentAgents[0].agentName, 'Risk Sentinel');
   assert.ok(drilldown.anomalyStats.mean >= 0);
+  assert.ok(drilldown.confidenceScore >= 0 && drilldown.confidenceScore <= 100);
+  assert.equal(drilldown.confidenceBand, classifyConfidenceBand(drilldown.confidenceScore));
 });
 
 test('computeAllStagesOverview and flattenStageMetricsForPersistence stay consistent across all 6 stages', () => {
@@ -73,6 +78,7 @@ test('computeAllStagesOverview and flattenStageMetricsForPersistence stay consis
   const overview = computeAllStagesOverview(runs);
   assert.equal(overview.length, 6);
   assert.equal(overview[1].stageId, 2);
+  assert.ok(overview.every((s) => s.confidenceScore >= 0 && s.confidenceScore <= 100));
 
   const flat = flattenStageMetricsForPersistence({ ...runs[0], stageMetrics: enriched });
   assert.equal(flat.length, 6);
@@ -80,4 +86,75 @@ test('computeAllStagesOverview and flattenStageMetricsForPersistence stay consis
   assert.equal(flat[3].stageId, 4);
   assert.equal(flat[3].industry, 'Telco');
   assert.equal(flat[3].constituentAgents.length, 3);
+});
+
+test('computeStageConfidenceScore weights success rate, latency, and anomaly burden accurately', () => {
+  const healthy = computeStageConfidenceScore({
+    avgSuccessRate: 96,
+    avgLatencyMs: 150,
+    totalAnomalies: 0,
+    spikeRunCount: 0,
+    runCount: 10
+  });
+  assert.equal(healthy.confidenceBand, 'high');
+  assert.ok(healthy.confidenceScore >= 95);
+
+  const slower = computeStageConfidenceScore({
+    avgSuccessRate: 96,
+    avgLatencyMs: 550,
+    totalAnomalies: 0,
+    spikeRunCount: 0,
+    runCount: 10
+  });
+  assert.ok(slower.confidenceScore < healthy.confidenceScore);
+
+  const noisy = computeStageConfidenceScore({
+    avgSuccessRate: 96,
+    avgLatencyMs: 150,
+    totalAnomalies: 20,
+    spikeRunCount: 5,
+    runCount: 10
+  });
+  assert.ok(noisy.confidenceScore < healthy.confidenceScore);
+
+  const degraded = computeStageConfidenceScore({
+    avgSuccessRate: 62,
+    avgLatencyMs: 620,
+    totalAnomalies: 25,
+    spikeRunCount: 6,
+    runCount: 10
+  });
+  assert.equal(degraded.confidenceBand, 'low');
+  assert.ok(degraded.confidenceScore < 70);
+});
+
+test('computeAllStagesOverview confidenceScore reflects stage spike sensitivity adjustments', () => {
+  const sampleRuns = Array.from({ length: 10 }, (_, idx) => ({
+    id: `r-${idx + 1}`,
+    run: `Run ${idx + 1}`,
+    stage: 'Risk Radar',
+    activeStage: 4,
+    successRate: 91,
+    latencyMs: 1350,
+    anomalyCount: idx % 3 === 0 ? 4 : 1,
+    source: 'baseline',
+    createdAt: `2026-11-15T18:0${idx}:00.000Z`
+  }));
+
+  const highConfigs = buildDefaultAgentThresholdConfigs().map((cfg) =>
+    cfg.stageId === 4
+      ? { ...cfg, sensitivity: 'high' as const, stdDevMultiplier: 0.75, minAnomalyFloor: 1 }
+      : cfg
+  );
+  const lowConfigs = buildDefaultAgentThresholdConfigs().map((cfg) =>
+    cfg.stageId === 4
+      ? { ...cfg, sensitivity: 'low' as const, stdDevMultiplier: 1.75, minAnomalyFloor: 4 }
+      : cfg
+  );
+
+  const highOverview = computeAllStagesOverview(sampleRuns, highConfigs).find((s) => s.stageId === 4)!;
+  const lowOverview = computeAllStagesOverview(sampleRuns, lowConfigs).find((s) => s.stageId === 4)!;
+
+  assert.ok(highOverview.spikeRunCount >= lowOverview.spikeRunCount);
+  assert.ok(lowOverview.confidenceScore >= highOverview.confidenceScore);
 });
